@@ -175,6 +175,21 @@ class NavigationFeedback(StrictModel):
     scan_span_rad: float
 
 
+class SkillFeedback(StrictModel):
+    revision: int
+    motion_revision: int
+    status: Literal["idle", "running", "awaiting_policy", "completed", "cancelled", "failed"]
+    skill: str | None
+    instruction: str
+    reason: str
+    remaining_s: float
+    checkpoint: str
+    policy_requests: int
+    rejected_chunks: int
+    policy_latency_s: float | None
+    completion_source: Literal["supervisor"] | None = None
+
+
 class AgentObservation(StrictModel):
     run_id: str
     episode_epoch: int
@@ -190,6 +205,7 @@ class AgentObservation(StrictModel):
     battery: BatterySensor | None = None
     proximity: ProximitySensors | None = None
     navigation: NavigationFeedback | None = None
+    skill: SkillFeedback | None = None
     sensor_profile: Literal["rgb_proprioception"] = "rgb_proprioception"
 
 

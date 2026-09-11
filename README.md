@@ -23,7 +23,18 @@ npm --prefix frontend ci --registry=https://packagefeedproxy.microsoft.io/npm/
 
 On Microsoft-managed devices, use the CFS-protected feed above. Do not switch to the blocked public registries. The frontend lockfile uses the internal Microsoft tarball host returned by CFS.
 
-The root launcher builds React and serves both the UI and API at http://127.0.0.1:8000. Use `-Port 8001` when 8000 is occupied. `-SkipBuild` reuses a previously built frontend. No deployment or inference credentials are needed for manual operation.
+The root launcher builds React and serves both the UI and API at http://127.0.0.1:8000. Use `-Port 8002` when 8000 is occupied; port 8001 is reserved for automated tests. `-SkipBuild` reuses a previously built frontend. No deployment or inference credentials are needed for manual operation.
+
+To run the fine-tuned local navigation model in its separate test scene:
+
+```powershell
+./start.ps1 -NavigationTest -WhatIf
+./start.ps1 -NavigationTest
+```
+
+This requires the separate Windows model environment and a completed navigation checkpoint. The default is `.runtime/navigation-stop-balanced-1500/checkpoint`, case 15, seed 716, with a 30-request limit. Override these with `-Checkpoint`, `-Case`, `-Seed`, and `-Requests`; use `-ModelPython` for another model interpreter. Results go to a fresh directory under `.runtime/navigation-tests`, or a new directory specified by `-Output`. The launcher prints the task outcome, report path, and camera timelapse path. `-WhatIf` checks prerequisites without starting inference or creating results.
+
+`-NavigationTest` does not launch the browser, change an existing browser scene, or start the left-arm policy service. Use plain `./start.ps1` for the browser. Its Single step and Navigation plan modes use the selected LLM; Luna + SmolVLA still needs a separate compatible left-arm server. Navigation and browser-only flags cannot be combined.
 
 For separate frontend development, start the backend and run `npm --prefix frontend run dev`; Vite proxies `/api` and WebSocket traffic to port 8000. After building, run `npm --prefix frontend test` with an installed Microsoft Edge browser. Playwright starts an isolated test server on port 8001 with real physics and scripted model replies; it does not use your live Foundry connection or reset the manual session on port 8000. Port 8001 must be free. Set `ROBOSIM_PYTHON` to an alternative simulator interpreter when needed.
 
@@ -61,7 +72,7 @@ Placement does not simulate driving, advance time, change encoder odometry, or c
 
 ## Predefined Challenges
 
-Choose a task from **Challenge** and click **Load challenge**. Each option creates a fresh physical scene, resets progress, and fills the robot goal automatically. Select your configured model and click **Start LLM control** to attempt it, or use the manual controls. Voice sessions receive the same public goal; you can ask Milo to solve the loaded challenge.
+Choose a task from **Challenge** and click **Load challenge**. Ten scenarios are grouped into Navigation, Perception and Manipulation; the clinic and three new training grounds are marked Advanced. Each option creates a fresh physical scene, resets progress, and fills the robot goal automatically. Select your configured model and click **Start LLM control** to attempt it, or use the manual controls. Voice sessions receive the same public goal; you can ask Milo to solve the loaded challenge.
 
 | Challenge | Goal | Completion |
 | --- | --- | --- |
@@ -71,12 +82,24 @@ Choose a task from **Challenge** and click **Load challenge**. Each option creat
 | Tidy the Cube | Pick up the red cube and put it in the blue floor zone. | Cube lifted clear of the floor, then fully inside the zone, released and settled. |
 | Color Sort | Put the red and blue cubes in their matching colored zones. | Both cubes individually lifted, released, fully contained, and settled in the correct zones. |
 | Remember and Recharge | Remember the starting cyan charger, visit the orange survey zone behind a screen, then return when the battery is low. | Complete the survey, return to the original pad after the warning, and recharge to at least 90%. |
+| Clinic Supply Delivery | Navigate reception, bypass the maintenance barrier, and enter treatment through diagnostics. | Grounded transit through two ordered checkpoints, then base/wheels fully parked in the green bay. No carried supplies are required or scored. |
+| Warehouse Dispatch Circuit | Route around offset stock racks in a 10 x 8 m warehouse, following blue, orange, then green checkpoints. | Ordered grounded crossings, followed by full dispatch-bay parking for one simulated second. Scripted route exceeds 20 m. |
+| Service Gallery Inspection | Search an 8 x 8 m equipment gallery behind occluding partitions; reject the red decoy. | Yellow target within 0.9 m, unobstructed head-camera visibility and a stationary one-second inspection. Scripted route exceeds 15 m. |
+| Cluttered Assembly Workshop | Use both arms to sort small cubes among fixed divider blocks, parts racks and a workbench. | Both cubes lifted, released, fully inside matching squares and settled on the floor. |
 
 The checklist uses actual physics measurements, not an LLM's claim. For pick-and-place tasks it records a lift while held by grasp assistance or real opposing finger contacts. Pushing a cube into a zone, holding it above the zone, placing it partly outside, or swapping colors does not count. Zones are visible floor markings with no collision surface. Cubes are used because they match the current validated gripper; spherical-object manipulation is not included in these presets.
 
 **Reset episode** restarts the currently loaded task. Choose **Practice bench** to return to unscored practice. Loading or resetting interrupts text/voice control and invalidates previous-episode commands; connection configuration is preserved. Scene positions, grasp history, and scoring stay on the backend. Models receive only the public goal, their normal robot sensors, and head-camera images. The model may need to tilt or turn the head to inspect objects on the floor.
 
-All six tasks' physical completion checks have been satisfied by scripted commands through real physics, including both cubes in one Color Sort episode, the full charger round trip, apartment search through both doorways, and navigation from the kitchen to the bathroom. This establishes feasibility, not autonomous room recognition or model success rates. Progress reflects the current physical state: a completed objective can become incomplete if its conditions no longer hold. No run history or benchmark result is persisted.
+All ten tasks' physical completion checks have been satisfied by scripted commands through real physics, including both workshop pickups and the new long routes. This establishes feasibility, not autonomous room recognition or model success rates. Ordered-route intermediate checkpoints retain visit history; the final destination must still satisfy its current conditions, so leaving or moving clears completion. Transit does not count without floor contact. No run history or benchmark result is persisted.
+
+### Testing Capabilities
+
+Use **Single step** for general camera-guided tasks and manipulation. **Navigation plan** supports bounded navigation only: warehouse and inspection are useful tests of route selection, occlusion, progress and recovery. The workshop tests the canonical arm/gripper tools. The experimental SmolVLA checkpoint remains a left-arm-only policy trained on a different small fixture; it is not validated for these grounds or both-arm workshop operation. Loading a challenge does not train model weights or export demonstrations.
+
+Start with Park, then Clinic, then Warehouse for navigation. Compare Apartment and Service Gallery for visual search. Compare Color Sort and Workshop for manipulation. Keep model, feedback interval, image count and retained context fixed for comparable attempts, reset before each run, and record actual completion, actions, contacts, elapsed time, tokens and any manual placement. The exchange feed can be copied before resetting. Report a manual-assisted result separately from an autonomous run.
+
+The grounds are fixed and repeatable, not randomized or held-out benchmarks. Furniture is simplified rigid geometry; there are no pedestrians, moving doors or soft-body hazards. Workshop fixture avoidance and keeping the base parked are task instructions, not separate scored objectives; lift/release/settle is the measured success condition. Large spectator views fit the actual floor on desktop/mobile but remain privileged operator views, never model maps.
 
 ### Apartment Search
 
@@ -102,7 +125,7 @@ Parking in the orange zone for one simulated second completes a scan that consum
 
 Use the bounded `wait` tool to advance survey/charging time; `observe` alone does not advance physics. The manual **Wait** button uses the selected duration. Zero charge blocks further movement, so an empty robot stranded outside the charger requires an episode reset. Battery percentage, low-battery state, and charging state appear in the sensor panel and exchange feed. They are the only new model-visible battery data.
 
-This task defaults to 100 model turns. Its text-model controller preserves the first genuine camera/sensor observation as a historical reference even after the recent six-turn context window rolls over. Current feedback remains last in the request, and the feed identifies the remembered frame. Voice uses its existing conversation history. This fixed-layout exercise practices memory-guided navigation; it is not a held-out memory benchmark or a realistic hardware battery model.
+This task defaults to 100 model turns. With **Images per request** set to at least two, its text-model controller reserves a historical image slot for the first genuine camera/sensor observation when that image differs from the current view. The reference counts toward the selected image limit and is identified in the feed. At one image, only the current view is sent. Voice uses its existing conversation history. This fixed-layout exercise practices memory-guided navigation; it is not a held-out memory benchmark or a realistic hardware battery model.
 
 ## Chat and Voice Modes
 
@@ -153,6 +176,21 @@ The model receives the actual head-camera PNG and the `AgentObservation` sensor 
 
 Feedback interval is a minimum wall-clock interval between fresh model inputs, adjustable from 0.25 to 30 seconds (default 2 seconds), including during a run using **Apply rate**. Model requests do not overlap. In single-step mode, physics holds during inference and feedback delays; the explicit `wait` tool advances simulated time while holding position. Navigation plan mode can execute a bounded buffer during inference, as described below. This is inference-based robot control, not model weight training.
 
+### Images and Retained Context
+
+Chat and navigation share two settings, applied on the next start or typed follow-up:
+
+- **Images per request:** 1-8, default 1. Each request includes the current image plus distinct recent model-observation images as they accumulate. The first request may have only one available view. Older images include their own sensor readings and timestamps; they are not current observations. The setting does not trigger extra motion or capture a burst of identical images. All frames come from the robot head camera, never the spectator.
+- **Retained context (tokens):** 0-32,768, default 4,096. This is a conservative estimate for past text turns and recent-action summaries, using UTF-8 bytes plus message overhead. Oldest complete turns are discarded without splitting tool calls from replies. Zero removes text history and action summaries; the active request and current feedback remain. Selected images and their paired observations, current goal, tools, and fresh sensors are additional inputs, so this is not a cap on the total provider input tokens.
+
+Historical images are not also replayed through text history. The exchange feed shows every image actually submitted and the retained-context estimate; the usage tracker still shows actual provider-reported tokens. More images increase input cost, and a larger Ollama context may increase GPU/RAM use. These controls do not change Realtime voice conversation retention. No fixed six-turn or three-turn cap remains; a 200-turn memory guard supplements the token budget.
+
+For Luna supervision, start with **2 images and 8,192 retained-history tokens**. This supplies the current view and one distinct historical comparison as available. For longer search/recovery tasks, try 3 images and 16,384 only after checking latency and useful recall. These are starting recommendations, not measured optimal settings; defaults remain 1 image and 4,096. SmolVLA uses its separate single paired head-camera/state input and active skill instruction, not the supervisor's chat-history budget.
+
+System instructions and the active run's goal are resent on every model request, outside trimmed history. Chat also resends the current typed command at every tool step, even with zero retained history. This prevents truncation from deleting the active task, but does not guarantee the model follows it. A new chat follow-up becomes the active command: earlier chat details can be trimmed. Keep task-wide constraints in **Robot goal**, or restate them explicitly when changing the task. Skill instructions remain local task-manager state until cancellation/replacement.
+
+**Request context** shows the latest dispatched request's estimated retained history against its configured budget, retained turns, actual image count and provider-reported input tokens when available. **Active command (resent)** exposes the protected command. The meter is **not** the deployment's full context-window utilization: instructions, tools, current sensors, images and response allowance are additional. No verified full-window limit is configured, so no full-window percentage is invented. Run token totals remain separate. Editing settings affects the next run, not the displayed past request. Pending requests clear their reported input count; disconnected views are marked **Last received**.
+
 ### Navigation Plan Mode
 
 Load an apartment scenario, choose your model, select **Navigation plan**, and click **Start LLM control**. Selecting the mode sets the initial feedback interval to 0.25 s; it remains adjustable. **Single step** is the default and remains available for manipulation and comparison. Realtime voice continues using single-step tools.
@@ -168,13 +206,37 @@ The model constructs an ordered plan: **Inspect room -> Locate doorway -> Approa
 
 This mode is a simulator task executor, not a pretrained VLA or automatic Luna/Gemma supervisor. It does not provide a hidden map or a geometric target location to the model. Doorway recognition, room interpretation, and visual completion evidence remain model judgments. The model can replace its plan after reviewing new observations. Autonomous performance and hard real-time behavior are not claimed; see [docs/MECHANICS.md](docs/MECHANICS.md) for freshness and safety bounds.
 
+### Local Navigation Fine-Tune
+
+A separate **native Windows SmolVLA navigation checkpoint** is now trained for short green-bay docking. It uses the head camera plus wheel/head/range readings and predicts forward speed and turn rate. The existing navigation worker executes bounded one-second segments; it does not receive hidden targets from the model. In four fixed held-out cases, the learned controller reached every bay and completed the full parking/stop test in **three**; the fourth kept making corrections and exhausted its request budget.
+
+This is a small docking pilot, not general warehouse navigation. Dataset: 16 scripted and replay-verified routes, 276 paired samples, 12 training episodes and four held out. Fine-tuning: 1,000 actual optimizer updates, separate from the arm checkpoint. Target saturation and the stop deadband are logged; initial inspect/locate scans are scripted. No live UI option or production policy-server change was made. [Training details, limits, evidence and repeat commands](docs/SMOLVLA.md#local-navigation-fine-tune).
+
+An experimental **1,500-total-step stopping candidate** adds 500 updates with training-only balanced stop/move sampling. It completes the previously failed stopping case. In a matched comparison on four new offsets, both checkpoints park successfully, while total commands fall from 81 to 74 but velocity saturation increases from 20 to 27 requests. The original checkpoint stays the default; this is a modest docking improvement, not general navigation. [Results and explicit candidate test command](docs/SMOLVLA.md#navigation-stopping-experiment).
+
+To test the new checkpoint in isolated real physics, using a fresh output directory:
+
+```powershell
+./.runtime/env/python.exe -m scripts.navigation_policy --stage evaluate --case 12 --seed 713 --output .runtime/navigation-local-retest
+```
+
+**Keep Single step and Navigation plan.** Single step supports precise actions, manipulation, comparison and recovery. Planning is appropriate for multi-stage navigation, with local learned skills potentially executing bounded subgoals. The existing default and both mode controls remain unchanged; this checkpoint is not interchangeable with the seven-axis `Luna + SmolVLA` arm policy.
+
+### Luna + SmolVLA
+
+The opt-in **Luna + SmolVLA** execution mode keeps the selected Foundry model as a task supervisor and runs a local SmolVLA policy through an independent task manager. The supervisor selects a left-arm pick/place instruction, observes progress, and cancels or reports completion; only the worker accepts and executes bounded numeric policy chunks. The base, head and right arm remain fixed. **Local manipulation** shows the policy buffer, latency and rejected chunks, and the **Policy** exchange filter exposes the request/action trace.
+
+This mode requires a **Milo-trained checkpoint** and local policy server, normally at `http://127.0.0.1:8085`. It refuses base-model or incompatible-embodiment execution. Setup, the seven-axis checkpoint contract, cancellation behavior and remaining limitations are in [docs/SMOLVLA.md](docs/SMOLVLA.md). Five scripted, physical-only pick/place demonstrations have been recorded, replayed, and exported with real LeRobot 0.6.1 (3,600 paired frames). Reopened pixels, state/actions, timing, normalization statistics and episode-end action padding are verified. Native Windows CUDA and a 1,100-total-step fine-tuned checkpoint now work. Raw chunks still fail action validation; an explicitly approved, opt-in trajectory adapter produces visible arm/gripper movement. A Windows pacing fix removed premature expiry in the repeated isolated trials: all 70 accepted chunks completed, but none of three trials lifted or placed the cube. The candidate remains disabled for live control. See [timing results and repeat commands](docs/SMOLVLA.md#windows-policy-timing-fix); broader demonstrations, action quality and learned task success remain outstanding.
+
+Policy mode renders timestamped camera snapshots in a separate process instead of rendering continuously on the physics thread. The camera footer reports the actual image size. This avoids that specific blocking path but is not a new hard-real-time performance claim. Single-step, navigation and Realtime voice retain their existing behavior.
+
 ### Gemma Through Ollama
 
 Start Ollama and ensure `gemma4:e2b-it-qat` is downloaded (`ollama pull gemma4:e2b-it-qat`). In the app, load a challenge, select **Gemma 4 E2B (Ollama)**, and click **Start LLM control**, or send a message in Chat. **None** reasoning is selected automatically and every Ollama request sets `think=false`. Voice still uses the separately configured Foundry Realtime model.
 
 The default endpoint is `http://127.0.0.1:11434`. **Model connection** allows editing the provider, local endpoint, label, and model tag without overwriting the Foundry endpoint or other profiles. Only HTTP loopback addresses are accepted. `OLLAMA_ENDPOINT` can override the startup endpoint. Gemma works without Azure credentials, and no cloud fallback occurs if Ollama is offline or the model is missing. A configured indicator identifies saved settings, not server reachability or model availability.
 
-Ollama receives only the existing robot camera/sensor history and tool results. Its native tool calls pass through the same single-action validator and worker as Foundry. Requests use a 16,384-token context and a 1,024-token output cap, with the existing 45-second inference timeout. Private thinking is discarded. The exchange feed and token tracker include local responses; these counts are usage statistics, not cloud charges. Both single-step and navigation plan modes are available. There is no automatic Luna supervision.
+Ollama receives only the existing robot camera/sensor history and tool results. Its native tool calls pass through the same single-action validator and worker as Foundry. Requests use at least a 16,384-token runtime context, increased in 8,192-token steps for larger retained-context/image settings (up to 49,152 at the maximum settings), and a 1,024-token output cap. The existing 45-second inference timeout remains. Model support and local memory can still limit accepted input sizes. Private thinking is discarded. The exchange feed and token tracker include local responses; these counts are usage statistics, not cloud charges. Both single-step and navigation plan modes are available. There is no automatic Luna supervision.
 
 Start with short goals and a small turn limit, and keep Stop available. A live integration check completed one head turn followed by Stop, but autonomous navigation and manipulation quality remain unbenchmarked. Small-model direction and planning mistakes are still possible. Cold image/prompt processing can be much slower than repeated requests; a low feedback interval does not guarantee that inference cadence.
 
@@ -238,7 +300,7 @@ The Foundry adapter uses the OpenAI Responses API with `store=false`, preserves 
 - Manual REST and WebSocket API, original-geometry spectator renderer, head image panel, manual controls, and a session-local action timeline.
 - Foundry vision/tool adapter, paced LLM control, configurable model profiles, inference cancellation, manual takeover, and bounded session activity.
 - On-demand Foundry Realtime voice control, microphone capture, spoken audio playback, transcripts, and shared robot tool/feedback traces.
-- Four loadable challenge scenes, public task goals, and private physics-based progress checks for navigation, cube manipulation, and return-to-charge memory.
+- Ten loadable challenge scenes, grouped by capability, with private physics-based checks for ordered navigation, occluded search, cube manipulation, and return-to-charge memory.
 
 See [docs/MECHANICS.md](docs/MECHANICS.md) for frames, controls, and approximations. See [docs/VALIDATION.md](docs/VALIDATION.md) for verified behavior and remaining limitations.
 
@@ -247,7 +309,7 @@ See [docs/MECHANICS.md](docs/MECHANICS.md) for frames, controls, and approximati
 1. Mechanical vertical slice: backend mechanics and frontend build/browser gates passed.
 2. Foundry control loop and UI: implemented and tested; live GPT-5.2 image/sensor/tool probe passed. Luna binding and autonomous task performance remain unverified.
 3. Ollama vision/tool adapter: implemented, with an isolated live Gemma head-turn/Stop check. Other local runtimes and hybrid supervision remain unimplemented.
-4. Four curated challenges and private physics checks: implemented and tested. Randomized challenges, held-out seeds, and benchmark scoring remain pending.
+4. Ten curated challenges and private physics checks: implemented and tested. Randomized challenges, held-out seeds, and persistent benchmark scoring remain pending.
 5. Experiment persistence, replay, comparisons, and exports: not implemented.
 
 The robot can execute LLM-selected actions when a compatible Foundry deployment is configured and the user starts control. Autonomous navigation and pickup success have not been benchmarked. There are no saved navigation or pick-and-place demonstration runs yet. Manual and LLM timelines are in-memory and are not persistent replay systems.

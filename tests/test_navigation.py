@@ -40,6 +40,144 @@ def complete(runtime, sim):
         expected_revision=revision, evidence="Fixture observation reviewed in the camera"), sequence)
 
 
+def test_navigation_recording_and_replay_use_real_wheels_without_private_model_features(tmp_path):
+    from scripts.navigation_policy import CASES, STATE_NAMES, challenge_for, load_episode, record_episode, replay_episode
+    directory = tmp_path / "episode-000"
+    sim = BulletSimulation(challenge=challenge_for(CASES[0]), width=160, height=120)
+    try:
+        result = record_episode(sim, CASES[0], directory)
+        assert result["success"] and result["travel_m"] > .5
+    finally:
+        sim.close()
+    import json
+    path = directory / "frames.json"
+    original = path.read_text()
+    for key, value in (("timestamp", .5), ("action", [9, 0]), ("observation.state", [float("nan")] * 20),
+                       ("private_target", [1, 1]), ("image_sha256", "incorrect")):
+        corrupted = json.loads(original)
+        corrupted[0][key] = value
+        path.write_text(json.dumps(corrupted))
+        with pytest.raises(ValueError):
+            load_episode(directory)
+    path.write_text(original)
+    metadata, frames = load_episode(directory)
+    assert len(STATE_NAMES) == len(frames[0]["observation.state"]) == 20
+    assert not {"target", "case", "position", "geometry"} & frames[0].keys()
+    sim = BulletSimulation(challenge=challenge_for(CASES[0]), width=160, height=120)
+    try:
+        result = replay_episode(sim, metadata, frames)
+        assert result["success"] and result["max_state_error"] < 1e-5
+    finally:
+        sim.close()
+
+
+def test_stopping_evaluation_cases_are_disjoint_from_training_and_validation():
+    from scripts.navigation_policy import CASES, EVALUATION_CASES
+    fixture = lambda case: (*case["target"], case["doorway"])
+    assert len(CASES) == 16 and sum(case["split"] == "train" for case in CASES) == 12
+    assert len(EVALUATION_CASES) == 4
+    assert {fixture(case) for case in CASES}.isdisjoint({fixture(case) for case in EVALUATION_CASES})
+    assert all(case["split"] == "evaluation_only" for case in EVALUATION_CASES)
+    assert [case["id"] for case in CASES + EVALUATION_CASES] == list(range(20))
+
+
+async def test_navigation_comparison_matches_seeds_and_retains_premature_stop_failures(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from scripts import navigation_policy
+    calls = []
+    baseline, candidate = tmp_path / "baseline", tmp_path / "candidate"
+
+    async def fake_evaluate(options):
+        calls.append(options)
+        failed = options.checkpoint == candidate and options.case == 16
+        return {"weights_sha256": options.checkpoint.name, "success": not failed,
+                "status": "stopped_outside_bay" if failed else "parked", "saturated_requests": int(failed),
+                "requests": [{"index": 0, "measured": {"parked": not failed}}], "final": {"parked": not failed}}
+
+    monkeypatch.setattr(navigation_policy, "evaluate", fake_evaluate)
+    output = tmp_path / "results"
+    await navigation_policy.compare(SimpleNamespace(output=output, baseline=baseline, checkpoint=candidate, seed=800, requests=30))
+    assert len(calls) == 8
+    for index in range(0, len(calls), 2):
+        first, second = calls[index:index + 2]
+        assert first.case == second.case == 16 + index // 2
+        assert first.seed == second.seed == 800 + first.case
+        assert first.requests == second.requests == 30
+        assert first.checkpoint == baseline and second.checkpoint == candidate
+    summary = json.loads((output / "comparison.json").read_text())
+    assert summary["complete"] and not summary["controller_changed"]
+    assert summary["totals"]["baseline"]["successes"] == 4
+    assert summary["totals"]["candidate"] == {"trials": 4, "successes": 3, "premature_stops": 1,
+                                               "requests": 4, "saturated_requests": 1}
+    assert "does not isolate" in summary["qualification"]
+
+
+def test_navigation_policy_state_uses_only_head_wheel_and_range_measurements():
+    from types import SimpleNamespace
+    from scripts.navigation_policy import DIRECTIONS, STATE_NAMES, state_vector
+    readings = [SimpleNamespace(direction=name, status="hit", distance_m=.7) for name in DIRECTIONS]
+    readings[1] = SimpleNamespace(direction=DIRECTIONS[1], status="clear", distance_m=None)
+    readings[2] = SimpleNamespace(direction=DIRECTIONS[2], status="occluded", distance_m=None)
+    observation = SimpleNamespace(head_rad=[.1, .4], joints=[SimpleNamespace(name="left_wheel", velocity=1.),
+        SimpleNamespace(name="right_wheel", velocity=2.)], proximity=SimpleNamespace(distances=readings),
+        target=[99, 99], robot_position=[20, 30, 0])
+    result = state_vector(observation)
+    assert len(result) == len(STATE_NAMES) == 20
+    assert result[:4] == pytest.approx([.1, .4, .135, .09 / .38])
+    assert result[4:7] == [.7, 2., 0.]
+    assert result[12:15] == [1., 0., -1.]
+
+
+def test_navigation_velocity_adapter_logs_saturation_and_rejects_invalid_output():
+    from scripts.navigation_policy import bounded_velocity
+    assert bounded_velocity([.1, -.2]) == ([.1, -.2], [])
+    assert bounded_velocity([.2, -.7]) == ([.15, -.5], ["linear_mps", "angular_radps"])
+    for invalid in ([1], [1, 2, 3], [float("nan"), 0], [float("inf"), 0]):
+        with pytest.raises(ValueError, match="two finite"):
+            bounded_velocity(invalid)
+
+
+def test_navigation_training_contract_is_separate_from_manipulation():
+    from types import SimpleNamespace
+    from scripts.navigation_policy import ACTION_NAMES, STATE_NAMES
+    from scripts.train_milo import validate_dataset
+    dataset = SimpleNamespace(fps=1, num_episodes=16, features={
+        "action": {"names": ACTION_NAMES, "shape": (2,), "dtype": "float32"},
+        "observation.state": {"names": STATE_NAMES, "shape": (20,), "dtype": "float32"},
+        "observation.images.head": {"shape": (240, 320, 3), "dtype": "image"}})
+    validate_dataset(dataset, navigation=True)
+    with pytest.raises(ValueError):
+        validate_dataset(dataset)
+    dataset.features["action"]["names"] = ACTION_NAMES[::-1]
+    with pytest.raises(ValueError, match="contract"):
+        validate_dataset(dataset, navigation=True)
+
+
+def test_navigation_checkpoint_rejects_arm_weights_and_tampered_weights(tmp_path):
+    import hashlib
+    import json
+    from scripts.navigation_policy import ACTION_NAMES, EMBODIMENT, STATE_NAMES, load_checkpoint
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "model.safetensors").write_bytes(b"navigation")
+    report = {"status": "trained_and_reloaded", "embodiment": EMBODIMENT,
+        "weights_sha256": hashlib.sha256(b"navigation").hexdigest(), "state_names": STATE_NAMES,
+        "action_names": ACTION_NAMES, "reloaded_output": {"shape": [1, 1, 2]}}
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report))
+    assert load_checkpoint(checkpoint)[0] == checkpoint
+    report["embodiment"] = "milo-left-arm-v1"
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="navigation-specific"):
+        load_checkpoint(checkpoint)
+    report["embodiment"] = EMBODIMENT
+    path.write_text(json.dumps(report))
+    (checkpoint / "model.safetensors").write_bytes(b"modified")
+    with pytest.raises(ValueError, match="navigation-specific"):
+        load_checkpoint(checkpoint)
+
+
 def test_navigation_skill_order_limits_and_feedback_checkpoints():
     with pytest.raises(ValidationError):
         NavigationPlan(expected_revision=0, steps=[{"skill": "cross", "goal": "Skip inspection"}])

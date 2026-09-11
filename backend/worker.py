@@ -10,9 +10,31 @@ import numpy as np
 from PIL import Image
 from pydantic import ValidationError
 
-from backend.contracts import NavigationFeedback, ToolResult
+from backend.contracts import AgentObservation, NavigationFeedback, SkillFeedback, ToolResult
 from backend.navigation import NAVIGATION_TOOLS, NavigationRuntime
-from backend.simulation import BulletSimulation, MotionError
+from backend.policy import SKILL_TOOLS, SkillRuntime
+from backend.simulation import BulletSimulation, MotionError, TIMESTEP
+
+
+class PolicyPacer:
+    def __init__(self, clock=time.perf_counter):
+        self.clock = clock
+        self.reset()
+
+    def reset(self):
+        self.deadline = None
+        self.revision = None
+
+    def wait(self, cancel, revision, started):
+        now = self.clock()
+        if self.deadline is None or revision != self.revision or now - self.deadline > .05:
+            self.deadline = started + TIMESTEP
+        else:
+            self.deadline += TIMESTEP
+        self.revision = revision
+        remaining = self.deadline - self.clock()
+        if remaining > 0:
+            cancel.wait(remaining)
 
 
 class CameraActivity:
@@ -53,21 +75,29 @@ class SimulationWorker:
         self.camera_activity = CameraActivity()
         self.stop_revision = 0
         self.navigation = None
+        self.skill = None
+        self.renderer = None
+        self.render_frame = None
+        self.render_requested_at = 0
+        self.policy_pacer = PolicyPacer()
         self.thread = threading.Thread(target=self._run, name=f"physics-{epoch}", daemon=True)
         self.thread.start()
 
     def _publish(self):
         self.latest = {**self.latest, "snapshot": self.sim.snapshot(), "challenge": self.sim.challenge_status(),
                    "proximity": self.sim.proximity_sensors().model_dump(),
-                   "navigation": self.navigation.state() if self.navigation else None}
-        if time.monotonic() - self.camera_published_at >= self.camera_interval_s:
+                   "navigation": self.navigation.state() if self.navigation else None,
+                   "skill": self.skill.state() if self.skill else None}
+        if self.renderer:
+            self._render_update()
+        elif time.monotonic() - self.camera_published_at >= self.camera_interval_s:
             self._publish_camera()
-        if self.pace:
+        if self.pace and not self.renderer:
             remaining = self.wall_start + (self.sim.ticks - self.tick_start) / 240 - time.monotonic()
             if remaining > 0:
                 self.sim.cancel.wait(remaining)
 
-    def _publish_camera(self, image=None):
+    def _publish_camera(self, image=None, simulated_time_s=None):
         if image is None:
             image = self.sim.capture()
         self.camera_activity.sample(image)
@@ -79,8 +109,25 @@ class SimulationWorker:
         self.camera_published_at = time.monotonic()
         self.latest = {**self.latest, "camera": {
             "seq": self.camera_seq, "frame_ref": reference,
-            "simulated_time_s": self.sim.ticks / 240,
+            "simulated_time_s": self.sim.ticks / 240 if simulated_time_s is None else simulated_time_s,
             "url": f"/api/camera/{self.sim.run_id}/{reference}"}}
+
+    def _render_update(self):
+        import pybullet as bullet
+        frame = self.renderer.latest()
+        if frame:
+            data, image, captured_at = frame
+            observation = AgentObservation.model_validate(data)
+            self.render_frame = observation, image, captured_at
+            self._publish_camera(image, observation.simulated_time_s)
+        if time.monotonic() - self.render_requested_at >= .05:
+            self.render_requested_at = time.monotonic()
+            observation = self.sim.observe(render=False)
+            self.renderer.submit({"observation": observation.model_dump(), "captured_at": self.render_requested_at,
+                "bodies": [(body, *bullet.getBasePositionAndOrientation(body, physicsClientId=self.sim.client))
+                           for body in [item["id"] for item in self.sim.objects] + [self.sim.robot]],
+                "joints": [(name, bullet.getJointState(self.sim.robot, index, physicsClientId=self.sim.client)[0])
+                           for name, index in self.sim.joints.items()]})
 
     def _run(self):
         try:
@@ -95,13 +142,36 @@ class SimulationWorker:
             self.sim.on_tick = self._publish
             self.ready.set_result(True)
             while True:
+                if self.skill and self.sim.cancel.is_set() and self.skill.active:
+                    self.skill.cancel(self.sim, "Interrupted by Stop")
+                    self._publish_skill()
                 if self.navigation and self.sim.cancel.is_set() and self.navigation.status in {"running", "awaiting_feedback", "idle"}:
                     self.navigation.cancel(self.sim)
                     self._publish_navigation()
                 try:
                     active = self.navigation and self.navigation.status in {"running", "awaiting_feedback"}
-                    work = self.queue.get(timeout=0 if active and self.navigation.buffer else .05 if active else None)
+                    skill_active = self.skill and self.skill.active
+                    buffered = (active and self.navigation.buffer) or (skill_active and self.skill.buffer)
+                    rendering = self.renderer and not self.sim.cancel.is_set()
+                    work = self.queue.get(timeout=0 if buffered else .01 if skill_active or rendering else .05 if active else None)
                 except Empty:
+                    if rendering and not skill_active:
+                        self._render_update()
+                        continue
+                    if skill_active:
+                        started = time.perf_counter()
+                        if self.renderer and not self.skill.buffer:
+                            self._render_update()
+                        try:
+                            self.skill.tick(self.sim)
+                        except Exception:
+                            self.skill.fail(self.sim, "EXECUTION_FAILED: Policy executor stopped")
+                        self._publish_skill()
+                        if self.pace and self.skill.buffer:
+                            self.policy_pacer.wait(self.sim.cancel, self.skill.motion_revision, started)
+                        else:
+                            self.policy_pacer.reset()
+                        continue
                     try:
                         self.navigation.tick(self.sim)
                     except Exception:
@@ -122,6 +192,8 @@ class SimulationWorker:
             if not self.ready.done():
                 self.ready.set_exception(error)
         finally:
+            if self.renderer:
+                self.renderer.close()
             if self.sim:
                 self.sim.close()
             self.camera_frames.clear()
@@ -136,6 +208,12 @@ class SimulationWorker:
 
     async def execute(self, command, assisted=True):
         def operation(sim):
+            if self.skill and self.skill.active:
+                if command.tool not in {"stop", "observe"}:
+                    raise MotionError("CONTROL_CONFLICT", "Cancel the policy skill before manual motion")
+                if command.tool == "stop":
+                    self.skill.cancel(sim, "Stopped by supervisor")
+                    self._publish_skill()
             if self.navigation and self.navigation.status in {"running", "awaiting_feedback"}:
                 if command.tool not in {"stop", "observe"}:
                     raise MotionError("CONTROL_CONFLICT", "Cancel navigation before manual motion.")
@@ -161,11 +239,21 @@ class SimulationWorker:
                        "snapshot": self.sim.snapshot(), "stopped": self.sim.cancel.is_set()}
 
     def _feedback(self, sim):
-        observation = sim.observe()
+        if self.renderer:
+            self._render_update()
+            cached, image, captured_at = self.render_frame
+            if time.monotonic() - captured_at > 1:
+                raise MotionError("CAMERA_STALE", "Snapshot camera feedback expired")
+            observation = cached.model_copy(deep=True)
+        else:
+            observation = sim.observe()
+            image = sim.frame(observation.frame_ref)
         if self.navigation:
             observation.navigation = NavigationFeedback.model_validate(self.navigation.observe(sim, observation))
+        if self.skill:
+            observation.skill = SkillFeedback.model_validate(self.skill.state())
         self.latest = {**self.latest, "observation": observation.model_dump()}
-        return observation, sim.frame(observation.frame_ref)
+        return observation, image
 
     async def feedback(self):
         return await self.call(self._feedback)
@@ -176,8 +264,100 @@ class SimulationWorker:
                 raise MotionError("CANCELLED", "Navigation start was invalidated by Stop.")
             if self.navigation:
                 self.navigation.cancel(sim, "New navigation session")
+            if self.skill:
+                self.skill.cancel(sim, "Execution mode changed")
+                self.skill = None
+            if self.renderer:
+                self.renderer.close()
+                self.renderer = None
+                self.render_frame = None
             self.navigation = NavigationRuntime() if enabled else None
-            self.latest = {**self.latest, "navigation": self.navigation.state() if self.navigation else None}
+            self.latest = {**self.latest, "navigation": self.navigation.state() if self.navigation else None, "skill": None}
+        await self.call(operation)
+
+    def _publish_skill(self):
+        self.latest = {**self.latest, "skill": self.skill.state(), "busy": bool(self.skill.buffer),
+                       "stopped": self.sim.cancel.is_set()}
+
+    async def begin_skill_mode(self, metadata, expected_stop_revision):
+        def operation(sim):
+            from backend.camera import SnapshotRenderer
+            if sim.cancel.is_set() or self.stop_revision != expected_stop_revision:
+                raise MotionError("CANCELLED", "Skill mode start was invalidated")
+            if self.skill:
+                self.skill.cancel(sim)
+            if self.navigation:
+                self.navigation.cancel(sim)
+                self.navigation = None
+            if not self.renderer:
+                self.renderer = SnapshotRenderer(sim.scene)
+            captured_at = time.monotonic()
+            observation = sim.observe()
+            self.render_frame = observation, sim.frame(observation.frame_ref), captured_at
+            self.skill = SkillRuntime(metadata)
+            self._publish_skill()
+        await self.call(operation)
+
+    async def end_skill_mode(self):
+        def operation(sim):
+            if self.skill and self.skill.active:
+                self.skill.cancel(sim, "Supervisor session ended")
+            if self.renderer:
+                self.renderer.close()
+                self.renderer = None
+                self.render_frame = None
+            if self.skill:
+                self._publish_skill()
+                observation, image = self._feedback(sim)
+                self.latest = {**self.latest, "snapshot": sim.snapshot(), "observation": observation.model_dump()}
+                self._publish_camera(image)
+        await self.call(operation)
+
+    async def execute_skill(self, command):
+        def operation(sim):
+            if command.run_id != sim.run_id or command.episode_epoch != sim.epoch or not self.skill:
+                raise MotionError("CANCELLED", "Skill episode changed")
+            if command.action_id in sim.results:
+                return sim.results[command.action_id]
+            status, code, message = "ok", None, "Skill request accepted; task completion is not implied"
+            try:
+                arguments = SKILL_TOOLS[command.tool].model_validate(command.arguments)
+                self.skill.apply(sim, command.tool, arguments)
+            except (ValidationError, MotionError) as error:
+                status, code = "error", error.code if isinstance(error, MotionError) else "INVALID_ARGUMENT"
+                message = str(error)
+            observation, image = self._feedback(sim)
+            result = ToolResult(action_id=command.action_id, status=status, error=code, message=message, observation=observation)
+            sim.results[command.action_id] = result
+            self.latest = {**self.latest, "result": result.model_dump()}
+            self._publish_skill()
+            self._publish_camera(image)
+            return result
+        return await self.call(operation)
+
+    async def policy_feedback(self):
+        def operation(sim):
+            observation, image = self._feedback(sim)
+            return self.skill.ticket(sim, observation, self.render_frame[2] if self.render_frame else None), observation, image
+        return await self.call(operation)
+
+    async def accept_policy(self, chunk):
+        def operation(sim):
+            if not self.skill:
+                raise MotionError("CANCELLED", "Policy mode ended")
+            try:
+                self.skill.accept(sim, chunk)
+            except MotionError:
+                self.skill.rejected_chunks += 1
+                raise
+            self._publish_skill()
+        await self.call(operation)
+
+    async def fail_policy(self, reason):
+        def operation(sim):
+            if self.skill and self.skill.active:
+                self.skill.fail(sim, reason)
+                self._publish_skill()
         await self.call(operation)
 
     async def pause_navigation(self, reason):
@@ -219,6 +399,8 @@ class SimulationWorker:
 
     async def reposition(self, placement):
         def operation(sim):
+            if self.skill and self.skill.active:
+                raise MotionError("CONTROL_CONFLICT", "Cancel the policy skill before placement")
             if self.navigation and self.navigation.status in {"running", "awaiting_feedback"}:
                 raise MotionError("CONTROL_CONFLICT", "Cancel navigation before placement.")
             observation = sim.reposition(placement)

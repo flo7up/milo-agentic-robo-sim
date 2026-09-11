@@ -54,7 +54,7 @@ class BulletSimulation:
             {"name": "floor", "size": [6, 6, .1], "position": [0, 0, -.05], "color": [.77, .80, .79, 1]},
             {"name": "back_wall", "size": [.1, 6, 1], "position": [2.5, 0, .5], "color": [.50, .57, .56, 1]},
             {"name": "cube", "size": [.06, .06, .06], "position": [.36, .25, .032], "color": [.86, .17, .27, 1], "mass": .08}]
-        self.scene = [{**item, "texture": scene_material(item, bool(challenge and challenge.id in {"apartment", "kitchen_bathroom"}))} for item in self.scene]
+        self.scene = [{**item, "texture": scene_material(item, bool(challenge and challenge.id in {"apartment", "kitchen_bathroom", "clinic_delivery"}))} for item in self.scene]
         textures = {name: bullet.loadTexture(str(path), physicsClientId=self.client) for name, path in ensure_textures().items()}
         for client in (self.client, self.planner):
             bullet.setGravity(0, 0, -9.81, physicsClientId=client)
@@ -293,10 +293,15 @@ class BulletSimulation:
                 return solution.x
         raise MotionError("UNREACHABLE_TARGET", "IK could not satisfy position/orientation tolerances")
 
-    def _check_trajectory(self, side, current, target):
+    def _check_trajectory(self, side, current, target, opening=None):
         self._sync_planner()
         moving = self.arms[side] + [self.palms[side]] + self.fingers[side]
         for fraction in np.linspace(0, 1, max(2, math.ceil(max(abs(target - current)) / .025))):
+            if opening is not None:
+                for joint in self.fingers[side]:
+                    initial = bullet.getJointState(self.robot, joint, physicsClientId=self.client)[0]
+                    bullet.resetJointState(self.shadow, joint, initial + (opening / 2 - initial) * fraction,
+                                          physicsClientId=self.planner)
             self._shadow_pose(side, current + (target - current) * fraction)
             bullet.performCollisionDetection(physicsClientId=self.planner)
             for item in self.objects:
@@ -455,12 +460,13 @@ class BulletSimulation:
         return ProximitySensors(simulated_time_s=self.ticks * TIMESTEP, distances=distances,
                                 collisions=[{"direction": direction, "force_n": round(force, 3)} for direction, force in sorted(forces.items())])
 
-    def observe(self):
+    def observe(self, render=True):
         self.seq += 1
         reference = f"{self.epoch}-{self.seq}.png"
-        self.frames[reference] = self.capture()
-        while len(self.frames) > 16:
-            self.frames.popitem(last=False)
+        if render:
+            self.frames[reference] = self.capture()
+            while len(self.frames) > 16:
+                self.frames.popitem(last=False)
         joints = [JointSensor(name=name, position=state[0], velocity=state[1]) for name, index in self.joints.items()
                   if (state := bullet.getJointState(self.robot, index, physicsClientId=self.client)) and
                   bullet.getJointInfo(self.robot, index, physicsClientId=self.client)[2] != bullet.JOINT_FIXED]

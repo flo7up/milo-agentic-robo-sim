@@ -7,7 +7,7 @@ export function HeadCamera({ frame }: { frame: CameraFrame }) {
   latest.current = frame;
   const refresh = useRef<(force?: boolean) => void>(() => {});
   const objectUrls = useRef(new Set<string>());
-  const [displayed, setDisplayed] = useState<{ frame: CameraFrame; url: string } | null>(null);
+  const [displayed, setDisplayed] = useState<{ frame: CameraFrame; url: string; width: number; height: number } | null>(null);
   const [error, setError] = useState(false);
 
   useEffect(() => {
@@ -33,7 +33,7 @@ export function HeadCamera({ frame }: { frame: CameraFrame }) {
         decoded.src = objectUrl;
         await decoded.decode();
         if (active) {
-          setDisplayed({ frame: selected, url: objectUrl });
+          setDisplayed({ frame: selected, url: objectUrl, width: decoded.naturalWidth, height: decoded.naturalHeight });
           setError(false);
         }
       } catch {
@@ -69,7 +69,7 @@ export function HeadCamera({ frame }: { frame: CameraFrame }) {
   return <>
     <div className="camera-frame">{displayed && <img alt="Authoritative robot head camera" src={displayed.url}
       data-frame={displayed.frame.frame_ref} data-simulated-time={displayed.frame.simulated_time_s} />}</div>
-    <div className="camera-meta"><span>640 x 480 / 65 deg</span><span>Live {displayed?.frame.seq ?? '-'} / {displayed?.frame.simulated_time_s.toFixed(2) ?? '0.00'} s</span></div>
+    <div className="camera-meta"><span>{displayed ? `${displayed.width} x ${displayed.height}` : '-'} / 65 deg</span><span>Live {displayed?.frame.seq ?? '-'} / {displayed?.frame.simulated_time_s.toFixed(2) ?? '0.00'} s</span></div>
     {error && <div className="exchange-error" role="alert"><span>Live camera unavailable</span><button className="icon-button" type="button" aria-label="Retry live camera" title="Retry live camera" onClick={() => refresh.current(true)}><RefreshCw size={16} /></button></div>}
   </>;
 }

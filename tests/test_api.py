@@ -16,6 +16,109 @@ def isolate_foundry_environment(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.mark.parametrize("policy_status", ["unavailable", "incompatible", "untrained", "stop_during_check"])
+def test_policy_start_preflight_does_not_create_failed_sessions_or_ignore_stop(policy_status):
+    from backend.policy import PolicyConnectionError
+    from tests.test_policy import trained_metadata
+
+    class Policy:
+        async def describe(self):
+            if policy_status in {"unavailable", "incompatible"}:
+                raise PolicyConnectionError(policy_status, f"SmolVLA {policy_status}")
+            metadata = trained_metadata()
+            metadata.trained_for_milo = policy_status != "untrained"
+            if policy_status == "stop_during_check":
+                lab.worker.stop()
+            return metadata
+
+        async def close(self):
+            pass
+
+    with TestClient(app) as client:
+        lab.agent.policy_factory = lambda config: Policy()
+        with client.websocket_connect("/api/live") as socket:
+            initial = socket.receive_json()
+            if policy_status != "stop_during_check":
+                check = client.post("/api/policy/check", json={"endpoint": "http://127.0.0.1:8085"})
+                assert check.status_code == 200
+                assert check.json()["status"] == policy_status and not check.json()["ready"]
+            response = client.post("/api/agent/start", json={
+                "run_id": initial["run_id"], "episode_epoch": initial["episode_epoch"],
+                "goal": "Pick up cube", "execution_mode": "supervised_policy"})
+            assert response.status_code == 409
+            state = client.get("/api/state").json()
+            assert state["agent"]["session_id"] == initial["agent"]["session_id"]
+            assert state["agent"]["error"] is None and not state["agent"]["active"]
+            assert state["agent"]["turns"] == 0 and state["snapshot"]["simulated_time_s"] == 0
+            assert client.post("/api/policy/check", json={"endpoint": "http://example.com"}).status_code == 422
+
+
+def test_local_navigation_status_is_read_only_and_never_enters_model_observations(tmp_path, monkeypatch):
+    from backend import local_progress
+    monkeypatch.setattr(local_progress, "PROGRESS_ROOT", tmp_path)
+    with TestClient(app) as client:
+        initial = client.get("/api/state").json()
+        assert client.get("/api/local-navigation/status").json() == {"test": None}
+        progress = local_progress.NavigationProgress(tmp_path / "candidate" / "checkpoint", 15, 30)
+        progress.update(phase="loading")
+        response = client.get("/api/local-navigation/status")
+        assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
+        status = response.json()["test"]
+        assert status["phase"] == "loading" and status["checkpoint"] == "candidate"
+        assert str(tmp_path) not in response.text and "observation" not in status
+        progress.update(phase="running", requests_completed=3)
+        assert client.get("/api/local-navigation/status").json()["test"]["requests_completed"] == 3
+        current = client.get("/api/state").json()
+        assert current["run_id"] == initial["run_id"]
+        assert current["observation"] == initial["observation"]
+        assert current["snapshot"]["simulated_time_s"] == 0 and not current["agent"]["active"]
+        assert client.post("/api/local-navigation/status").status_code == 405
+        assert client.get("/api/local-navigation/status", headers={"Origin": "https://untrusted.example"}).status_code == 403
+        progress.path.write_text("{", encoding="utf-8")
+        assert client.get("/api/local-navigation/status").status_code == 503
+
+
+@pytest.mark.parametrize("phase", ["loading", "warming", "running", "completed", "failed"])
+def test_local_navigation_progress_expiry_and_latest_run(tmp_path, monkeypatch, phase):
+    from backend import local_progress
+    monkeypatch.setattr(local_progress, "PROGRESS_ROOT", tmp_path)
+    monkeypatch.setattr(local_progress.time, "time_ns", lambda: 1)
+    run_ids = iter(["ffffffff-ffff-ffff-ffff-ffffffffffff", "00000000-0000-0000-0000-000000000000"])
+    monkeypatch.setattr(local_progress, "uuid4", lambda: next(run_ids))
+    older = local_progress.NavigationProgress(tmp_path / "older" / "checkpoint", 12, 30)
+    newer = local_progress.NavigationProgress(tmp_path / "newer" / "checkpoint", 15, 30)
+    newer.update(phase=phase)
+    older.update(phase="running")
+    result = local_progress.read_navigation_progress(now=newer.state.updated_at + 16)
+    assert result["checkpoint"] == "newer"
+    assert result["phase"] == (phase if phase in local_progress.TERMINAL_PHASES else "interrupted")
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_local_navigation_progress_write_failure_is_nonfatal(tmp_path, monkeypatch):
+    from backend import local_progress
+    monkeypatch.setattr(local_progress, "PROGRESS_ROOT", tmp_path)
+    progress = local_progress.NavigationProgress(tmp_path / "candidate" / "checkpoint", 15, 30)
+
+    def unavailable(path, target):
+        raise OSError("Progress file temporarily unavailable")
+
+    monkeypatch.setattr(type(progress.path), "replace", unavailable)
+    progress.update(phase="warming")
+    assert progress.state.phase == "warming"
+    assert local_progress.read_navigation_progress()["phase"] == "checking"
+
+
+async def test_local_navigation_progress_records_startup_failure(tmp_path, monkeypatch):
+    from backend import local_progress
+    monkeypatch.setattr(local_progress, "PROGRESS_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        async with local_progress.track_navigation_progress(tmp_path / "candidate" / "checkpoint", 15, 30):
+            raise RuntimeError("startup failed")
+    result = local_progress.read_navigation_progress()
+    assert result["phase"] == "failed" and result["success"] is False
+
+
 def test_shared_scene_texture_endpoints():
     with TestClient(app) as client:
         state = client.get("/api/state").json()
@@ -341,9 +444,14 @@ def test_exchange_feed_frames_survive_live_cache_rotation_and_expire_on_reset():
         image = client.get(live_url).content
         lab.agent.state["session_id"] = "test-trace"
         identifier = lab.agent._trace("feedback", "Camera + sensors submitted", {
-            "observation": state["observation"]}, image=image)
+            "observation": state["observation"]}, image=image, images=[image, image])
         feed = client.get("/api/agent/trace", params={"session_id": "test-trace"}).json()
         trace_url = feed["events"][0]["image_url"]
+        historical_url = feed["events"][0]["image_urls"][1]
+        assert client.get(historical_url).content == image
+        assert client.get(trace_url, params={"index": 2}).status_code == 404
+        assert client.get(trace_url, params={"index": -1}).status_code == 422
+        assert client.get(trace_url, params={"index": 8}).status_code == 422
         assert feed["events"][0]["payload"]["observation"] == state["observation"]
         assert client.get("/api/agent/trace", params={"after": identifier}).json()["events"] == []
         assert client.get("/api/agent/trace", params={"after": -1}).status_code == 422
@@ -355,10 +463,12 @@ def test_exchange_feed_frames_survive_live_cache_rotation_and_expire_on_reset():
         assert client.get(live_url).status_code == 404
         retained = client.get(trace_url)
         assert retained.status_code == 200 and retained.content == image
+        assert client.get(historical_url).content == image
         assert retained.headers["cache-control"] == "no-store"
         client.post("/api/reset")
         assert client.get("/api/agent/trace").json()["events"] == []
         assert client.get(trace_url).status_code == 404
+        assert client.get(historical_url).status_code == 404
         assert client.get("/api/agent/trace", params={"session_id": "test-trace"}).status_code == 409
 
 
@@ -393,7 +503,7 @@ def test_challenge_loading_resets_scene_goal_progress_and_preserves_model_config
         initial = client.get("/api/state").json()
         assert initial["challenge"] is None
         presets = client.get("/api/challenges").json()
-        assert {preset["id"] for preset in presets} == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom"}
+        assert {preset["id"] for preset in presets} == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop"}
         assert all("objects" not in preset for preset in presets)
         config = {"endpoint": "https://test.openai.azure.com", "models": [
             {"id": "model", "label": "Model", "deployment": "test-model"}]}

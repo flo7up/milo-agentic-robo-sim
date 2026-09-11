@@ -70,6 +70,22 @@ def test_retained_context_budget_keeps_complete_pairs_without_old_images():
     assert "input_image" not in json.dumps(kept)
     assert retain_context(turns, cost - 1) == ([], 0)
     assert retain_context(turns, 0) == ([], 0)
+    assert len(retain_context(turns * 4, cost * 12)[0]) == 12
     assert json.dumps(turns) == before
     unicode_turn = [{"role": "user", "content": "\u4f60\u597d"}]
     assert context_token_estimate(unicode_turn) >= len("\u4f60\u597d".encode("utf-8"))
+
+
+def test_camera_batch_bounds_deduplicates_and_labels_paired_historical_sensors():
+    from backend.feedback import camera_batch
+    frames = [feedback_message(observation(index).model_copy(update={"wall_timestamp": float(index)}),
+                               f"camera-{index}".encode()) for index in range(1, 5)]
+    message, selected = camera_batch(frames[-1], frames[:-1], 3, frames[0])
+    assert selected == [frames[3], frames[0], frames[2]]
+    assert message["content"][:2] == frames[3]["content"][:2]
+    historical = [json.loads(part["text"])["historical_camera_observation"] for part in message["content"]
+                  if part["type"] == "input_text" and "historical_camera_observation" in part["text"]]
+    assert [entry["seq"] for entry in historical] == [1, 3]
+    assert len([part for part in message["content"] if part["type"] == "input_image"]) == 3
+    assert camera_batch(frames[-1], frames, 1, frames[0])[1] == [frames[-1]]
+    assert camera_batch(frames[-1], [frames[-1]] * 8, 8)[1] == [frames[-1]]

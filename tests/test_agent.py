@@ -311,6 +311,7 @@ async def test_static_camera_does_not_idle_pending_inference_and_limits_prevent_
         model = ScriptedModel([text_response()])
         controller.model_factory = lambda config: model
         controller.start(worker, start_settings(worker, max_turns=1))
+        assert controller.public()["context_usage"] is None
         await controller.task
         await wait_for_phase(controller, "sleeping")
         assert not controller.state["auto_wake"] and controller.idle_task is None
@@ -321,6 +322,25 @@ async def test_static_camera_does_not_idle_pending_inference_and_limits_prevent_
         worker.stop()
         assert not await worker.resume_manual(expected_stop_revision=generation)
         assert worker.latest["stopped"]
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+async def test_context_input_count_is_cleared_for_a_pending_next_request():
+    worker = SimulationWorker(pace=False)
+    model = ScriptedModel([model_response("observe", "{}"), "wait"])
+    controller = controller_for(model)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        controller.start(worker, start_settings(worker, feedback_interval_s=.25))
+        async with asyncio.timeout(5):
+            while len(model.inputs) < 2:
+                await asyncio.sleep(.01)
+        usage = controller.public()["context_usage"]
+        assert usage["turn"] == 2 and controller.state["input_tokens"] == 10
+        assert usage["input_tokens"] is None and not usage["response_received"]
+        assert usage["instructions_repeated"] and usage["active_command"] == controller.state["goal"]
     finally:
         await controller.halt()
         await worker.close()
@@ -395,7 +415,9 @@ async def test_chat_messages_use_real_feedback_and_bounded_followup_context():
         assert model.inputs[1][-1]["content"][1]["type"] == "input_image"
         assert "function_call_output" in json.dumps(model.inputs[2])
         assert all(secret not in json.dumps(model.inputs) for secret in ("snapshot", "geometry", "robot_position", "completed_objectives"))
-        assert controller.chat_history.maxlen == 6
+        from backend.feedback import context_token_estimate
+        assert sum(context_token_estimate(turn) for turn in controller.chat_history) <= settings.context_tokens
+        assert "input_image" not in json.dumps(list(controller.chat_history))
         with pytest.raises(RuntimeError, match="conversation changed"):
             controller.start(worker, followup)
         with pytest.raises(ValidationError):
@@ -443,6 +465,73 @@ async def test_model_drives_real_physics_with_paced_feedback_and_tool_continuati
         await worker.close()
 
 
+@pytest.mark.parametrize("context_tokens", [0, 12000])
+async def test_multiple_real_camera_images_and_configurable_history(context_tokens):
+    worker = SimulationWorker(pace=False)
+    model = ScriptedModel([model_response("set_head", '{"yaw_rad":0.6,"pitch_rad":0.2,"duration_s":0.5}'),
+                           model_response("set_head", '{"yaw_rad":-0.6,"pitch_rad":0.2,"duration_s":1}', "head-2"),
+                           model_response("stop", "{}", "stop")])
+    controller = controller_for(model)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        controller.start(worker, start_settings(worker, images_per_request=3, context_tokens=context_tokens, feedback_interval_s=.25))
+        await controller.task
+        assert controller.state["phase"] == "completed", controller.state["error"]
+        feedback = [entry for entry in controller.trace()["events"] if entry["kind"] == "feedback"]
+        assert [entry["payload"]["images_in_request"] for entry in feedback] == [1, 2, 3]
+        for request, entry in zip(model.inputs, feedback):
+            images = [part for item in request for part in item.get("content", []) if isinstance(part, dict) and part["type"] == "input_image"]
+            assert len(images) == entry["payload"]["images_in_request"]
+            assert len({part["image_url"] for part in images}) == len(images)
+            assert entry["payload"]["camera_frames"][0]["current"]
+            assert entry["payload"]["retained_context_tokens_estimate"] <= context_tokens
+            assert controller.trace_image_batches[entry["id"]] == [base64.b64decode(part["image_url"].split(",", 1)[1]) for part in images]
+            if context_tokens == 0:
+                assert len(request) == 1 and entry["payload"]["recent_actions"] == []
+                assert entry["payload"]["history_turns"] == []
+        assert not any(secret in json.dumps(model.inputs) for secret in ("robot_position", "snapshot", "geometry", "completed_objectives"))
+        usage = controller.public()["context_usage"]
+        latest = feedback[-1]["payload"]
+        assert usage["retained_tokens_estimate"] == latest["retained_context_tokens_estimate"]
+        assert usage["retained_budget"] == context_tokens
+        assert usage["retained_turns"] == len(latest["history_turns"])
+        assert usage["images_sent"] == usage["image_limit"] == 3
+        assert usage["observation_seq"] == latest["observation"]["seq"]
+        assert usage["input_tokens"] == 10 and controller.state["input_tokens"] == 30
+        assert usage["instructions_repeated"] and usage["response_received"]
+        assert usage["active_command"] == controller.state["goal"]
+        if context_tokens == 0:
+            assert not controller.run_history
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+async def test_zero_context_preserves_active_chat_request_across_tool_steps():
+    goals = []
+    class ChatModel(ScriptedModel):
+        async def respond(self, profile, reasoning, goal, inputs):
+            goals.append(goal)
+            return await super().respond(profile, reasoning, goal, inputs)
+    model = ChatModel([model_response("observe", "{}"), text_response("The camera is clear.")])
+    worker = SimulationWorker(pace=False)
+    controller = controller_for(model)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        settings = ChatStart(**start_settings(worker, context_tokens=0, feedback_interval_s=.25).model_dump(),
+                             message="Inspect and describe the camera without moving")
+        controller.start(worker, settings)
+        await controller.task
+        assert controller.state["phase"] == "completed"
+        assert len(goals) == 2 and all(settings.message in goal for goal in goals)
+        assert len(model.inputs[-1]) == 1 and not controller.chat_history
+        assert controller.public()["context_usage"]["active_command"] == settings.message
+        assert controller.public()["context_usage"]["retained_tokens_estimate"] == 0
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
 async def test_inference_cancel_cannot_move_robot_and_closes_client():
     worker = SimulationWorker(pace=False)
     model = ScriptedModel(["wait"])
@@ -453,6 +542,9 @@ async def test_inference_cancel_cannot_move_robot_and_closes_client():
         controller.start(worker, start_settings(worker))
         await model.entered.wait()
         assert [entry["kind"] for entry in controller.trace()["events"]] == ["session", "feedback"]
+        usage = controller.public()["context_usage"]
+        assert usage["input_tokens"] is None and not usage["response_received"]
+        assert usage["retained_tokens_estimate"] == 0 and usage["images_sent"] == 1
         await controller.halt("Manual takeover")
         model.release.set()
         assert worker.latest["observation"]["odometry_m_rad"] == before
@@ -652,6 +744,14 @@ if __name__ == "__main__":
 
     class BrowserModel(ScriptedModel):
         async def respond(self, profile, reasoning, goal, inputs):
+            if getattr(self, "execution_mode", "single_step") == "supervised_policy":
+                self.inputs.append(inputs)
+                state = json.loads(inputs[-1]["content"][0]["text"])["skill"]
+                if not state["skill"]:
+                    return model_response("start_skill", json.dumps({"expected_revision": state["revision"],
+                        "skill": "pick_place", "instruction": "Scripted policy fixture, not trained task execution"}), call_id="start-skill")
+                await self.release.wait()
+                return model_response("stop", "{}", call_id="stop-policy")
             if getattr(self, "execution_mode", "single_step") == "navigation_plan":
                 self.inputs.append(inputs)
                 state = json.loads(inputs[-1]["content"][0]["text"])["navigation"]
@@ -672,7 +772,8 @@ if __name__ == "__main__":
             if not goal.startswith("Respond to the latest chat message."):
                 return await super().respond(profile, reasoning, goal, inputs)
             messages = [(index, item["content"][0]["text"]) for index, item in enumerate(inputs)
-                        if item.get("role") == "user" and len(item.get("content", [])) == 1 and item["content"][0]["type"] == "input_text"]
+                        if item.get("role") == "user" and len(item.get("content", [])) == 1 and item["content"][0]["type"] == "input_text"
+                        and not item["content"][0]["text"].startswith("{")]
             index, message = messages[-1]
             if message == "Hold your reply":
                 await self.release.wait()
@@ -683,8 +784,10 @@ if __name__ == "__main__":
     @asynccontextmanager
     async def browser_fixture(application):
         async with lifespan(application):
+            from tests.test_policy import BrowserPolicy
             lab.agent = AgentController(FoundryConfig(), lambda config: BrowserModel([
-                model_response(arguments=json.dumps({"linear_mps": .2, "angular_radps": .4, "duration_s": 2})), "wait"]))
+                model_response(arguments=json.dumps({"linear_mps": .2, "angular_radps": .4, "duration_s": 2})), "wait"]),
+                policy_factory=lambda config: BrowserPolicy())
             lab.realtime_config = RealtimeConfig()
             lab.voice_factory = lambda config: RealtimeModel([tool_call(), []])
             yield

@@ -73,6 +73,26 @@ async def test_router_selects_ollama_without_constructing_foundry(monkeypatch):
     assert adapter.client.is_closed
 
 
+async def test_ollama_multi_image_payload_and_context_window():
+    from backend.feedback import camera_batch
+    captured = []
+    def handle(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=local_response("stop"))
+    adapter = await adapter_for(handle)
+    adapter.context_tokens = 32768
+    adapter.images_per_request = 8
+    message, _ = camera_batch(feedback_message(observation(2), b"new"), [feedback_message(observation(1), b"old")], 2)
+    try:
+        await adapter.respond(FoundryConfig().models[2], "none", "Inspect", [message])
+        payload = captured[0]
+        assert [base64.b64decode(image) for image in payload["messages"][1]["images"]] == [b"new", b"old"]
+        assert "historical_camera_observation" in payload["messages"][1]["content"]
+        assert payload["options"]["num_ctx"] == 49152 and payload["think"] is False
+    finally:
+        await adapter.close()
+
+
 @pytest.mark.parametrize("failure", ["multiple", "unknown", "nonfinite", "incomplete", "missing", "offline"])
 async def test_ollama_failed_responses_never_move_robot(failure):
     def handle(request):

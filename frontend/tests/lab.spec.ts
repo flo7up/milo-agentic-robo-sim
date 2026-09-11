@@ -25,6 +25,160 @@ test.beforeEach(async ({ request }) => {
   await request.post('/api/voice/config', { data: { endpoint: '', deployment: '' } });
 });
 
+test('request context indicator distinguishes history estimates from actual request tokens', async ({ page, request }) => {
+  const initial: LiveState = await (await request.get('/api/state')).json();
+  let socket: WebSocketRoute;
+  await page.routeWebSocket('**/api/live', connection => { socket = connection; connection.send(JSON.stringify(initial)); });
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  await page.goto('/');
+  const panel = page.getByRole('region', { name: 'Request context', exact: true });
+  await expect(panel).toContainText('No request measurements available');
+  const usage = { turn: 7, observation_seq: 12, retained_tokens_estimate: 6144, retained_budget: 8192,
+    retained_turns: 2, images_sent: 2, image_limit: 3, input_tokens: 15321, response_received: true,
+    active_command: 'Pick up the red cube. Keep the base parked and avoid the blue object.', instructions_repeated: true };
+  const publish = (context: typeof usage | null, connected = true) => {
+    socket.send(JSON.stringify({ ...initial, agent: { ...initial.agent, input_tokens: 900000,
+      context_usage: context } }));
+    if (!connected) socket.close();
+  };
+  publish(usage);
+  await expect(panel).toContainText('6,144 / 8,192 tokens');
+  await expect(panel).toContainText('15,321 tokens');
+  await expect(panel).not.toContainText('900,000');
+  await expect(panel.getByRole('meter', { name: 'Retained history budget', exact: true })).toHaveAttribute('value', '6144');
+  await expect(panel.getByRole('meter')).toHaveAttribute('max', '8192');
+  await expect(panel).toContainText('Full model window: not configured');
+  await page.getByRole('spinbutton', { name: 'Retained context (tokens)', exact: true }).fill('12000');
+  await expect(panel.getByRole('meter')).toHaveAttribute('max', '8192');
+  await panel.locator('summary').click();
+  await expect(panel).toContainText(usage.active_command);
+  await panel.screenshot({ path: 'test-results/context-indicator-desktop.png' });
+  for (const width of [390, 320]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await panel.screenshot({ path: `test-results/context-indicator-${width}.png` });
+  }
+  socket.send(JSON.stringify({ ...initial, agent: { ...initial.agent,
+    context_usage: { ...usage, turn: 8, input_tokens: null, response_received: false } } }));
+  await expect(panel).toContainText('Not yet reported');
+  socket.send(JSON.stringify({ ...initial, agent: { ...initial.agent,
+    context_usage: { ...usage, input_tokens: null, response_received: true } } }));
+  await expect(panel).toContainText('Not reported');
+  publish({ ...usage, retained_budget: 0, retained_tokens_estimate: 0, retained_turns: 0 });
+  await expect(panel).toContainText('History disabled');
+  await expect(panel.getByRole('meter')).toHaveCount(0);
+  publish(null);
+  await expect(panel).toContainText('No request measurements available');
+  publish(usage, false);
+  await expect(panel).toContainText('Last received');
+});
+
+test('request context telemetry follows real scripted inputs and resets with the episode', async ({ page, request }) => {
+  await request.post('/api/agent/config', { data: { endpoint: 'https://test.openai.azure.com', models: [
+    { id: 'luna', label: 'GPT-5.6 Luna', deployment: 'scripted-supervisor' },
+  ] } });
+  await page.goto('/');
+  await page.getByRole('spinbutton', { name: 'Images per request', exact: true }).fill('2');
+  await page.getByRole('spinbutton', { name: 'Retained context (tokens)', exact: true }).fill('8192');
+  const command = 'Retain this original task during the scripted movement';
+  await page.getByRole('textbox', { name: 'Robot goal', exact: true }).fill(command);
+  await page.getByRole('button', { name: 'Start LLM control', exact: true }).click();
+  const panel = page.getByRole('region', { name: 'Request context', exact: true });
+  await expect.poll(async () => ((await (await request.get('/api/state')).json()) as LiveState).agent.context_usage?.turn).toBe(2);
+  const state: LiveState = await (await request.get('/api/state')).json();
+  expect(state.agent.context_usage?.retained_budget).toBe(8192);
+  expect(state.agent.context_usage?.images_sent).toBe(2);
+  expect(state.agent.context_usage?.retained_tokens_estimate).toBeGreaterThan(0);
+  expect(state.agent.context_usage?.input_tokens).toBeNull();
+  expect(state.agent.context_usage?.active_command).toBe(command);
+  await expect(panel).toContainText('Not yet reported');
+  await page.getByRole('button', { name: 'Take manual control', exact: true }).click();
+  await expect(panel).toContainText('Request 2');
+  await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
+  await expect(panel).toContainText('No request measurements available');
+});
+
+test('offline policy readiness blocks start and chat and preserves single-step control', async ({ page, request }) => {
+  await request.post('/api/agent/config', { data: { endpoint: 'https://test.openai.azure.com', models: [
+    { id: 'luna', label: 'GPT-5.6 Luna', deployment: 'scripted-supervisor' },
+  ] } });
+  let ready = false;
+  let checks = 0;
+  await page.route('**/api/policy/check', route => {
+    checks += 1;
+    return route.fulfill({ json: { ready, status: ready ? 'ready' : 'unavailable',
+      message: ready ? 'Compatible policy server connected; task success is not verified.' : 'SmolVLA server is offline. A local server and Milo-trained checkpoint are required.',
+      metadata: ready ? { checkpoint: 'scripted-test-only' } : null } });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Luna + SmolVLA', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Left-arm policy connection', exact: true })).toBeVisible();
+  await expect(page.locator('.policy-readiness')).toContainText('navigation checkpoints are currently CLI-only');
+  const status = page.getByRole('status', { name: 'Policy connection status', exact: true });
+  await expect(status).toContainText('offline');
+  await expect(page.getByRole('button', { name: 'Start LLM control', exact: true })).toBeDisabled();
+  await page.getByRole('textbox', { name: 'Chat message', exact: true }).fill('Pick up the cube');
+  await expect(page.getByRole('button', { name: 'Send chat message', exact: true })).toBeDisabled();
+  const state: LiveState = await (await request.get('/api/state')).json();
+  expect(state.agent.turns).toBe(0);
+  expect(state.agent.session_id).toBeNull();
+  expect(state.agent.error).toBeNull();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.locator('.policy-readiness').screenshot({ path: 'test-results/policy-offline-mobile.png' });
+  await page.getByRole('button', { name: 'Single step', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Start LLM control', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Send chat message', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Luna + SmolVLA', exact: true }).click();
+  await expect(status).toContainText('offline');
+  ready = true;
+  await page.getByRole('button', { name: 'Check policy connection', exact: true }).click();
+  await expect(status).toContainText('Compatible policy');
+  await expect(page.getByRole('button', { name: 'Start LLM control', exact: true })).toBeEnabled();
+  ready = false;
+  await page.getByRole('textbox', { name: 'SmolVLA endpoint', exact: true }).fill('http://127.0.0.1:8086');
+  await expect(status).toContainText('offline');
+  await expect(page.getByRole('button', { name: 'Start LLM control', exact: true })).toBeDisabled();
+  expect(checks).toBeGreaterThanOrEqual(4);
+});
+
+test('supervised policy mode runs scripted motion and cancels both models on desktop and mobile', async ({ page, request }) => {
+  await request.post('/api/agent/config', { data: { endpoint: 'https://test.openai.azure.com', models: [
+    { id: 'luna', label: 'GPT-5.6 Luna', deployment: 'scripted-supervisor', reasoning_efforts: ['none', 'low'] },
+  ] } });
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Luna + SmolVLA', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'SmolVLA endpoint', exact: true })).toHaveValue('http://127.0.0.1:8085');
+  await expect(page.getByRole('status', { name: 'Policy skill status', exact: true })).toHaveText('Milo-trained checkpoint required');
+  await page.getByRole('textbox', { name: 'Robot goal', exact: true }).fill('Scripted policy transport test');
+  await page.getByRole('button', { name: 'Start LLM control', exact: true }).click();
+  await expect.poll(async () => ((await (await request.get('/api/state')).json()) as LiveState).skill?.policy_requests, { timeout: 15000 }).toBeGreaterThan(0);
+  await expect.poll(async () => ((await (await request.get('/api/state')).json()) as LiveState).snapshot.simulated_time_s).toBeGreaterThan(.2);
+  await expect(page.getByRole('textbox', { name: 'SmolVLA endpoint', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Single step', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Policy', exact: true }).click();
+  await expect(page.locator('.exchange-policy').first()).toBeVisible();
+  await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(20);
+  await expect(page.getByAltText('Authoritative robot head camera')).toHaveJSProperty('naturalWidth', 320);
+  await expect(page.locator('.camera-meta')).toContainText('320 x 240');
+  await page.screenshot({ path: 'test-results/supervised-policy-desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(20);
+  await page.screenshot({ path: 'test-results/supervised-policy-mobile.png', fullPage: true });
+  await page.getByRole('button', { name: 'Cancel policy skill', exact: true }).click();
+  await expect.poll(async () => ((await (await request.get('/api/state')).json()) as LiveState).agent.active).toBe(false);
+  const stopped: LiveState = await (await request.get('/api/state')).json();
+  expect(stopped.skill?.remaining_s).toBe(0);
+  expect(stopped.skill?.status).toBe('cancelled');
+  await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Single step', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  expect(errors).toEqual([]);
+});
+
 test('textures and live proximity readings render in the operator views', async ({ page, request }) => {
   const loadedTextures = new Set<string>();
   const errors: string[] = [];
@@ -117,11 +271,12 @@ test('outcome feedback separates verified completion, agent reports, and unsucce
 });
 
 test('predefined challenges load distinct scenes and goals and reset in place', async ({ page, request }) => {
+  test.setTimeout(120000);
   const presets = await (await request.get('/api/challenges')).json();
   await page.setViewportSize({ width: 1440, height: 1100 });
   await page.goto('/');
   const selector = page.getByRole('combobox', { name: 'Predefined challenge', exact: true });
-  await expect(selector.locator('option')).toHaveCount(7);
+  await expect(selector.locator('option')).toHaveCount(presets.length + 1);
   const signatures = new Set();
   for (const preset of presets) {
     await selector.selectOption(preset.id);
@@ -142,12 +297,51 @@ test('predefined challenges load distinct scenes and goals and reset in place', 
     await expect(selector).toHaveValue(preset.id);
     await expect(page.getByRole('textbox', { name: 'Robot goal', exact: true })).toHaveValue(preset.goal);
   }
-  expect(signatures.size).toBe(6);
+  expect(signatures.size).toBe(presets.length);
   await selector.selectOption('bench');
   await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Floor pickup & release', exact: true })).toBeVisible();
   await expect(page.locator('.challenge-status')).toHaveCount(0);
 });
+
+for (const width of [1440, 390]) {
+  test(`advanced training grounds render and move at ${width}px`, async ({ page, request }) => {
+    test.setTimeout(90000);
+    await page.setViewportSize({ width, height: 1000 });
+    await page.goto('/');
+    const selector = page.getByRole('combobox', { name: 'Predefined challenge', exact: true });
+    await expect(selector.locator('optgroup')).toHaveCount(3);
+    for (const [identifier, title] of [['clinic_delivery', 'Clinic Supply Delivery'], ['warehouse', 'Warehouse Dispatch Circuit'],
+      ['inspection', 'Service Gallery Inspection'], ['workshop', 'Cluttered Assembly Workshop']]) {
+      await selector.selectOption(identifier);
+      await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+      await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+      await expect(page.locator('.challenge-toolbar')).toContainText('Advanced');
+      await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(30);
+      await expect(page.getByAltText('Authoritative robot head camera')).toHaveJSProperty('naturalWidth', 640);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      await page.locator('.spectator-shell').screenshot({ path: `test-results/ground-${identifier}-${width}.png` });
+      await page.locator('.camera-frame').screenshot({ path: `test-results/ground-camera-${identifier}-${width}.png` });
+      if (identifier === 'warehouse') {
+        const before: LiveState = await (await request.get('/api/state')).json();
+        const pixelsBefore = (await spectatorPixels(page)).signature;
+        const response = await request.post('/api/command', { data: {
+          run_id: before.run_id, episode_epoch: before.episode_epoch, observation_seq: before.observation.seq,
+          action_id: `warehouse-drive-${width}`, tool: 'drive_base', arguments: { linear_mps: .15, angular_radps: 0, duration_s: 1 },
+        } });
+        const result = await response.json();
+        expect(result.status).toBe('ok');
+        expect(result.observation.odometry_m_rad[0]).toBeGreaterThan(.05);
+        await expect(page.getByAltText('Authoritative robot head camera')).toHaveAttribute('data-simulated-time', '1');
+        await expect.poll(async () => (await spectatorPixels(page)).signature).not.toBe(pixelsBefore);
+        await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
+        await expect(page.getByAltText('Authoritative robot head camera')).toHaveAttribute('data-simulated-time', '0');
+        await expect(page.locator('.challenge-status')).toHaveText('0 / 3 goals complete');
+      }
+    }
+    await page.screenshot({ path: `test-results/grounds-layout-${width}.png`, fullPage: true });
+  });
+}
 
 test('kitchen to bathroom shows recognizable camera views and resettable arrival', async ({ page, request }) => {
   await page.setViewportSize({ width: 1440, height: 1100 });
@@ -671,6 +865,8 @@ test('LLM selection, paced feedback, real tools, and manual takeover with script
   await expect(page.getByRole('combobox', { name: 'LLM model', exact: true })).toHaveValue('luna');
   await expect(page.getByRole('combobox', { name: 'Reasoning effort', exact: true })).toHaveValue('low');
   await expect(page.getByRole('spinbutton', { name: 'Feedback interval (s)', exact: true })).toHaveValue('2');
+  await expect(page.getByRole('spinbutton', { name: 'Images per request', exact: true })).toHaveValue('1');
+  await expect(page.getByRole('spinbutton', { name: 'Retained context (tokens)', exact: true })).toHaveValue('4096');
   await expect(page.getByRole('button', { name: 'Start LLM control', exact: true })).toBeDisabled();
   await page.locator('.agent-connection summary').click();
   await page.getByRole('textbox', { name: 'Foundry endpoint', exact: true }).fill('https://test.services.ai.azure.com/api/projects/test');
@@ -684,10 +880,14 @@ test('LLM selection, paced feedback, real tools, and manual takeover with script
   await expect(page.getByRole('combobox', { name: 'LLM model', exact: true }).locator('option:checked')).toHaveText('Alternate vision model');
   await page.getByRole('combobox', { name: 'LLM model', exact: true }).selectOption('luna');
   await page.getByRole('textbox', { name: 'Robot goal', exact: true }).fill('Move forward once, then observe.');
+  await page.getByRole('spinbutton', { name: 'Images per request', exact: true }).fill('2');
+  await page.getByRole('spinbutton', { name: 'Retained context (tokens)', exact: true }).fill('12000');
   await page.getByRole('spinbutton', { name: 'Feedback interval (s)', exact: true }).fill('10');
   const startRequest = page.waitForRequest(request => request.url().endsWith('/api/agent/start'));
   await page.getByRole('button', { name: 'Start LLM control', exact: true }).click();
-  expect((await startRequest).postDataJSON()).toMatchObject({ model_id: 'luna', reasoning: 'low', feedback_interval_s: 10, goal: 'Move forward once, then observe.' });
+  expect((await startRequest).postDataJSON()).toMatchObject({ model_id: 'luna', reasoning: 'low', feedback_interval_s: 10, goal: 'Move forward once, then observe.', images_per_request: 2, context_tokens: 12000 });
+  await expect(page.getByRole('spinbutton', { name: 'Images per request', exact: true })).toBeDisabled();
+  await expect(page.getByRole('spinbutton', { name: 'Retained context (tokens)', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Drive forward', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Observe', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Select robot', exact: true })).toBeDisabled();
@@ -713,6 +913,18 @@ test('LLM selection, paced feedback, real tools, and manual takeover with script
   expect((await (await request.get('/api/agent')).json()).feedback_interval_s).toBe(.5);
   await expect(tracker.locator('.token-total dd')).toHaveText('15');
   await expect(feed.locator('[data-kind="feedback"]')).toHaveCount(2);
+  const latestInput = feed.locator('[data-kind="feedback"]').last();
+  await expect(latestInput).toContainText('2 image(s) in request');
+  await expect(latestInput).toContainText('/ 12000 tokens (est.)');
+  await expect(latestInput.getByRole('img')).toHaveCount(2);
+  await latestInput.getByRole('img', { name: /Historical input camera/ }).scrollIntoViewIfNeeded();
+  await expect(latestInput.getByRole('img', { name: /Historical input camera/ })).toHaveJSProperty('naturalWidth', 640);
+  await latestInput.screenshot({ path: 'test-results/camera-batch-desktop.png' });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await latestInput.screenshot({ path: 'test-results/camera-batch-mobile.png' });
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  await feed.evaluate(element => { element.scrollTop = 0; });
   expect(await feed.evaluate(element => element.scrollTop)).toBe(0);
   await page.getByRole('button', { name: 'Inputs', exact: true }).click();
   await expect(feed.locator('article')).toHaveCount(2);
@@ -858,8 +1070,11 @@ test('Chat and Voice are separate modes with text followups and safe switching',
   await composer.fill('Move forward a little');
   await expect(send).toBeEnabled();
   const followupRequest = page.waitForRequest(value => value.url().endsWith('/api/agent/chat'));
+  await page.getByRole('spinbutton', { name: 'Images per request', exact: true }).fill('3');
+  await page.getByRole('spinbutton', { name: 'Retained context (tokens)', exact: true }).fill('12000');
   await send.click();
-  expect((await followupRequest).postDataJSON().conversation_id).toBe(first.agent.session_id);
+  expect((await followupRequest).postDataJSON()).toMatchObject({ conversation_id: first.agent.session_id,
+    images_per_request: 3, context_tokens: 12000 });
   await expect(transcript).toContainText('Movement complete.');
   await expect(transcript.locator('article')).toHaveCount(5);
   await expect.poll(() => transcript.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(2);
@@ -1021,6 +1236,19 @@ test('loaded project selects its configured deployment and explains missing mode
 });
 
 test('navigation plan advances skills, moves during inference, and cancels its buffer', async ({ page, request }) => {
+  let observedMotionDuringInference = false;
+  const firstPhysicsTime = new Map<string, number>();
+  page.on('websocket', socket => {
+    if (!socket.url().endsWith('/api/live')) return;
+    socket.on('framereceived', ({ payload }) => {
+      const state: LiveState = JSON.parse(String(payload));
+      if (state.agent.phase !== 'thinking' || state.navigation?.active_step !== 1 || !state.busy) return;
+      const key = `${state.agent.session_id}:${state.agent.turns}:${state.navigation.revision}`;
+      const first = firstPhysicsTime.get(key);
+      if (first !== undefined && state.snapshot.simulated_time_s > first) observedMotionDuringInference = true;
+      if (first === undefined) firstPhysicsTime.set(key, state.snapshot.simulated_time_s);
+    });
+  });
   await request.post('/api/agent/config', { data: { endpoint: 'https://test.openai.azure.com' } });
   await page.setViewportSize({ width: 1440, height: 1100 });
   await page.goto('/');
@@ -1035,14 +1263,7 @@ test('navigation plan advances skills, moves during inference, and cancels its b
   await expect(plan.locator('li').nth(0)).toHaveAttribute('data-status', 'completed');
   await expect(plan.locator('li').nth(1)).toHaveAttribute('data-status', 'running');
   await expect(plan.locator('li').nth(2)).toHaveAttribute('data-status', 'pending');
-  await expect.poll(async () => {
-    const state: LiveState = await (await request.get('/api/state')).json();
-    return state.agent.phase === 'thinking' && state.navigation?.active_step === 1 && state.busy;
-  }).toBe(true);
-  const moving: LiveState = await (await request.get('/api/state')).json();
-  await expect.poll(async () => (await (await request.get('/api/state')).json()).snapshot.simulated_time_s).toBeGreaterThan(moving.snapshot.simulated_time_s);
-  const later: LiveState = await (await request.get('/api/state')).json();
-  expect(later.agent.turns).toBe(moving.agent.turns);
+  await expect.poll(() => observedMotionDuringInference).toBe(true);
   await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(50);
   const feed = page.getByRole('log', { name: 'Robot and LLM exchanges' });
   await expect(feed.locator('[data-kind="tool"]').filter({ hasText: 'replace_motion_buffer' })).not.toHaveCount(0);

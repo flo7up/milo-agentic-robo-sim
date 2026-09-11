@@ -8,14 +8,23 @@ const channels = {
   response: { icon: Bot, from: 'LLM', to: 'Controller' },
   tool: { icon: Wrench, from: 'Controller', to: 'Robot' },
   result: { icon: CheckCheck, from: 'Robot', to: 'Controller' },
+  policy: { icon: Bot, from: 'SmolVLA', to: 'Task manager' },
 };
-const filters = ['All', 'Inputs', 'LLM', 'Tools', 'Session'] as const;
+const filters = ['All', 'Inputs', 'LLM', 'Tools', 'Policy', 'Session'] as const;
 
 function Payload({ title, value }: { title: string; value: unknown }) {
   return <details className="exchange-payload"><summary>{title}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>;
 }
 
 function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
+  if (entry.kind === 'policy') {
+    return <>
+      {entry.image_url && <a href={entry.image_url} target="_blank" rel="noreferrer">
+        <img src={entry.image_url} alt={`Policy input camera, event ${entry.id}`} width={160} height={120} loading="lazy" />
+      </a>}
+      <Payload title="Policy payload" value={entry.payload} />
+    </>;
+  }
   if (entry.kind === 'feedback') {
     const { observation } = entry.payload;
     return <>
@@ -34,7 +43,18 @@ function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
           {Object.entries(observation.grippers).map(([side, sensor]) => <div key={side}><dt>{side} gripper</dt><dd>{(sensor.aperture_m * 1000).toFixed(0)} mm / {sensor.load_n.toFixed(2)} N</dd></div>)}
         </dl>
       </div>
+      {!!entry.image_urls && entry.image_urls.length > 1 && <div className="exchange-camera-batch" aria-label="Historical camera frames">
+        {entry.image_urls.slice(1).map((url, index) => {
+          const frame = entry.payload.camera_frames?.[index + 1];
+          return <figure key={url}><a href={url} target="_blank" rel="noreferrer" title={`Open historical camera frame ${frame?.seq ?? index + 1}`}>
+            <img src={url} alt={`Historical input camera, frame ${frame?.seq ?? index + 1}`} width={128} height={96} loading="lazy" />
+          </a><figcaption>Frame {frame?.seq ?? index + 1} / {frame?.simulated_time_s.toFixed(2) ?? '-'} s</figcaption></figure>;
+        })}
+      </div>}
       <div className="exchange-meta"><span>{entry.payload.context_mode === 'realtime_conversation' ? 'Realtime conversation' : `Replayed turns: ${entry.payload.history_turns.join(', ') || 'None'}`}</span><span>{entry.payload.images_in_request} image(s) in request</span></div>
+      {entry.payload.context_tokens !== undefined && <div className="exchange-meta" title={entry.payload.context_estimator}>
+        Retained context: {entry.payload.retained_context_tokens_estimate ?? 0} / {entry.payload.context_tokens} tokens (est.)
+      </div>}
       {entry.payload.memory_frame_seq != null && <div className="exchange-meta">Remembered initial frame: {entry.payload.memory_frame_seq}</div>}
       {entry.payload.tool_result_call_ids.length > 0 && <div className="exchange-call-ids">Included tool results: {entry.payload.tool_result_call_ids.join(', ')}</div>}
       {entry.payload.collision_feedback && <p className="exchange-text bad">{entry.payload.collision_feedback.guidance}</p>}
@@ -128,6 +148,7 @@ export function ExchangeFeed({ agent }: { agent: AgentState }) {
   const entries = feed.session_id === agent.session_id ? feed.events : [];
   const shown = entries.filter(entry => filter === 'All' || (filter === 'Inputs' && entry.kind === 'feedback') ||
     (filter === 'LLM' && entry.kind === 'response') || (filter === 'Tools' && ['tool', 'result'].includes(entry.kind)) ||
+    (filter === 'Policy' && entry.kind === 'policy') ||
     (filter === 'Session' && entry.kind === 'session'));
   useLayoutEffect(() => {
     if (follow && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;

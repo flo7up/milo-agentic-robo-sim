@@ -37,8 +37,12 @@ export function ChallengePicker({ state, connected, request }: {
     <div className="challenge-toolbar">
       <label><Target size={16} /> Challenge<select aria-label="Predefined challenge" value={selected} disabled={loading} onChange={event => setSelected(event.target.value as ChallengeId)}>
         <option value="bench">Practice bench</option>
-        {presets.map(entry => <option value={entry.id} key={entry.id}>{entry.title}</option>)}
+        {['Navigation', 'Perception', 'Manipulation'].map(category => <optgroup label={category} key={category}>
+          {presets.filter(entry => (entry.category ?? 'Navigation') === category).map(entry =>
+            <option value={entry.id} key={entry.id}>{entry.title}</option>)}
+        </optgroup>)}
       </select></label>
+      {preset?.difficulty === 'Advanced' && <span className="tag">Advanced</span>}
       <span className="tag">{preset?.skill ?? 'Free practice'}</span>
       <button type="button" disabled={!connected || loading || !presets.length} title="Stop current control and load a fresh episode" onClick={() => void load()}><FolderOpen size={16} /> {loading ? 'Loading...' : 'Load challenge'}</button>
       {loaded && <span className={`challenge-status ${loaded.status === 'completed' ? 'ok' : loaded.status === 'failed' ? 'bad' : ''}`} role="status">{loaded.status === 'completed' ? 'Completed' : loaded.status === 'failed' ? 'Failed' : `${loaded.completed_objectives} / ${loaded.progress.length} goals complete`}</span>}

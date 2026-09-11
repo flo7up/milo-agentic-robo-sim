@@ -11,8 +11,10 @@ from fastapi.staticfiles import StaticFiles
 from backend.agent import AgentController, AgentStart, ChatStart, FeedbackRate, FoundryConfig, InteractionMode, robot_tools
 from backend.challenges import ChallengeLoad, PRESETS, get_challenge
 from backend.contracts import Command, ManualPlacement, tool_schemas
+from backend.local_progress import read_navigation_progress
 from backend.robot import calibration
 from backend.materials import TEXTURE_NAMES, TEXTURE_ROOT
+from backend.policy import PolicyConfig, check_policy_readiness
 from backend.realtime import FoundryRealtime, RealtimeConfig, VoiceController, VoiceStart
 from backend.simulation import MotionError
 from backend.worker import SimulationWorker
@@ -45,7 +47,7 @@ class Lab:
             await asyncio.wrap_future(replacement.ready)
             self.worker = replacement
             self.challenge_id = selected
-            self.agent = AgentController(self.agent.config, self.agent.model_factory)
+            self.agent = AgentController(self.agent.config, self.agent.model_factory, policy_factory=self.agent.policy_factory)
             self.interaction_mode = "chat"
         return self.state()
 
@@ -91,6 +93,15 @@ async def state():
     return lab.state()
 
 
+@app.get("/api/local-navigation/status")
+def local_navigation_status(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"test": read_navigation_progress()}
+    except (OSError, ValueError) as error:
+        raise HTTPException(503, "Local navigation status is temporarily unavailable") from error
+
+
 @app.get("/api/textures/{name}.png")
 async def texture(name: str):
     if name not in TEXTURE_NAMES:
@@ -104,8 +115,8 @@ async def robot_calibration():
 
 
 @app.get("/api/tools")
-async def tools(execution_mode: Literal["single_step", "navigation_plan"] = "single_step"):
-    return robot_tools(execution_mode) if execution_mode == "navigation_plan" else tool_schemas()
+async def tools(execution_mode: Literal["single_step", "navigation_plan", "supervised_policy"] = "single_step"):
+    return robot_tools(execution_mode) if execution_mode != "single_step" else tool_schemas()
 
 
 @app.post("/api/command")
@@ -214,6 +225,11 @@ async def change_interaction_mode(selection: InteractionMode):
     return lab.state()
 
 
+@app.post("/api/policy/check")
+async def policy_readiness(config: PolicyConfig):
+    return await check_policy_readiness(config, lab.agent.policy_factory)
+
+
 @app.post("/api/agent/chat")
 async def chat_message(settings: ChatStart):
     return await start_agent(settings)
@@ -228,6 +244,16 @@ async def start_agent(settings: AgentStart):
     if not lab.connections:
         raise HTTPException(409, "Keep an operator interface connected while the LLM controls the robot")
     async with lab.lock:
+        if settings.execution_mode == "supervised_policy":
+            if lab.agent.active or lab.worker.latest.get("busy"):
+                raise HTTPException(409, "Stop current control before starting a policy session")
+            worker = lab.worker
+            stop_revision = worker.stop_revision
+            readiness = await check_policy_readiness(settings.policy, lab.agent.policy_factory)
+            if not readiness["ready"]:
+                raise HTTPException(409, readiness["message"])
+            if worker is not lab.worker or worker.stop_revision != stop_revision or not lab.connections:
+                raise HTTPException(409, "Policy start invalidated by Stop or episode/operator change")
         try:
             lab.agent.start(lab.worker, settings)
         except ValueError as error:
