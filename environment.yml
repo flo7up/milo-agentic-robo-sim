@@ -1,0 +1,9 @@
+name: embodied-robot-lab
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pybullet=3.25
+  - numpy=1.26
+  - libblas=*=*openblas
+  - pip

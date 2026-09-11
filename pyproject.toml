@@ -1,0 +1,19 @@
+[project]
+name = "embodied-robot-lab"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1", "pydantic>=2.10,<3",
+  "pybullet==3.2.7; sys_platform != 'win32'", "numpy>=1.26,<2", "pillow>=11,<13",
+  "scipy>=1.15,<2", "httpx>=0.28,<1", "openai>=2,<3", "azure-identity>=1.23,<2",
+  "websockets>=17.1,<18",
+  "opentelemetry-sdk>=1.30,<2", "python-dotenv>=1.1,<2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "pytest-asyncio>=1,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
