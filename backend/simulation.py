@@ -27,7 +27,13 @@ class MotionError(Exception):
 
 
 class BulletSimulation:
-    def __init__(self, run_id=None, epoch=0, width=640, height=480, scene=None, challenge=None):
+    def __init__(self, run_id=None, epoch=0, width=640, height=480, scene=None, challenge=None, rendering=None):
+        import os
+        self.rendering = rendering or os.environ.get("MILO_RENDERER", "tiny")
+        if self.rendering not in {"tiny", "enhanced"}:
+            raise ValueError("MILO_RENDERER must be enhanced or tiny")
+        self.camera_renderer = None
+        self.owns_camera_renderer = True
         self.run_id = run_id or str(uuid4())
         self.epoch = epoch
         self.width, self.height = width, height
@@ -50,6 +56,8 @@ class BulletSimulation:
         self.on_tick = None
         self.action_contacts = None
         self.challenge_progress = None
+        self.pedestrian_crossing = None
+        self.kinematic_velocities = {}
         self.scene = challenge.scene() if challenge else scene or [
             {"name": "floor", "size": [6, 6, .1], "position": [0, 0, -.05], "color": [.77, .80, .79, 1]},
             {"name": "back_wall", "size": [.1, 6, 1], "position": [2.5, 0, .5], "color": [.50, .57, .56, 1]},
@@ -105,6 +113,8 @@ class BulletSimulation:
         self.path_length = 0
         self.last_encoders = self._encoders()
         self.challenge_progress = ChallengeProgress(challenge) if challenge else None
+        if challenge and challenge.id == "pedestrian_crossing":
+            self.pedestrian_crossing = {"started_at": None, "elapsed_s": 0., "contact": False, "yield_s": 0., "yielded": False, "scored_at": 0}
         self._update_challenge()
 
     def _update_challenge(self):
@@ -129,6 +139,22 @@ class BulletSimulation:
                                  if contact[9] > .02] for finger in fingers]
                     if all(contacts) and any(np.dot(inner[7], outer[7]) < -.7 for inner in contacts[0] for outer in contacts[1]):
                         held_bodies.add(body)
+        if self.pedestrian_crossing is not None:
+            crossing = self.pedestrian_crossing
+            position = bullet.getBasePositionAndOrientation(self.robot, physicsClientId=self.client)[0]
+            measurement = measurements["robot"]
+            waiting = (crossing["started_at"] is not None and 1. <= crossing["elapsed_s"] <= 3. and
+                       .25 <= position[0] < .75 and abs(position[1]) < .4 and
+                       measurement["grounded"] and measurement["speed"] < .025 and measurement["angular_speed"] < .15)
+            elapsed = (self.ticks - crossing["scored_at"]) * TIMESTEP
+            crossing["scored_at"] = self.ticks
+            crossing["yield_s"] = crossing["yield_s"] + elapsed if waiting else 0.
+            crossing["yielded"] |= crossing["yield_s"] >= .4
+            measurement.update(pedestrian_contact=crossing["contact"], yielded=crossing["yielded"],
+                               pedestrian_passed=crossing["elapsed_s"] >= 4.)
+        if challenge.orbit:
+            position = bullet.getBasePositionAndOrientation(self.robot, physicsClientId=self.client)[0]
+            measurements["robot"].update(position_xy=list(position[:2]), contact=bool(self.proximity_sensors().collisions))
         if challenge.search_target:
             target = next(item["id"] for item in self.objects if item["name"] == challenge.search_target)
             target_position = np.array(bullet.getBasePositionAndOrientation(target, physicsClientId=self.client)[0])
@@ -184,6 +210,31 @@ class BulletSimulation:
         self._hold()
         self._brake()
 
+    def _advance_pedestrian(self):
+        crossing = self.pedestrian_crossing
+        if crossing is None:
+            return
+        now = self.ticks * TIMESTEP
+        if crossing["started_at"] is None:
+            velocity = bullet.getBaseVelocity(self.robot, physicsClientId=self.client)[0]
+            if self.odometry[0] < .30 or velocity[0] < .03:
+                return
+            crossing["started_at"] = now
+        elapsed = now - crossing["started_at"]
+        crossing["elapsed_s"] = elapsed
+        displacement = min(2.6, .65 * elapsed)
+        walking = displacement < 2.6
+        for item in self.objects:
+            if not item.get("pedestrian"):
+                continue
+            position = list(item["position"])
+            swing = item.get("gait", 0) * math.sin(elapsed * 2 * math.pi) if walking else 0.
+            position[1] += displacement + .06 * swing
+            rotation = bullet.getQuaternionFromEuler([.18 * swing if "foot" not in item["name"] else 0., 0., 0.])
+            previous = bullet.getBasePositionAndOrientation(item["id"], physicsClientId=self.client)[0]
+            self.kinematic_velocities[item["id"]] = (np.array(position) - previous) / TIMESTEP
+            bullet.resetBasePositionAndOrientation(item["id"], position, rotation, physicsClientId=self.client)
+
     def _ticks(self, count, callback=None, allow_depleted=False):
         for tick in range(count):
             if self.cancel.is_set():
@@ -191,9 +242,14 @@ class BulletSimulation:
                 raise MotionError("CANCELLED", "Motion interrupted")
             if callback:
                 callback(tick)
+            self._advance_pedestrian()
             before = self._encoders()
             bullet.stepSimulation(physicsClientId=self.client)
             self.ticks += 1
+            if self.pedestrian_crossing is not None and not self.pedestrian_crossing["contact"]:
+                self.pedestrian_crossing["contact"] = any(
+                    bullet.getContactPoints(self.robot, item["id"], physicsClientId=self.client)
+                    for item in self.objects if item.get("pedestrian"))
             delta = (self._encoders() - before) * .09
             distance, heading = float(np.mean(delta)), float((delta[1] - delta[0]) / .38)
             self.odometry[:2] += distance * np.array([math.cos(self.odometry[2] + heading / 2), math.sin(self.odometry[2] + heading / 2)])
@@ -412,6 +468,8 @@ class BulletSimulation:
         return np.array(eye), matrix
 
     def capture(self):
+        if self.rendering == "enhanced":
+            return self._enhanced_capture(self.width, self.height, depth=False)[0]
         eye, matrix = self.camera_pose()
         view = bullet.computeViewMatrix(eye, eye + matrix[:, 0], matrix[:, 2])
         projection = bullet.computeProjectionMatrixFOV(65, self.width / self.height, .015, 12)
@@ -420,6 +478,63 @@ class BulletSimulation:
         output = BytesIO()
         Image.fromarray(np.asarray(pixels, dtype=np.uint8).reshape(self.height, self.width, 4)[:, :, :3]).save(output, format="PNG")
         return output.getvalue()
+
+    def _enhanced_capture(self, width, height, depth=True):
+        from backend.camera import EnhancedRenderer, scene_snapshot
+        try:
+            if self.camera_renderer is None:
+                self.camera_renderer = EnhancedRenderer()
+            return self.camera_renderer.capture(scene_snapshot(self, width, height), depth=depth)
+        except Exception:
+            self.stop()
+            raise
+
+    def robot_footprint(self):
+        position, orientation = bullet.getBasePositionAndOrientation(self.robot, physicsClientId=self.client)
+        rotation = np.array(bullet.getMatrixFromQuaternion(orientation)).reshape(3, 3)
+        corners = []
+        for index in [-1, *self.joints.values()]:
+            lower, upper = bullet.getAABB(self.robot, index, physicsClientId=self.client)
+            for horizontal in (lower[0], upper[0]):
+                for lateral in (lower[1], upper[1]):
+                    for height in (lower[2], upper[2]):
+                        corners.append((np.array([horizontal, lateral, height]) - position) @ rotation)
+        corners = np.array(corners)
+        return {"lower_xy_m": corners[:, :2].min(axis=0).tolist(), "upper_xy_m": corners[:, :2].max(axis=0).tolist(),
+            "radius_m": float(np.linalg.norm(corners[:, :2], axis=1).max()), "frame": "robot_base",
+            "method": "Conservative union of current robot link collision bounds"}
+
+    def capture_spatial(self, sequence):
+        from scipy.ndimage import binary_dilation
+        from backend.contracts import SpatialObservation
+        from backend.spatial import calibration, metric_depth
+        captured_at = time.monotonic()
+        head = [bullet.getJointState(self.robot, self.joints[name], physicsClientId=self.client)[0]
+                for name in ("head_yaw", "head_pitch")]
+        odometry = self.odometry.tolist()
+        eye, matrix = self.camera_pose()
+        intrinsics = calibration(160, 120)
+        if self.rendering == "enhanced":
+            image, depth = self._enhanced_capture(intrinsics.width, intrinsics.height)
+            depth[(depth < intrinsics.near_m) | (depth > intrinsics.usable_range_m)] = np.nan
+            observation = SpatialObservation(run_id=self.run_id, episode_epoch=self.epoch, sequence=sequence,
+                captured_at=captured_at, simulated_time_s=self.ticks * TIMESTEP, calibration=intrinsics,
+                head_rad=head, odometry_m_rad=odometry, depth_m=np.where(np.isfinite(depth), depth, None).ravel().tolist())
+            return observation, image
+        view = bullet.computeViewMatrix(eye, eye + matrix[:, 0], matrix[:, 2])
+        projection = bullet.computeProjectionMatrixFOV(65, 4 / 3, intrinsics.near_m, intrinsics.far_m)
+        rendered = bullet.getCameraImage(intrinsics.width, intrinsics.height, view, projection,
+            renderer=bullet.ER_TINY_RENDERER, flags=bullet.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX, physicsClientId=self.client)
+        segments = np.asarray(rendered[4], dtype=np.int64).reshape(intrinsics.height, intrinsics.width)
+        self_mask = (segments >= 0) & ((segments & ((1 << 24) - 1)) == self.robot)
+        self_mask = binary_dilation(self_mask, iterations=1)
+        depth = metric_depth(np.asarray(rendered[3]).reshape(intrinsics.height, intrinsics.width), self_mask, intrinsics)
+        output = BytesIO()
+        Image.fromarray(np.asarray(rendered[2], dtype=np.uint8).reshape(intrinsics.height, intrinsics.width, 4)[:, :, :3]).save(output, format="PNG")
+        observation = SpatialObservation(run_id=self.run_id, episode_epoch=self.epoch, sequence=sequence,
+            captured_at=captured_at, simulated_time_s=self.ticks * TIMESTEP, calibration=intrinsics,
+            head_rad=head, odometry_m_rad=odometry, depth_m=np.where(np.isfinite(depth), depth, None).ravel().tolist())
+        return observation, output.getvalue()
 
     def gripper_sensors(self):
         sensors = {}
@@ -581,14 +696,18 @@ class BulletSimulation:
     def geometry(self):
         geometry = []
         textures = {item["id"]: item.get("texture") for item in self.objects}
+        names = {item["id"]: item["name"] for item in self.objects}
         for body in [item["id"] for item in self.objects] + [self.robot]:
             for visual in bullet.getVisualShapeData(body, physicsClientId=self.client):
                 geometry.append({"key": f"{body}:{visual[1]}", "type": visual[2], "dimensions": list(visual[3]),
                                  "position": list(visual[5]), "quaternion": list(visual[6]), "color": list(visual[7]),
+                                 "name": names.get(body, "robot"),
                                  "texture": f"/api/textures/{textures[body]}.png" if textures.get(body) else None})
         return geometry
 
     def close(self):
+        if self.camera_renderer and self.owns_camera_renderer:
+            self.camera_renderer.close()
         for client in (self.client, self.planner):
             if bullet.isConnected(client):
                 bullet.disconnect(client)

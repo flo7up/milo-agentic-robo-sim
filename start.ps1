@@ -7,6 +7,8 @@ param(
     [switch]$SkipBuild,
     [Parameter(ParameterSetName = 'Lab')]
     [switch]$BackendOnly,
+    [Parameter(ParameterSetName = 'Lab')]
+    [switch]$Nav2,
     [Parameter(Mandatory = $true, ParameterSetName = 'Navigation')]
     [switch]$NavigationTest,
     [Parameter(ParameterSetName = 'Navigation')]
@@ -29,6 +31,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$nav2Container = $null
+$previousRosEnabled = [Environment]::GetEnvironmentVariable('MILO_ROS_ENABLED', 'Process')
 Push-Location $PSScriptRoot
 try {
     $physicsPython = './.runtime/env/python.exe'
@@ -102,13 +106,36 @@ try {
         npm --prefix frontend run build
         if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
     }
+    if ($Nav2) {
+        if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker Desktop is required for -Nav2.' }
+        docker version --format '{{.Server.Version}}'
+        if ($LASTEXITCODE -ne 0) { throw 'Start Docker Desktop with its Linux engine, then retry -Nav2.' }
+        docker image inspect milo-nav2:jazzy --format '{{.Id}}' 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            docker build --tag milo-nav2:jazzy ros
+            if ($LASTEXITCODE -ne 0) { throw 'Nav2 image build failed; normal startup still supports Built-in backup.' }
+        }
+        $nav2Container = "milo-nav2-$Port-$([guid]::NewGuid().ToString('N').Substring(0,6))"
+        $env:MILO_ROS_ENABLED = '1'
+        docker run --detach --name $nav2Container --restart unless-stopped --env "ROS_DOMAIN_ID=$($Port % 200)" --mount "type=bind,source=$PSScriptRoot/ros,target=/opt/milo,readonly" milo-nav2:jazzy bash -lc "source /opt/ros/jazzy/setup.bash && exec ros2 launch /opt/milo/milo.launch.py backend:=http://host.docker.internal:$Port"
+        if ($LASTEXITCODE -ne 0) { throw 'Could not start the Nav2 container.' }
+        Write-Host "Nav2 primary: $nav2Container. Run settings retains Built-in backup."
+    }
     Write-Host "Embodied Robot Lab: $url"
     if ($BackendOnly) { Write-Host "Backend API: $url/docs" }
-    Write-Host 'Fine-tuned local driving: ./start.ps1 -NavigationTest (isolated test, not browser integration).'
-    Write-Host 'Luna + SmolVLA in the browser requires a separate compatible left-arm policy server.'
+    Write-Host 'Browser driving: configure Luna, load a challenge, then click Start LLM control.'
+    Write-Host 'Luna selects observed destinations; -Nav2 enables Nav2 primary, with Built-in backup in Run settings.'
+    Write-Host 'Select SmolVLA primitives for learned local velocities; that model loads on its first Start.'
+    Write-Host 'SmolVLA stays loaded between browser runs. Use Unload local model to release GPU memory.'
+    Write-Host 'Optional isolated evaluation: ./start.ps1 -NavigationTest.'
+    Write-Host 'No arm-policy server is required. Luna deployment access is required for supervision.'
     & $physicsPython -m uvicorn backend.app:app --host 127.0.0.1 --port $Port
     if ($LASTEXITCODE -ne 0) { throw "Robot Lab server exited with code $LASTEXITCODE." }
 }
 finally {
+    if ($nav2Container) {
+        docker rm --force $nav2Container | Out-Null
+        [Environment]::SetEnvironmentVariable('MILO_ROS_ENABLED', $previousRosEnabled, 'Process')
+    }
     Pop-Location
 }

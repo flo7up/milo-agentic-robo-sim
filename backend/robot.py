@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets"
 ARM_LIMITS = [(-1.8, 1.8), (-2.5, 2.5), (-2.7, 2.7), (-3.0, 3.0), (-2.5, 2.5), (-3.0, 3.0)]
 NEUTRAL = [0.0, -0.6, 1.8, 0.0, -1.2, 0.0]
+TRAVEL = [0.0, -1.3, 2.6, 0.0, -1.3, 0.0]
 ARM_AXES = [(0, 0, 1), (0, 1, 0), (0, 1, 0), (1, 0, 0), (0, 1, 0), (1, 0, 0)]
 
 
@@ -116,7 +117,9 @@ def calibration():
                              "force_nm": 24} for index, limit in enumerate(ARM_LIMITS)] for side in ("left", "right")},
             "head_limits_rad": {"yaw": [-1.5, 1.5], "pitch": [-.7, 1.15]},
             "gripper": {"max_opening_m": .11, "max_force_n": 35, "max_mass_kg": .35, "max_load_n": 18},
-            "wheel": {"radius_m": .09, "track_m": .38}, "neutral_rad": NEUTRAL}
+            "wheel": {"radius_m": .09, "track_m": .38}, "neutral_rad": NEUTRAL,
+            "travel_posture": {"joint_positions_rad": TRAVEL, "automatic": False,
+                "requires": "No held object; collision-checked set_arm_joints for each arm from the current pose"}}
 
 
 if __name__ == "__main__":

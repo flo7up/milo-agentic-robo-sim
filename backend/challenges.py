@@ -1,17 +1,40 @@
+import math
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from backend.contracts import BatterySensor, StrictModel
 
 
 ChallengeId = Literal["bench", "park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery",
-                      "warehouse", "inspection", "workshop"]
+                      "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit"]
 Vector3 = Annotated[list[float], Field(min_length=3, max_length=3)]
 
 
 class ChallengeLoad(StrictModel):
     challenge_id: ChallengeId
+    environment: Literal["standalone", "shared_apartment_v1"] = "standalone"
+    orbit_target: Literal["table", "sofa", "chair", "floor lamp"] | None = None
+    orbit_direction: Literal["clockwise", "counterclockwise"] | None = None
+
+    @model_validator(mode="after")
+    def circuit_options(self):
+        if self.environment == "shared_apartment_v1":
+            if self.challenge_id not in {"furniture_circuit", "apartment", "flat_kitchen", "recharge"}:
+                raise ValueError("Shared Apartment V1 supports circle, object search, kitchen search and recharge")
+            if self.orbit_target not in {None, "table"}:
+                raise ValueError("Shared Apartment V1 currently supports only the table circuit")
+        if self.challenge_id != "furniture_circuit" and (self.orbit_target is not None or self.orbit_direction is not None):
+            raise ValueError("Object and direction options only apply to Circle the Furniture")
+        return self
+
+
+class OrbitTask(StrictModel):
+    target: Literal["table", "sofa", "chair", "floor lamp"] = "table"
+    direction: Literal["clockwise", "counterclockwise"] = "clockwise"
+    center_m: list[float] = Field(min_length=2, max_length=2)
+    minimum_radius_m: float = Field(gt=0)
+    maximum_radius_m: float = Field(gt=0)
 
 
 class Objective(StrictModel):
@@ -28,6 +51,7 @@ class Objective(StrictModel):
 
 class Challenge(StrictModel):
     id: ChallengeId
+    environment: Literal["standalone", "shared_apartment_v1"] = "standalone"
     title: str
     skill: str
     category: Literal["Navigation", "Perception", "Manipulation"] = "Navigation"
@@ -40,16 +64,19 @@ class Challenge(StrictModel):
     initial_xy: Annotated[list[float], Field(min_length=2, max_length=2)] = Field(default_factory=lambda: [0, 0])
     search_target: str | None = None
     ordered_objectives: bool = False
+    orbit: OrbitTask | None = None
     floor_size_m: Annotated[list[Annotated[float, Field(ge=4, le=20)]], Field(min_length=2, max_length=2)] = Field(default_factory=lambda: [6, 6])
 
     def public(self):
-        return {"id": self.id, "title": self.title, "skill": self.skill, "goal": self.goal,
+        return {"id": self.id, "environment": self.environment, "title": self.title, "skill": self.skill, "goal": self.goal,
             "objectives": [objective.label for objective in self.objectives], "suggested_turn_limit": self.suggested_turn_limit,
-            "category": self.category, "difficulty": self.difficulty}
+            "category": self.category, "difficulty": self.difficulty,
+            **({"orbit": {"target": self.orbit.target, "direction": self.orbit.direction}} if self.orbit else {})}
 
     def scene(self):
         objects = [
-            {"name": "floor", "size": [*self.floor_size_m, .1], "position": [0, 0, -.05], "color": [.77, .80, .79, 1]},
+            {"name": "floor", "size": [*self.floor_size_m, .1], "position": [0, 0, -.05], "color": [.77, .80, .79, 1],
+             **({"material": "concrete"} if self.environment == "shared_apartment_v1" else {})},
             *([] if any(item["name"] == "back_wall" for item in self.objects) else [
                 {"name": "back_wall", "size": [.1, 6, 1], "position": [2.5, 0, .5], "color": [.50, .57, .56, 1]}]),
             *self.model_dump()["objects"],
@@ -69,6 +96,17 @@ class Challenge(StrictModel):
 
 
 PRESETS = {
+    "local_park": Challenge(
+        id="local_park", title="Local Model Parking", skill="Fine-tuned navigation / green-bay parking",
+        goal="Drive into the green floor bay and stop. Keep clear of the posts and walls.", initial_head_pitch=.45,
+        objects=[
+            {"name": "back_wall", "size": [.1, 5.8, 1.2], "position": [2.9, 0, .6], "color": [.68, .73, .73, 1]},
+            {"name": "north_wall", "size": [5.8, .1, 1.2], "position": [0, 2.9, .6], "color": [.78, .80, .77, 1]},
+            {"name": "south_wall", "size": [5.8, .1, 1.2], "position": [0, -2.9, .6], "color": [.78, .80, .77, 1]},
+            *[{"name": f"door_post_{side}", "size": [.14, .15, 1.1], "position": [.65, sign * 1.05, .55],
+               "color": [.89, .60, .15, 1]} for side, sign in (("left", 1), ("right", -1))],
+        ], objectives=[Objective(label="Park fully in the green bay", body="robot", center=[1.45, .22, 0],
+                                 size=[.85, .9], color=[.08, .72, .25, 1], require_lift=False)]),
         "apartment": Challenge(
                 id="apartment", title="Apartment Search", skill="Room exploration", category="Perception",
                 suggested_turn_limit=100, initial_head_pitch=.15, search_target="yellow_target",
@@ -193,6 +231,146 @@ PRESETS["kitchen_bathroom"] = Challenge(
         ],
         objectives=[Objective(label="Base and wheels stopped inside the bathroom", body="robot", center=[1.40, 1.15, 0],
                                                     size=[1.20, 1.48], color=[.62, .83, .88, 1], require_lift=False, visible_zone=False)],
+)
+
+
+FURNITURE_TARGETS = {
+        "table": ([-2.4, 1.8], 1.35, 2.05),
+        "sofa": ([2.6, 1.8], 1.55, 2.2),
+        "chair": ([2.6, -2.5], 1., 1.65),
+        "floor lamp": ([-2.8, -2.5], .9, 1.65),
+}
+
+
+def furniture_circuit(target="table", direction="clockwise"):
+        center, minimum, maximum = FURNITURE_TARGETS[target]
+        return Challenge(id="furniture_circuit", title="Circle the Furniture", skill="Object recognition / directed circuits",
+                difficulty="Advanced", floor_size_m=[14, 12], initial_xy=[-4.8, 1.8], initial_head_pitch=.12,
+                suggested_turn_limit=160, orbit=OrbitTask(target=target, direction=direction, center_m=center,
+                        minimum_radius_m=minimum, maximum_radius_m=maximum),
+                goal=f"Identify the {target} from the head camera, then drive one complete {direction} circuit around that {target} as quickly as safely possible and stop. Keep both arms stowed. A table has a flat top and four legs; the sofa has cushions and armrests; the chair has a seat and back; the floor lamp has a pole and shade. Circle only the requested object, not the whole room or another piece of furniture. Stay roughly 0.8-1.1 m clear of its outside edges and keep the object on your right for clockwise or left for counterclockwise travel. Prefer smooth curved motion and clear local continuations, slow for obstacles, and do not spin in place or move furniture. Finish near where you began the circuit and hold still for half a simulated second. Inspect if the target is not confidently identified; never invent its coordinates.",
+                objects=[
+                        {"name": "back_wall", "size": [.12, 11.6, 1.35], "position": [6.8, 0., .675], "color": [.80, .83, .82, 1]},
+                        {"name": "circuit_west_wall", "size": [.12, 11.6, 1.35], "position": [-6.8, 0., .675], "color": [.80, .83, .82, 1]},
+                        *[{"name": f"circuit_{side}_wall", "size": [13.6, .12, 1.35], "position": [0., sign * 5.8, .675], "color": [.86, .87, .84, 1]}
+                            for side, sign in (("north", 1), ("south", -1))],
+                        {"name": "circuit_table_top", "material": "wood", "size": [1.35, .85, .09], "position": [-2.4, 1.8, .76], "color": [.57, .35, .19, 1]},
+                        *[{"name": f"circuit_table_leg_{index}", "material": "wood", "size": [.10, .10, .72], "position": [-2.4 + horizontal, 1.8 + lateral, .36], "color": [.38, .24, .14, 1]}
+                            for index, (horizontal, lateral) in enumerate(((-.55, -.3), (-.55, .3), (.55, -.3), (.55, .3)))],
+                        {"name": "circuit_sofa_base", "material": "fabric", "size": [1.8, .85, .33], "position": [2.6, 1.8, .22], "color": [.13, .38, .53, 1]},
+                        {"name": "circuit_sofa_back", "material": "fabric", "size": [1.8, .18, .65], "position": [2.6, 2.16, .46], "color": [.13, .38, .53, 1]},
+                        *[{"name": f"circuit_sofa_arm_{index}", "material": "fabric", "size": [.18, .85, .45], "position": [2.6 + sign * .87, 1.8, .42], "color": [.10, .30, .43, 1]}
+                            for index, sign in enumerate((-1, 1))],
+                        *[{"name": f"circuit_sofa_cushion_{index}", "material": "fabric", "size": [.7, .62, .12], "position": [2.6 + sign * .38, 1.72, .445], "color": [.25, .55, .64, 1]}
+                            for index, sign in enumerate((-1, 1))],
+                        {"name": "circuit_chair_seat", "material": "wood", "size": [.62, .62, .07], "position": [2.6, -2.5, .46], "color": [.80, .62, .22, 1]},
+                        {"name": "circuit_chair_back", "material": "wood", "size": [.62, .08, .52], "position": [2.6, -2.23, .71], "color": [.80, .62, .22, 1]},
+                        *[{"name": f"circuit_chair_leg_{index}", "size": [.06, .06, .43], "position": [2.6 + horizontal, -2.5 + lateral, .215], "color": [.27, .29, .30, 1]}
+                            for index, (horizontal, lateral) in enumerate(((-.24, -.24), (-.24, .24), (.24, -.24), (.24, .24)))],
+                        {"name": "circuit_lamp_base", "shape": "cylinder", "size": [.45, .45, .06], "position": [-2.8, -2.5, .03], "color": [.27, .28, .30, 1]},
+                        {"name": "circuit_lamp_pole", "shape": "cylinder", "size": [.06, .06, 1.1], "position": [-2.8, -2.5, .58], "color": [.29, .30, .32, 1]},
+                        {"name": "circuit_lamp_shade", "shape": "cylinder", "size": [.5, .5, .3], "position": [-2.8, -2.5, 1.16], "color": [.78, .25, .34, 1]},
+                        {"name": "circuit_window", "size": [2.8, .02, .65], "position": [0., 5.72, .91], "color": [.62, .79, .84, 1], "marker": True},
+                ], objectives=[Objective(label=f"Circle the {target} {direction} once, then stop", body="robot", center=[*center, 0.],
+                        size=[maximum * 2, maximum * 2], color=[.2, .7, .3, 1], require_lift=False, visible_zone=False)])
+
+
+PRESETS["furniture_circuit"] = furniture_circuit()
+
+
+PRESETS["flat_kitchen"] = Challenge(
+        id="flat_kitchen", title="Find the Kitchen", skill="Five-room exploration / timed kitchen search",
+        category="Perception", difficulty="Advanced", floor_size_m=[12, 10],
+        suggested_turn_limit=160, initial_xy=[-4.4, -2.2], initial_head_pitch=.12, ordered_objectives=True,
+        goal="Find the kitchen in this unfamiliar five-room flat as quickly as safely possible. Identify rooms from their visible furniture and appliances; a sink alone does not identify a kitchen. Explore only as much as needed to find it, using remembered sightings and open doorways to avoid revisiting rooms. Prefer long, clear routes and compatible continuations so you keep driving while planning whenever fresh observations and clearance allow. Avoid unnecessary stationary scans, tiny movements, and repeated turns. Safety stops take priority; never cross walls, move furniture, or drive into unobserved space. Once you identify the kitchen from cooking appliances, enter fully, stop in its clear interior for half a simulated second, and describe the fixtures that establish it is the kitchen. Do not stop at a doorway or continue touring after arrival. Minimize total elapsed control time, including thinking and pauses; there is no requirement to visit every room.",
+        objects=[
+                *[{"name": name, "size": size, "position": position, "material": "plaster", "color": [.79, .82, .81, 1]}
+                    for name, size, position in (
+                            ("back_wall", [.12, 9.6, 1.25], [5.8, 0, .625]),
+                            ("flat_west_wall", [.12, 9.6, 1.25], [-5.8, 0, .625]),
+                            ("flat_north_wall", [11.6, .12, 1.25], [0, 4.8, .625]),
+                            ("flat_south_wall", [11.6, .12, 1.25], [0, -4.8, .625]),
+                            ("study_bathroom_partition", [.12, 3.75, 1.25], [-1.8, 2.925, .625]),
+                            ("bathroom_kitchen_partition", [.12, 3.75, 1.25], [1.8, 2.925, .625]),
+                            ("living_bedroom_partition_south", [.12, 1.5, 1.25], [0, -4.05, .625]),
+                            ("living_bedroom_partition_north", [.12, .65, 1.25], [0, -1.375, .625]))],
+                *[{"name": f"hall_north_wall_{index}", "size": [end - start, .12, 1.25],
+                     "position": [(start + end) / 2, 1.05, .625], "color": [.85, .86, .83, 1]}
+                    for index, (start, end) in enumerate(((-5.8, -4.8), (-3.2, -.8), (.8, 3.2), (4.8, 5.8)))],
+                *[{"name": f"hall_south_wall_{index}", "size": [end - start, .12, 1.25],
+                     "position": [(start + end) / 2, -1.05, .625], "color": [.85, .86, .83, 1]}
+                    for index, (start, end) in enumerate(((-5.8, -3.8), (-2.2, 2.2), (3.8, 5.8)))],
+                *[{"name": f"{name}_floor", "size": [*size, .002], "position": [*center, .001],
+                     "color": color, "material": material, "marker": True}
+                    for name, size, center, color, material in (
+                            ("living", [5.68, 3.63], [-2.9, -2.925], [.74, .76, .73, 1], "wood"),
+                            ("bedroom", [5.68, 3.63], [2.9, -2.925], [.72, .73, .78, 1], "wood"),
+                            ("study", [3.88, 3.63], [-3.8, 2.925], [.77, .70, .70, 1], "wood"),
+                            ("bathroom", [3.48, 3.63], [0, 2.925], [.66, .81, .83, 1], "tile"),
+                            ("kitchen", [3.88, 3.63], [3.8, 2.925], [.78, .80, .77, 1], "tile"),
+                            ("hall", [11.48, 1.98], [0, 0], [.76, .78, .76, 1], "stone"))],
+                {"name": "living_sofa_seat", "size": [.76, 1.85, .32], "position": [-5.25, -3.35, .16], "material": "fabric", "color": [.21, .42, .43, 1]},
+                {"name": "living_sofa_back", "size": [.16, 1.95, .76], "position": [-5.61, -3.35, .38], "material": "fabric", "color": [.17, .34, .37, 1]},
+                *[{"name": f"living_sofa_arm_{index}", "size": [.80, .15, .52], "position": [-5.25, center_y, .26], "material": "fabric", "color": [.21, .42, .43, 1]}
+                    for index, center_y in enumerate((-4.25, -2.45))],
+                *[{"name": f"living_cushion_{index}", "size": [.20, .37, .30], "position": [-5.32, center_y, .46], "material": "fabric", "color": [.81, .57, .28, 1]}
+                    for index, center_y in enumerate((-3.85, -2.85))],
+                {"name": "living_rug", "size": [2.45, 2.15, .002], "position": [-3.85, -3.6, .004], "material": "fabric", "color": [.31, .48, .47, 1], "marker": True},
+                {"name": "living_coffee_table", "size": [.65, 1.05, .055], "position": [-3.85, -3.6, .34], "material": "wood", "color": [.62, .47, .32, 1]},
+                *[{"name": f"living_table_leg_{index}", "size": [.07, .07, .31], "position": [center_x, center_y, .155], "color": [.22, .25, .26, 1]}
+                    for index, (center_x, center_y) in enumerate(((-4.09, -4.02), (-4.09, -3.18), (-3.61, -4.02), (-3.61, -3.18)))],
+                {"name": "living_tv_console", "size": [.36, 1.50, .32], "position": [-.30, -4.0, .16], "material": "wood", "color": [.54, .42, .31, 1]},
+                {"name": "living_tv_frame", "size": [.08, 1.20, .65], "position": [-.31, -4.0, .73], "color": [.10, .12, .14, 1]},
+                {"name": "living_tv_screen", "size": [.009, 1.08, .53], "position": [-.355, -4.0, .73], "color": [.27, .43, .54, 1]},
+                {"name": "living_book_on_table", "size": [.26, .18, .035], "position": [-3.85, -3.65, .385], "color": [.72, .26, .29, 1]},
+                {"name": "bedroom_bed_base", "size": [1.55, 1.95, .22], "position": [2.35, -3.67, .11], "material": "wood", "color": [.47, .42, .37, 1]},
+                {"name": "bedroom_mattress", "size": [1.52, 1.90, .17], "position": [2.35, -3.67, .305], "material": "fabric", "color": [.91, .91, .88, 1]},
+                {"name": "bedroom_duvet", "size": [1.55, 1.30, .05], "position": [2.35, -3.39, .41], "material": "fabric", "color": [.35, .43, .60, 1]},
+                {"name": "bedroom_headboard", "size": [1.70, .10, .80], "position": [2.35, -4.65, .40], "material": "wood", "color": [.49, .40, .32, 1]},
+                *[{"name": f"bedroom_pillow_{index}", "size": [.58, .33, .09], "position": [center_x, -4.25, .435], "material": "fabric", "color": [.95, .94, .90, 1]}
+                    for index, center_x in enumerate((1.96, 2.74))],
+                {"name": "bedroom_nightstand", "size": [.46, .45, .42], "position": [1.16, -4.25, .21], "material": "wood", "color": [.66, .56, .44, 1]},
+                {"name": "bedroom_lamp_stem", "shape": "cylinder", "size": [.04, .04, .20], "position": [1.16, -4.25, .54], "color": [.32, .35, .35, 1]},
+                {"name": "bedroom_lampshade", "shape": "cylinder", "size": [.25, .25, .21], "position": [1.16, -4.25, .72], "material": "fabric", "color": [.94, .88, .70, 1]},
+                {"name": "bedroom_wardrobe", "size": [.55, 1.80, 1.08], "position": [5.40, -3.25, .54], "material": "wood", "color": [.71, .68, .62, 1]},
+                *[{"name": f"bedroom_wardrobe_handle_{index}", "size": [.035, .035, .25], "position": [5.105, center_y, .60], "color": [.29, .31, .31, 1]}
+                    for index, center_y in enumerate((-3.33, -3.17))],
+                {"name": "bedroom_mirror", "size": [.02, .55, .74], "position": [5.105, -2.70, .62], "color": [.67, .79, .83, 1]},
+                {"name": "study_desk_top", "size": [.66, 1.60, .07], "position": [-5.25, 3.25, .64], "material": "wood", "color": [.65, .53, .42, 1]},
+                *[{"name": f"study_desk_leg_{index}", "size": [.08, .08, .60], "position": [center_x, center_y, .30], "color": [.23, .28, .29, 1]}
+                    for index, (center_x, center_y) in enumerate(((-5.49, 2.57), (-5.49, 3.93), (-5.01, 2.57), (-5.01, 3.93)))],
+                {"name": "study_monitor", "size": [.065, .66, .43], "position": [-5.39, 3.25, .92], "color": [.16, .19, .23, 1]},
+                {"name": "study_monitor_screen", "size": [.008, .58, .35], "position": [-5.35, 3.25, .92], "color": [.37, .61, .64, 1]},
+                {"name": "study_keyboard", "size": [.20, .48, .025], "position": [-5.04, 3.25, .69], "color": [.26, .28, .29, 1]},
+                {"name": "study_chair_seat", "size": [.48, .48, .42], "position": [-4.49, 3.25, .21], "material": "fabric", "color": [.63, .28, .31, 1]},
+                {"name": "study_chair_back", "size": [.10, .48, .45], "position": [-4.27, 3.25, .61], "material": "fabric", "color": [.63, .28, .31, 1]},
+                {"name": "study_bookcase_back", "size": [1.35, .10, 1.10], "position": [-2.72, 4.67, .55], "material": "wood", "color": [.49, .40, .33, 1]},
+                *[{"name": f"study_shelf_{index}", "size": [1.35, .34, .055], "position": [-2.72, 4.53, height], "material": "wood", "color": [.58, .48, .38, 1]}
+                    for index, height in enumerate((.08, .42, .76, 1.10))],
+                *[{"name": f"study_book_{level}_{index}", "size": [.075, .20, height], "position": [-3.22 + index * .13, 4.50, base + height / 2], "color": color}
+                    for level, base in enumerate((.11, .45, .79))
+                    for index, (height, color) in enumerate(((.22, [.23, .48, .56, 1]), (.25, [.70, .26, .32, 1]), (.18, [.78, .65, .31, 1]), (.24, [.40, .52, .40, 1]), (.21, [.81, .80, .73, 1])))],
+                *[{**item, "position": [item["position"][0] - .9, item["position"][1] + 1.65, item["position"][2]]}
+                    for item in PRESETS["kitchen_bathroom"].objects
+                    if item["name"].startswith(("bathroom_tile", "vanity_", "bathroom_basin", "basin_rim_", "bathroom_faucet", "bathroom_tap", "mirror_", "toilet_", "tub_", "bathroom_towel"))],
+                *[{**item, "position": [item["position"][0] + 3.1, item["position"][1] + 4.2, item["position"][2]]}
+                    for item in PRESETS["kitchen_bathroom"].objects
+                    if item["name"].startswith(("fridge_", "sink_", "kitchen_sink", "kitchen_faucet", "stove_", "hob_", "oven_", "kitchen_backsplash"))],
+                {"name": "kitchen_north_cabinet", "size": [2.25, .55, .47], "position": [3.32, 4.40, .235], "material": "wood", "color": [.29, .48, .41, 1]},
+                {"name": "kitchen_north_worktop", "size": [2.33, .61, .045], "position": [3.32, 4.40, .495], "material": "stone", "color": [.81, .84, .82, 1]},
+                *[{"name": f"kitchen_cabinet_handle_{index}", "size": [.22, .035, .025], "position": [center_x, 4.11, .37], "color": [.68, .72, .72, 1]}
+                    for index, center_x in enumerate((2.60, 3.30, 4.00))],
+                {"name": "kitchen_cutting_board", "size": [.40, .28, .022], "position": [3.65, 4.35, .53], "material": "wood", "color": [.74, .59, .39, 1]},
+                {"name": "kitchen_kettle", "shape": "cylinder", "size": [.19, .19, .25], "position": [2.55, 4.38, .65], "color": [.71, .75, .76, 1]},
+                {"name": "kitchen_kettle_handle", "size": [.025, .10, .17], "position": [2.44, 4.38, .66], "color": [.18, .22, .23, 1]},
+                *[{"name": f"{room}_window_frame", "size": [width, .035, .62], "position": [center_x, center_y, .88], "color": [.90, .91, .87, 1]}
+                    for room, width, center_x, center_y in (("living", 1.45, -2.05, -4.725), ("bedroom", 1.25, 4.20, -4.725), ("study", 1.40, -4.48, 4.725), ("kitchen", 1.45, 3.35, 4.725))],
+                *[{"name": f"{room}_window_glass", "size": [width, .01, .50], "position": [center_x, center_y, .88], "color": [.57, .75, .83, 1]}
+                    for room, width, center_x, center_y in (("living", 1.30, -2.05, -4.70), ("bedroom", 1.10, 4.20, -4.70), ("study", 1.25, -4.48, 4.70), ("kitchen", 1.30, 3.35, 4.70))],
+        ],
+        objectives=[Objective(label="Find the kitchen and stop fully inside", body="robot", center=[3.4, 2.65, 0],
+                                                    size=[2.7, 2.7], color=[.78, .80, .77, 1], require_lift=False,
+                                                    visible_zone=False, dwell_s=.5)],
 )
 
 
@@ -373,6 +551,112 @@ PRESETS["workshop"] = Challenge(
                      for name, sign, color in (("red", 1, [.86, .17, .27, 1]), ("blue", -1, [.14, .49, .86, 1]))])
 
 
+PRESETS["pedestrian_crossing"] = Challenge(
+     id="pedestrian_crossing", title="Pedestrian Crossing", skill="Moving-obstacle detection and yielding", difficulty="Advanced",
+    initial_head_pitch=.15, suggested_turn_limit=100, floor_size_m=[12, 10],
+    goal="Drive toward the green bay. A pedestrian will cross your route after you start forward. Stop and yield without touching them. Let them pass, then inspect the route again before continuing to park fully in the green bay. Do not push or follow the pedestrian.",
+     objects=[
+        *enclosure(12, 10),
+          *[{"name": f"crosswalk_stripe_{index}", "size": [.45, .12, .002], "position": [1., offset, .002],
+              "color": [.94, .94, .92, 1], "marker": True} for index, offset in enumerate((-.9, -.6, -.3, 0., .3, .6, .9))],
+          {"name": "pedestrian_torso", "size": [.28, .42, .58], "position": [1., -1.3, 1.02], "color": [.08, .55, .56, 1], "pedestrian": True},
+          {"name": "pedestrian_head", "shape": "cylinder", "size": [.24, .24, .24], "position": [1., -1.3, 1.46], "color": [.80, .67, .57, 1], "pedestrian": True},
+          *[{"name": f"pedestrian_leg_{side}", "size": [.12, .14, .66], "position": [1. + sign * .09, -1.3, .38],
+              "color": [.24, .27, .29, 1], "pedestrian": True, "gait": sign} for side, sign in (("left", 1), ("right", -1))],
+          *[{"name": f"pedestrian_arm_{side}", "size": [.10, .13, .50], "position": [1. + sign * .23, -1.3, 1.00],
+              "color": [.08, .55, .56, 1], "pedestrian": True, "gait": -sign} for side, sign in (("left", 1), ("right", -1))],
+          *[{"name": f"pedestrian_foot_{side}", "size": [.14, .26, .10], "position": [1. + sign * .09, -1.25, .05],
+              "color": [.15, .16, .17, 1], "pedestrian": True, "gait": sign} for side, sign in (("left", 1), ("right", -1))],
+     ],
+    objectives=[Objective(label="Stop and yield without contact", body="robot", center=[4.5, 0, 0], size=[.90, 1.05],
+                          color=[.15, .65, .31, 1], require_lift=False, visible_zone=False),
+                Objective(label="Let the pedestrian pass", body="robot", center=[4.5, 0, 0], size=[.90, 1.05],
+                          color=[.15, .65, .31, 1], require_lift=False, visible_zone=False),
+                Objective(label="Park beyond the crossing", body="robot", center=[4.5, 0, 0],
+                                  size=[.90, 1.05], color=[.15, .65, .31, 1], require_lift=False)])
+
+
+def shared_apartment(identifier, direction="clockwise"):
+    selection = ChallengeLoad(challenge_id=identifier, environment="shared_apartment_v1",
+        orbit_direction=direction if identifier == "furniture_circuit" else None)
+    challenge = furniture_circuit("table", direction) if selection.challenge_id == "furniture_circuit" else get_challenge(identifier)
+    challenge.environment = "shared_apartment_v1"
+    challenge.floor_size_m = [16, 12]
+    challenge.initial_xy = [-6.8, 1.8]
+    challenge.initial_head_pitch = .12
+    challenge.difficulty = "Advanced"
+    objects = [
+        {"name": name, "size": size, "position": position, "material": "plaster", "color": [.79, .82, .81, 1]}
+        for name, size, position in (
+            ("back_wall", [.12, 11.6, 1.35], [7.8, 0, .675]),
+            ("shared_west_wall", [.12, 11.6, 1.35], [-7.8, 0, .675]),
+            ("shared_north_wall", [15.6, .12, 1.35], [0, 5.8, .675]),
+            ("shared_south_wall", [15.6, .12, 1.35], [0, -5.8, .675]),
+            ("living_hall_north", [.12, 5, 1.35], [-.8, 3.3, .675]),
+            ("living_hall_south", [.12, 5, 1.35], [-.8, -3.3, .675]),
+            ("kitchen_bathroom_partition", [6.6, .12, 1.35], [4.5, 1.8, .675]),
+            ("bedroom_bathroom_partition", [6.6, .12, 1.35], [4.5, -1.8, .675]))]
+    objects.extend({"name": f"shared_hall_east_{index}", "size": [.12, end - start, 1.35],
+        "position": [1.2, (start + end) / 2, .675], "color": [.85, .86, .83, 1]}
+        for index, (start, end) in enumerate(((-5.8, -4.6), (-3., -.8), (.8, 3.), (4.6, 5.8))))
+    objects.extend({"name": f"{name}_floor", "size": [*size, .002], "position": [*center, .001],
+        "color": color, "material": material, "marker": True}
+        for name, size, center, color, material in (
+            ("living", [6.88, 11.48], [-4.3, 0], [.74, .76, .73, 1], "wood"),
+            ("hall", [1.88, 11.48], [.2, 0], [.76, .78, .76, 1], "stone"),
+            ("kitchen", [6.48, 3.88], [4.5, 3.8], [.78, .80, .77, 1], "tile"),
+            ("bathroom", [6.48, 3.48], [4.5, 0], [.66, .81, .83, 1], "tile"),
+            ("bedroom", [6.48, 3.88], [4.5, -3.8], [.72, .73, .78, 1], "wood")))
+    for item in furniture_circuit().objects:
+        prefix = next((name for name in ("table", "sofa", "chair", "lamp") if item["name"].startswith(f"circuit_{name}_")), None)
+        if prefix:
+            offset = {"table": [-2., 0.], "sofa": [-8.6, -5.7], "chair": [-5.6, -1.4], "lamp": [.1, -2.5]}[prefix]
+            objects.append({**item, "position": [item["position"][0] + offset[0], item["position"][1] + offset[1], item["position"][2]]})
+    for item in PRESETS["flat_kitchen"].model_dump()["objects"]:
+        name = item["name"]
+        if name.endswith("_floor"):
+            continue
+        if name.startswith(("fridge_", "sink_", "kitchen_", "stove_", "hob_", "oven_")):
+            offset = [2., .4]
+        elif name.startswith("bedroom_"):
+            offset = [2., -.6]
+        elif name.startswith(("bathroom_", "vanity_", "basin_", "mirror_", "toilet_", "tub_")):
+            offset = [6., -2.6]
+        else:
+            continue
+        objects.append({**item, "position": [item["position"][0] + offset[0], item["position"][1] + offset[1], item["position"][2]]})
+    for name, center, color in (("yellow_target", [6.2, -2.6], [.98, .78, .05, 1]), ("red_decoy", [3.4, 4.7], [.85, .12, .18, 1])):
+        objects.extend([
+            {"name": f"{name}_pedestal", "size": [.32, .32, .34], "position": [*center, .17], "color": [.35, .39, .40, 1]},
+            {"name": name, "size": [.18, .18, .18], "position": [*center, .43], "color": color}])
+    for name, center, color in (("charger", [-2.7, 0], [.08, .68, .73, 1]), ("survey", [.2, 0], [.96, .46, .10, 1])):
+        objects.extend([
+            {"name": f"{name}_pad", "size": [.9, .9, .002], "position": [*center, .004], "color": color, "marker": True},
+            {"name": f"{name}_beacon", "size": [.10, .10, .55], "position": [center[0], center[1] + (-.7 if name == "charger" else .7), .275], "color": color}])
+    challenge.objects = objects
+    if identifier == "furniture_circuit":
+        challenge.orbit.center_m = [-4.4, 1.8]
+        challenge.objectives[0].center = [-4.4, 1.8, 0]
+    elif identifier == "apartment":
+        challenge.goal = challenge.goal.replace("this small apartment", "this apartment")
+        challenge.objectives[0].center = [6.2, -2.6, 0]
+    elif identifier == "flat_kitchen":
+        challenge.goal = challenge.goal.replace("five-room flat", "apartment")
+        challenge.skill = "Room recognition / kitchen search"
+        challenge.objectives[0].center = [3.4, 3.8, 0]
+        challenge.objectives[0].size = [2.6, 2.6]
+    else:
+        challenge.initial_xy = [-2.7, 0]
+        challenge.initial_head_pitch = .9
+        challenge.goal = challenge.goal.replace("around the gray screen to the orange survey zone", "through the open doorway to the orange survey zone in the hall")
+        for index, objective in enumerate(challenge.objectives):
+            objective.center = [.2, 0, 0] if index == 0 else [-2.7, 0, 0]
+            objective.size = [.9, .9]
+    for objective in challenge.objectives:
+        objective.visible_zone = False
+    return challenge
+
+
 def get_challenge(identifier):
     if identifier == "bench":
         return None
@@ -394,6 +678,49 @@ class ChallengeProgress:
         self.search_dwell_s = 0
         self.ordered_stage = 0
         self.route_dwell_s = 0
+        self.orbit_previous = None
+        self.orbit_start = None
+        self.orbit_angle = 0.
+        self.orbit_distance = 0.
+        self.orbit_lap = False
+        self.orbit_contact = False
+        self.orbit_dwell_s = 0.
+
+    def _update_orbit(self, measurement, simulated_time_s):
+        task = self.challenge.orbit
+        position = measurement["position_xy"]
+        radius = math.dist(position, task.center_m)
+        angle = math.atan2(position[1] - task.center_m[1], position[0] - task.center_m[0])
+        elapsed = max(0., simulated_time_s - self.last_time)
+        self.last_time = simulated_time_s
+        self.orbit_contact |= measurement["contact"]
+        eligible = measurement["grounded"] and task.minimum_radius_m <= radius <= task.maximum_radius_m
+        if self.orbit_previous is not None:
+            previous, previous_angle = self.orbit_previous
+            distance = math.dist(position, previous)
+            if distance > max(.06, elapsed * .65) or (elapsed <= 0 and distance > .001):
+                eligible = False
+            if eligible:
+                delta = math.atan2(math.sin(angle - previous_angle), math.cos(angle - previous_angle))
+                self.orbit_angle = max(0., self.orbit_angle + delta * (-1 if task.direction == "clockwise" else 1))
+                self.orbit_distance += distance
+        if not eligible:
+            self.orbit_start = None
+            self.orbit_angle = self.orbit_distance = self.orbit_dwell_s = 0.
+            self.orbit_lap = False
+        elif self.orbit_start is None:
+            self.orbit_start = list(position)
+        if eligible and self.orbit_start is not None:
+            self.orbit_lap |= (self.orbit_angle >= 2 * math.pi - .08 and self.orbit_distance >= 2 * math.pi * task.minimum_radius_m - .2
+                               and math.dist(position, self.orbit_start) < .25)
+            resting = measurement["speed"] < .025 and measurement["angular_speed"] < .15
+            self.orbit_dwell_s = self.orbit_dwell_s + elapsed if self.orbit_lap and resting else 0.
+        self.orbit_previous = (list(position), angle) if eligible else None
+        complete = self.orbit_lap and self.orbit_dwell_s >= .5 and not self.orbit_contact
+        detail = "Contact detected: reset the episode" if self.orbit_contact else "Complete" if complete else "Stop and hold for 0.5 s" if self.orbit_lap else f"{min(360, round(math.degrees(self.orbit_angle)))} / 360 degrees around the {task.target}"
+        self.status = {**self.challenge.public(), "status": "failed" if self.orbit_contact else "completed" if complete else "in_progress",
+            "completed_objectives": int(complete), "progress": [{"label": self.challenge.objectives[0].label, "complete": complete, "detail": detail}]}
+        return self.status
 
     @staticmethod
     def _parked(measurement, objective):
@@ -434,6 +761,22 @@ class ChallengeProgress:
         return self.status
 
     def update(self, measurements, held, simulated_time_s=0, travel_m=0):
+        if self.challenge.orbit:
+            return self._update_orbit(measurements["robot"], simulated_time_s)
+        if self.challenge.id == "pedestrian_crossing":
+            measurement = measurements["robot"]
+            failed = measurement["pedestrian_contact"]
+            yielded = measurement["yielded"] and not failed
+            passed = measurement["pedestrian_passed"] and yielded
+            parked = passed and self._parked(measurement, self.challenge.objectives[-1])
+            checks = [yielded, passed, parked]
+            details = ["Stop before the pedestrian and hold", "Wait for the crossing to clear", "Park fully in the green bay"]
+            self.status = {**self.challenge.public(), "status": "failed" if failed else "completed" if parked else "in_progress",
+                "completed_objectives": sum(checks), "progress": [
+                    {"label": objective.label, "complete": checks[index],
+                     "detail": "Pedestrian contact: reset the episode" if failed else "Complete" if checks[index] else details[index]}
+                    for index, objective in enumerate(self.challenge.objectives)]}
+            return self.status
         if self.challenge.search_target:
             measurement = measurements["robot"]
             elapsed = max(0, simulated_time_s - self.last_time)

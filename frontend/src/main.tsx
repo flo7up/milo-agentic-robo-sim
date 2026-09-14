@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, ArrowDown, ArrowUp, Battery, BatteryCharging, Camera, Check, CircleStop, Crosshair, Eye, Hand, LoaderCircle, Mic, Move3D, Pause, Play, RotateCcw, RotateCw, Settings2, Timer, TriangleAlert, Volume2, Wifi, WifiOff } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, Battery, BatteryCharging, Camera, Check, CircleStop, Crosshair, Eye, Hand, LoaderCircle, Map, MessageSquare, Mic, Move3D, Pause, Play, RotateCcw, RotateCw, Settings2, Timer, TriangleAlert, Volume2, Wifi, WifiOff } from 'lucide-react';
 import { Spectator } from './Spectator';
 import { HeadCamera } from './HeadCamera';
-import { AgentControl } from './AgentControl';
+import { SpatialSensing } from './SpatialSensing';
+import { HomeMapping } from './HomeMapping';
+import { LunaNavigationControl as AgentControl } from './LunaNavigationControl';
 import { ChallengePicker } from './ChallengePicker';
 import { OutcomeFeedback } from './OutcomeFeedback';
+import { ViewNavigation, type TestView } from './ViewNavigation';
 import type { LiveState, ManualPlacement, ProximitySensors, Result } from './types';
 import './style.css';
 
@@ -61,6 +64,8 @@ function RobotActivity({ state, connected }: { state: LiveState | null; connecte
     activity = { kind: 'settling', title: state.agent.idle_reason ?? 'Task ended', detail: 'Waiting for a quiet camera', icon: Timer };
   } else if (state.stopped) {
     activity = { kind: 'stopped', title: state.busy ? 'Stopping robot' : 'Robot stopped', detail: state.busy ? 'Stop requested' : 'Motion disabled', icon: CircleStop };
+  } else if (state.continuous_navigation?.status === 'running') {
+    activity = { kind: 'running', title: 'Robot navigating', detail: `Continuous local control / ${state.continuous_navigation.remaining_m.toFixed(2)} m remaining`, icon: Activity };
   } else if (state.busy) {
     activity = { kind: 'running', title: 'Robot running', detail: `Executing command / ${state.agent.active ? state.agent.mode === 'voice' ? 'Voice control' : state.agent.mode === 'chat' ? 'Chat control' : 'LLM control' : 'Manual control'}`, icon: Activity };
   } else if (state.agent.phase === 'error') {
@@ -81,7 +86,7 @@ function RobotActivity({ state, connected }: { state: LiveState | null; connecte
       <div><strong className="status">{activity.title}</strong><span className="activity-detail">{activity.detail}</span></div>
     </div>
     <div className="activity-readouts">
-      <TokenCounter agent={state?.agent} connected={connected} />
+      {(state?.agent.session_id || state?.agent.active) && <TokenCounter agent={state?.agent} connected={connected} />}
       <div className="activity-clock" aria-label="Simulation time"><strong>{connected && state ? state.snapshot.simulated_time_s.toFixed(2) : '--'}</strong><span>s simulated</span></div>
     </div>
     {state && <OutcomeFeedback state={state} connected={connected} />}
@@ -110,11 +115,13 @@ function ProximityPanel({ sensors }: { sensors: ProximitySensors }) {
   </section>;
 }
 
-function App() {
+function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void; onLiveState: (state: LiveState | null) => void }) {
   const [state, setState] = useState<LiveState | null>(null);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [pending, setPending] = useState(false);
+  const [sceneLoading, setSceneLoading] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
   const [axes, setAxes] = useState(false);
   const [tab, setTab] = useState('drive');
   const [arm, setArm] = useState('left');
@@ -128,7 +135,9 @@ function App() {
   const [events, setEvents] = useState<{ tool: string; result: Result }[]>([]);
   const currentRun = useRef(state?.run_id);
   currentRun.current = state?.run_id;
+  useEffect(() => { onLiveState(state); }, [state, onLiveState]);
   useEffect(() => { setEvents([]); setError(''); }, [state?.run_id]);
+  useEffect(() => { if (state?.agent.active) setManualOpen(false); }, [state?.agent.active]);
   useEffect(() => {
     let active = true;
     let socket: WebSocket;
@@ -172,32 +181,35 @@ function App() {
     } finally { setPending(false); }
   }
 
-  const disabled = !connected || pending || !!state?.busy || !!state?.stopped || !!state?.agent.active;
+  const disabled = !connected || pending || sceneLoading || !!state?.busy || !!state?.stopped || !!state?.agent.active;
   const jointLimits = [1.8, 2.5, 2.7, 3, 2.5, 3];
   const observation = state?.observation;
   return <>
     <header className="topbar">
-      <div className="brand"><span className="brand-mark"><Move3D size={26} /></span><div><h1>Milo <span>/ Embodied Lab</span></h1><p>Robot visual control research</p></div></div>
+      <div className="brand"><span className="brand-mark"><Move3D size={26} /></span><div><h1>Milo <span>/ Robot observatory</span></h1></div></div>
       <div className="connection">{connected ? <Wifi size={16} /> : <WifiOff size={16} />} {connected ? 'Local simulator' : 'Reconnecting'}</div>
     </header>
-    <main>
+    <ViewNavigation current="cockpit" onNavigate={onNavigate} />
+    <main className="observatory">
       <section className="runbar">
-        <div><span className="eyebrow">{state?.challenge ? 'PREDEFINED CHALLENGE' : 'MECHANICAL BENCH'}</span><h2>{state?.challenge?.title ?? 'Floor pickup & release'}</h2><p>{state?.challenge?.skill ?? 'Position either arm, close around the cube, lift, and release.'}</p></div>
+        <div className="run-context"><div><span className="eyebrow">LIVE ENVIRONMENT</span><h2>{state?.challenge?.title ?? 'Practice bench'}</h2></div>
+          {state && <ChallengePicker state={state} connected={connected} request={api} onLoadingChange={setSceneLoading} />}</div>
+        <nav className="workspace-nav" aria-label="Workspace"><a href="#setup"><Settings2 size={15} />Setup</a><a href="#observe"><Eye size={15} />Observe</a><a href="#interact"><MessageSquare size={15} />Luna</a><a href="#map"><Map size={15} />Map</a><a href="#controls" onClick={() => setManualOpen(true)}><Hand size={15} />Controls</a></nav>
         <div className="run-actions"><span className="tag">{state?.agent.active ? `${state.agent.mode === 'voice' ? 'Voice' : 'LLM'} / bounded tools` : state?.assisted ? 'Manual / assisted' : 'Manual ready'}</span><IconButton title="Resume manual control" disabled={!state?.stopped} onClick={() => control('resume')}><Play size={20} /></IconButton><IconButton title="Reset episode" onClick={() => control('reset')}><RotateCcw size={20} /></IconButton><button className="stop-button" onClick={() => control('stop')}><CircleStop size={18} /> Stop</button></div>
       </section>
-      <div className="mode-strip"><span>{state?.agent.active ? state.agent.mode === 'voice' ? 'Voice control' : 'LLM control' : 'Manual control'}</span><span>step_locked</span><span>RGB + proprioception</span><span>assisted_constraint</span><span>1 / 240 s physics</span></div>
       {error && <div className="error" role="alert">{error}</div>}
-      {state && <ChallengePicker state={state} connected={connected} request={api} />}
       <RobotActivity state={state} connected={connected} />
+      <div className="observatory-workspace" data-stage={state?.agent.session_id || state?.agent.active ? 'run' : 'setup'}>
+      <div className="observation-column" id="observe">
       <section className="view-grid">
         <div className="world-panel">
-          <div className="panel-header"><h3><Move3D size={16} /> Spectator</h3><label className="toggle"><input type="checkbox" checked={axes} onChange={event => setAxes(event.target.checked)} /> Axes</label></div>
+          <div className="panel-header"><h3><Move3D size={16} /> World view <span className="tag">Operator only</span></h3><label className="toggle"><input type="checkbox" checked={axes} onChange={event => setAxes(event.target.checked)} /> Axes</label></div>
           {state ? <Spectator state={state} axes={axes} enabled={!disabled} onPlace={placeRobot} /> : <div className="loading">Connecting to physics worker...</div>}
           <div className="viewport-footer"><span>{state?.manual_placements ? `Manual placements: ${state.manual_placements}` : 'MILO-01'}</span><span>{state?.snapshot.simulated_time_s.toFixed(2) ?? '0.00'} s simulated</span><span>Epoch {state?.episode_epoch ?? '-'}</span></div>
         </div>
         <div className="camera-panel">
           <div className="panel-header"><h3><Camera size={16} /> Head camera</h3><span className="tag">AUTHORITATIVE RGB</span></div>
-          {state && <HeadCamera key={state.run_id} frame={state.camera} />}
+          {state && <HeadCamera key={state.run_id} frame={state.camera} connected={connected} onStop={() => void control('stop')} />}
           <div className="sensors">
             <h3>Proprioception</h3>
             <div className="sensor-row"><span>Head yaw / pitch</span><strong>{observation?.head_rad.map(value => value.toFixed(2)).join(' / ') ?? '-'} rad</strong></div>
@@ -213,7 +225,18 @@ function App() {
           </div>
         </div>
       </section>
-      {state && <AgentControl key={state.run_id} state={state} connected={connected} request={api} />}
+      <div id="map">{state && <><HomeMapping key={`home-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
+        connected={connected} busy={sceneLoading || state.busy || state.agent.active} stopped={state.stopped} request={api} />
+        <SpatialSensing key={`spatial-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
+        connected={connected} busy={sceneLoading || state.busy || state.agent.active} request={api} /></>}</div>
+      </div>
+      <aside className="interaction-column" id="interact" aria-label="Robot interaction">
+        {state && <AgentControl key={state.run_id} state={state} connected={connected && !sceneLoading} request={api} />}
+      </aside>
+      </div>
+      <div className="lab-tools" id="controls">
+      <details className="manual-disclosure" open={manualOpen} onToggle={event => setManualOpen(event.currentTarget.open)}>
+      <summary><Hand size={16} />Manual controls</summary>
       <section className="controls-section">
         <div className="panel-header"><h3><Settings2 size={16} /> Manual control</h3><NumberInput label="Duration (s)" value={duration} set={setDuration} min={.1} max={2} step={.1} /></div>
         <div className="tabs" role="tablist">{[['drive', 'Base', <Move3D size={16} />], ['head', 'Head', <Eye size={16} />], ['arms', 'Arms & grippers', <Hand size={16} />]].map(([key, text, icon]) => <button role="tab" aria-selected={tab === key} key={String(key)} onClick={() => setTab(String(key))}>{icon}{text}</button>)}</div>
@@ -227,10 +250,52 @@ function App() {
         </div>
         <button className="wait-button" disabled={disabled} onClick={() => execute('wait', { duration_s: duration })}><Timer size={16} /> Wait</button>
       </section>
-      <section className="timeline"><div className="panel-header"><h3>Action timeline</h3><span>{events.length} commands</span></div>{events.length ? <div className="event-list">{[...events].reverse().map(({ tool, result }) => <div className="event" key={result.action_id}><span className={result.status === 'ok' ? 'ok' : 'bad'}>{result.status}</span><strong>{tool}</strong><span>{result.actual_duration_s.toFixed(2)} s</span><span>Frame {result.observation.seq}</span><span>{result.error ?? 'Completed'}</span></div>)}</div> : <p className="empty">No commands recorded in this episode.</p>}</section>
+      {events.length > 0 && <section className="timeline"><div className="panel-header"><h3>Action timeline</h3><span>{events.length} commands</span></div><div className="event-list">{[...events].reverse().map(({ tool, result }) => <div className="event" key={result.action_id}><span className={result.status === 'ok' ? 'ok' : 'bad'}>{result.status}</span><strong>{tool}</strong><span>{result.actual_duration_s.toFixed(2)} s</span><span>Frame {result.observation.seq}</span><span>{result.error ?? 'Completed'}</span></div>)}</div></section>}
+      </details>
+      </div>
       <footer>Prototype research simulator. Not a real-hardware safety validation.</footer>
     </main>
   </>;
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+const Archive = React.lazy(() => import('./TestResults').then(module => ({default:module.TestResults})));
+
+function TestWorkspace() {
+  const initialView = new URLSearchParams(location.search).get('view') === 'test-results' ? 'archive' : 'cockpit';
+  const [view, setView] = useState<TestView>(initialView);
+  const [cockpitOpened, setCockpitOpened] = useState(initialView === 'cockpit');
+  const [archiveOpened, setArchiveOpened] = useState(initialView === 'archive');
+  const [liveState, setLiveState] = useState<LiveState | null>(null);
+  function selectView(next: TestView) {
+    setView(next);
+    if (next === 'cockpit') setCockpitOpened(true);
+    else setArchiveOpened(true);
+  }
+  function navigate(next: TestView) {
+    if (next !== view) {
+      const url = new URL(location.href);
+      if (next === 'archive') url.searchParams.set('view', 'test-results');
+      else url.searchParams.delete('view');
+      history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+      selectView(next);
+    }
+  }
+  useEffect(() => {
+    const onPopState = () => selectView(new URLSearchParams(location.search).get('view') === 'test-results' ? 'archive' : 'cockpit');
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+  useEffect(() => { document.title = view === 'archive' ? 'Milo | Test results' : 'Milo | Embodied Robot Lab'; }, [view]);
+  return <>
+    {cockpitOpened && <div hidden={view !== 'cockpit'} data-test-view="cockpit"><App onNavigate={navigate} onLiveState={setLiveState} /></div>}
+    {archiveOpened && <div hidden={view !== 'archive'} data-test-view="archive"><React.Suspense fallback={<p role="status">Loading test archive...</p>}>
+      <Archive onNavigate={navigate} liveState={liveState} onStop={() => api('stop', {})} />
+    </React.Suspense></div>}
+  </>;
+}
+
+if (new URLSearchParams(location.search).has('cameraWorker')) {
+  void import('./gpuCamera').then(({ installGpuCamera }) => installGpuCamera());
+} else {
+  createRoot(document.getElementById('root')!).render(<TestWorkspace />);
+}

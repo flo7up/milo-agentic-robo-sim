@@ -2,7 +2,7 @@ from enum import Enum
 from typing import Annotated, Literal, Protocol
 import math
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -170,6 +170,9 @@ class NavigationFeedback(StrictModel):
     steps: list[NavigationStepState]
     remaining_s: float
     expires_in_s: float
+    skill_deadline_in_s: float = Field(default=0., ge=0)
+    effective_skill_budget_s: float = Field(default=0., ge=0)
+    deadline_recovery_enabled: bool = False
     velocity_mps_radps: list[float]
     travel_m: float
     scan_span_rad: float
@@ -206,7 +209,58 @@ class AgentObservation(StrictModel):
     proximity: ProximitySensors | None = None
     navigation: NavigationFeedback | None = None
     skill: SkillFeedback | None = None
+    spatial: dict | None = None
     sensor_profile: Literal["rgb_proprioception"] = "rgb_proprioception"
+
+
+class SpatialSettings(StrictModel):
+    run_id: str = Field(min_length=1, max_length=80)
+    episode_epoch: int = Field(ge=0)
+    enabled: bool
+
+
+class DepthCalibration(StrictModel):
+    width: int = Field(ge=16, le=640)
+    height: int = Field(ge=16, le=480)
+    fx: float = Field(gt=0)
+    fy: float = Field(gt=0)
+    cx: float
+    cy: float
+    near_m: float = Field(default=.015, gt=0)
+    far_m: float = Field(default=12., gt=0)
+    usable_range_m: float = Field(default=8., gt=0)
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if not self.near_m < self.usable_range_m <= self.far_m:
+            raise ValueError("Invalid depth clipping range")
+        if not 0 <= self.cx <= self.width or not 0 <= self.cy <= self.height:
+            raise ValueError("Invalid camera principal point")
+        return self
+
+
+class SpatialObservation(StrictModel):
+    run_id: str
+    episode_epoch: int = Field(ge=0)
+    sequence: int = Field(ge=1)
+    captured_at: float
+    simulated_time_s: float = Field(ge=0)
+    calibration: DepthCalibration
+    head_rad: list[float] = Field(min_length=2, max_length=2)
+    odometry_m_rad: list[float] = Field(min_length=3, max_length=3)
+    depth_m: list[float | None]
+
+    @model_validator(mode="after")
+    def validate_depth(self):
+        import math
+        if len(self.depth_m) != self.calibration.width * self.calibration.height:
+            raise ValueError("Depth dimensions do not match calibration")
+        if not all(math.isfinite(value) for value in [self.captured_at, *self.head_rad, *self.odometry_m_rad]):
+            raise ValueError("Spatial observation requires finite measured pose and timestamp")
+        if any(value is not None and (not math.isfinite(value) or not self.calibration.near_m <= value <= self.calibration.usable_range_m)
+               for value in self.depth_m):
+            raise ValueError("Depth values must be valid axial meters or null")
+        return self
 
 
 class EvaluatorState(StrictModel):

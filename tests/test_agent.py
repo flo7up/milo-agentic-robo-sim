@@ -20,6 +20,417 @@ def observation(seq=1):
                             head_rad=[0, .7], odometry_m_rad=[0, 0, 0], bumpers=[])
 
 
+async def test_resident_navigation_reuses_weights_and_discards_cancelled_reply():
+    from backend.local_navigation import ResidentNavigationModel
+    entered, release = asyncio.Event(), asyncio.Event()
+    clients, calls = [], []
+
+    class Client:
+        alive = True
+
+        def __init__(self):
+            clients.append(self)
+
+        @staticmethod
+        def check_available():
+            pass
+
+        async def start(self):
+            pass
+
+        async def reset(self):
+            calls.append("reset")
+
+        async def predict(self, observation, image):
+            calls.append((self.instruction, observation.seq))
+            if observation.seq == 1:
+                entered.set()
+                await release.wait()
+            return {"action": [.1, 0.], "seq": observation.seq}
+
+        async def close(self):
+            self.alive = False
+
+    resident = ResidentNavigationModel(Client)
+    first = resident()
+    first.instruction = "First goal"
+    try:
+        await first.start()
+        pending = asyncio.create_task(first.predict(observation(1), b"first"))
+        await entered.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await first.close()
+        second = resident()
+        second.instruction = "New goal"
+        next_start = asyncio.create_task(second.start())
+        release.set()
+        await asyncio.wait_for(next_start, 2)
+        result = await second.predict(observation(2), b"second")
+        await second.close()
+        assert result["seq"] == 2
+        assert calls == ["reset", ("First goal", 1), "reset", ("New goal", 2)]
+        assert len(clients) == 1 and clients[0].alive
+        assert resident.public()["load_count"] == 1 and resident.public()["phase"] == "ready"
+        with pytest.raises(asyncio.CancelledError):
+            await first.predict(observation(3), b"closed")
+    finally:
+        await resident.close()
+    assert not clients[0].alive and resident.public()["phase"] == "unloaded"
+
+
+async def test_resident_navigation_keeps_loading_after_run_is_stopped():
+    from backend.local_navigation import ResidentNavigationModel
+    entered, release = asyncio.Event(), asyncio.Event()
+    clients = []
+
+    class Client:
+        alive = True
+
+        def __init__(self):
+            clients.append(self)
+
+        async def start(self):
+            entered.set()
+            await release.wait()
+
+        async def reset(self):
+            pass
+
+        async def close(self):
+            self.alive = False
+
+    resident = ResidentNavigationModel(Client)
+    try:
+        first = resident()
+        pending = asyncio.create_task(first.start())
+        await entered.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await first.close()
+        assert resident.public()["phase"] == "loading" and clients[0].alive
+        second = resident()
+        next_start = asyncio.create_task(second.start())
+        release.set()
+        await asyncio.wait_for(next_start, 2)
+        assert len(clients) == 1 and resident.public()["phase"] == "ready"
+    finally:
+        await resident.close()
+    assert not clients[0].alive
+
+
+async def test_resident_navigation_late_reply_cannot_move_a_replacement_episode():
+    from backend.challenges import PRESETS
+    from backend.local_navigation import ResidentNavigationModel
+    entered, release = asyncio.Event(), asyncio.Event()
+    created = []
+
+    class Client:
+        alive = True
+
+        def __init__(self):
+            created.append(self)
+
+        @staticmethod
+        def check_available():
+            pass
+
+        async def start(self):
+            pass
+
+        async def reset(self):
+            pass
+
+        async def predict(self, observation, image):
+            if observation.navigation and self.instruction == "Old episode":
+                entered.set()
+                await release.wait()
+            return {"action": [.15, 0.]}
+
+        async def close(self):
+            self.alive = False
+
+    resident = ResidentNavigationModel(Client)
+    original = SimulationWorker(challenge=PRESETS["local_park"], pace=False)
+    replacement = None
+    first = AgentController(local_navigation_factory=resident)
+    second = AgentController(local_navigation_factory=resident)
+    try:
+        await asyncio.wrap_future(original.ready)
+        first.start(original, AgentStart(run_id=original.latest["run_id"], episode_epoch=0,
+            execution_mode="local_navigation", goal="Old episode"))
+        await asyncio.wait_for(entered.wait(), 10)
+        before = original.latest["snapshot"]["simulated_time_s"]
+        await asyncio.wait_for(first.halt(), 2)
+        assert created[0].alive and resident.public()["phase"] == "inferencing"
+        await original.close()
+        replacement = SimulationWorker(epoch=1, challenge=PRESETS["local_park"], pace=False)
+        await asyncio.wrap_future(replacement.ready)
+        second.start(replacement, AgentStart(run_id=replacement.latest["run_id"], episode_epoch=1,
+            execution_mode="local_navigation", goal="New episode", max_turns=1))
+        release.set()
+        await asyncio.wait_for(second.task, 15)
+        assert second.state["error"] is None
+        assert original.latest["snapshot"]["simulated_time_s"] == before
+        assert replacement.latest["snapshot"]["simulated_time_s"] == pytest.approx(4.6)
+        assert second.state["local_model"]["requests_completed"] == 1
+        assert resident.public()["load_count"] == 1 and created[0].alive
+    finally:
+        await first.halt()
+        await second.halt()
+        await resident.close()
+        if not original.closed:
+            await original.close()
+        if replacement:
+            await replacement.close()
+
+
+async def test_resident_navigation_reloads_only_after_worker_failure():
+    from backend.local_navigation import ResidentNavigationModel
+    clients = []
+
+    class Client:
+        alive = True
+
+        def __init__(self):
+            clients.append(self)
+
+        async def start(self):
+            pass
+
+        async def reset(self):
+            pass
+
+        async def predict(self, observation, image):
+            if len(clients) == 1:
+                raise ValueError("Worker failed")
+            return {"action": [0., 0.]}
+
+        async def close(self):
+            self.alive = False
+
+    resident = ResidentNavigationModel(Client)
+    try:
+        first = resident()
+        await first.start()
+        with pytest.raises(ValueError, match="Worker failed"):
+            await first.predict(observation(), b"frame")
+        assert not clients[0].alive and resident.public()["phase"] == "error"
+        await resident().start()
+        assert len(clients) == 2 and resident.public()["load_count"] == 2
+    finally:
+        await resident.close()
+
+
+async def test_local_navigation_session_reset_protocol_is_separate_from_motion():
+    from backend.local_navigation import LocalNavigationClient, NavigationReset
+    sent = []
+
+    class Input:
+        def write(self, data):
+            sent.append(json.loads(data))
+
+        async def drain(self):
+            pass
+
+    client = LocalNavigationClient()
+    client.process = SimpleNamespace(stdin=Input())
+
+    async def reply(timeout):
+        return {"reset": True}
+
+    client.reply = reply
+    await client.reset()
+    assert sent == [{"reset": True}]
+    with pytest.raises(ValidationError):
+        NavigationReset(reset=True, action=[.15, 0.])
+
+
+async def test_local_navigation_transmits_the_complete_challenge_goal_without_private_state():
+    from backend.challenges import PRESETS
+    from backend.local_navigation import LocalNavigationClient, NavigationRequest
+    from backend.policy import PolicyTicket
+    sent = []
+    current = observation()
+
+    class Input:
+        def write(self, data):
+            sent.append(json.loads(data))
+
+        async def drain(self):
+            pass
+
+    client = LocalNavigationClient()
+    client.process = SimpleNamespace(stdin=Input())
+    client.instruction = PRESETS["recharge"].goal
+    assert len(client.instruction) > 500
+
+    async def reply(timeout):
+        return {"ticket": PolicyTicket(run_id=current.run_id, episode_epoch=current.episode_epoch,
+            revision=0, observation_seq=current.seq).model_dump(), "action": [.1, .2]}
+
+    client.reply = reply
+    assert (await client.predict(current, b"head-image"))["action"] == [.1, .2]
+    request = NavigationRequest.model_validate(sent[0])
+    assert request.instruction == PRESETS["recharge"].goal
+    assert request.observation == current
+    assert base64.b64decode(request.image) == b"head-image"
+    assert set(sent[0]) == {"ticket", "observation", "image", "instruction"}
+
+
+async def test_local_navigation_spawn_cancellation_retains_process_for_cleanup(tmp_path, monkeypatch):
+    from backend import local_navigation
+    started, release = asyncio.Event(), asyncio.Event()
+    killed = []
+
+    class Process:
+        pid = 4242
+        returncode = None
+        stdin = None
+
+        def kill(self):
+            killed.append(True)
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+    process = Process()
+
+    async def spawn(*arguments, **kwargs):
+        if arguments[0] == "taskkill":
+            assert arguments[1:] == ("/PID", "4242", "/T", "/F")
+            killed.append(True)
+            return Process()
+        started.set()
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(local_navigation, "ROOT", tmp_path)
+    monkeypatch.setattr(local_navigation.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(local_navigation.LocalNavigationClient, "check_available", staticmethod(lambda: None))
+    client = local_navigation.LocalNavigationClient()
+    task = asyncio.create_task(client.start())
+    await started.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.process is process
+    await client.close()
+    assert killed == [True] and client.log.closed
+
+
+async def test_local_navigation_immediate_stop_clears_loading_without_spawning():
+    from backend.challenges import PRESETS
+    from backend.local_navigation import TASK
+
+    class LocalModel:
+        @staticmethod
+        def check_available():
+            pass
+
+        def __init__(self):
+            raise AssertionError("Stopped session must not create a model")
+
+    worker = SimulationWorker(challenge=PRESETS["local_park"], pace=False)
+    controller = AgentController(local_navigation_factory=LocalModel)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        controller.start(worker, AgentStart(run_id=worker.latest["run_id"], episode_epoch=worker.epoch,
+            goal=TASK, execution_mode="local_navigation"))
+        await controller.halt()
+        assert controller.state["local_model"]["phase"] == "interrupted"
+        assert not controller.active and worker.latest["stopped"]
+        assert worker.latest["snapshot"]["simulated_time_s"] == 0
+    finally:
+        await worker.close()
+
+
+async def test_local_navigation_load_is_cloud_free_and_cancellable():
+    from backend.challenges import PRESETS
+    from backend.local_navigation import TASK
+    entered = asyncio.Event()
+    closed = []
+
+    class LocalModel:
+        @staticmethod
+        def check_available():
+            pass
+
+        async def start(self):
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def close(self):
+            closed.append(True)
+
+    worker = SimulationWorker(challenge=PRESETS["local_park"], pace=False)
+    controller = AgentController(FoundryConfig(endpoint="", ollama_endpoint=""), local_navigation_factory=LocalModel)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        settings = AgentStart(run_id=worker.latest["run_id"], episode_epoch=worker.epoch,
+            goal=TASK, execution_mode="local_navigation")
+        controller.start(worker, settings)
+        await asyncio.wait_for(entered.wait(), 3)
+        assert controller.active and controller.public()["local_model"]["phase"] == "loading"
+        assert worker.latest["snapshot"]["simulated_time_s"] == 0
+        await controller.halt()
+        assert closed == [True] and not controller.active
+        assert controller.state["local_model"]["phase"] == "interrupted"
+        assert worker.latest["stopped"] and worker.latest["snapshot"]["simulated_time_s"] == 0
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+@pytest.mark.parametrize("challenge_id", ["local_park", "warehouse", "recharge"])
+async def test_local_navigation_drives_the_owned_worker_and_restores_camera(challenge_id):
+    from backend.challenges import PRESETS
+    from backend.local_navigation import TASK
+    inputs = []
+
+    class LocalModel:
+        @staticmethod
+        def check_available():
+            pass
+
+        async def start(self):
+            pass
+
+        async def predict(self, observation, image):
+            from io import BytesIO
+            from PIL import Image
+            assert self.instruction == PRESETS[challenge_id].goal
+            assert Image.open(BytesIO(image)).size == (320, 240)
+            inputs.append(observation.model_dump())
+            return {"action": [.15, 0.]}
+
+        async def close(self):
+            pass
+
+    worker = SimulationWorker(challenge=PRESETS[challenge_id], pace=False)
+    controller = AgentController(local_navigation_factory=LocalModel)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        controller.start(worker, AgentStart(run_id=worker.latest["run_id"], episode_epoch=worker.epoch,
+            goal=PRESETS[challenge_id].goal, execution_mode="local_navigation", max_turns=2, feedback_interval_s=.25))
+        await asyncio.wait_for(controller.task, 15)
+        assert controller.state["error"] is None, controller.state["error"]
+        assert controller.state["local_model"]["requests_completed"] == 2
+        assert worker.latest["snapshot"]["simulated_time_s"] == pytest.approx(5.6)
+        final_observation, _ = await worker.feedback()
+        assert final_observation.odometry_m_rad[0] > .1
+        assert all(set(value) == set(AgentObservation.model_fields) for value in inputs)
+        assert await worker.call(lambda sim: (sim.width, sim.height)) == (640, 480)
+        assert worker.latest["stopped"] and not controller.active
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
 def test_feedback_and_tools_expose_only_robot_inputs():
     message = feedback_message(observation(), b"camera-png")
     sensors = json.loads(message["content"][0]["text"])
@@ -737,13 +1148,62 @@ async def test_trace_never_exposes_encrypted_reasoning_or_credentials(monkeypatc
 
 if __name__ == "__main__":
     from contextlib import asynccontextmanager
+    import os
+    os.environ.setdefault("MILO_RENDERER", "tiny")
     import uvicorn
     from backend.app import app, lab, lifespan
     from backend.realtime import RealtimeConfig
     from tests.test_realtime import RealtimeModel, tool_call
 
+    class BrowserLocalNavigation:
+        def __init__(self):
+            self.requests = 0
+            self.alive = True
+
+        @staticmethod
+        def check_available():
+            pass
+
+        async def start(self):
+            await asyncio.sleep(.5)
+
+        async def reset(self):
+            self.requests = 0
+
+        async def predict(self, observation, image):
+            self.requests += 1
+            if self.requests >= 4:
+                await asyncio.Event().wait()
+            await asyncio.sleep(.1)
+            return {"action": [0., 0.] if self.instruction == "Remain stationary." else [.15, 0.]}
+
+        async def close(self):
+            self.alive = False
+
     class BrowserModel(ScriptedModel):
         async def respond(self, profile, reasoning, goal, inputs):
+            if getattr(self, "execution_mode", "single_step") == "luna_continuous":
+                self.inputs.append(inputs)
+                if goal == "Review motion camera history." and len(self.inputs) == 1:
+                    context = next(json.loads(part["text"]) for part in inputs[-1]["content"]
+                        if part["type"] == "input_text" and part["text"].startswith('{"reachable_floor_candidates"'))
+                    frame = context["camera_history"]["frames"][0]
+                    return model_response("guide_continuous", json.dumps({"action": "inspect_history", "history_frame_id": frame["frame_id"],
+                        "reason": "Scripted camera history inspection; not real-model recognition."}), call_id="history-inspect")
+                if len(self.inputs) > 1:
+                    await self.release.wait()
+                candidates = next(json.loads(part["text"])["reachable_floor_candidates"] for part in inputs[-1]["content"]
+                    if part["type"] == "input_text" and part["text"].startswith('{"reachable_floor_candidates"'))
+                choice = min(candidates, key=lambda item: abs(item["distance_m"] - 1.5))
+                return model_response("guide_continuous", json.dumps({"action": "navigate", "candidate_id": choice["id"],
+                    "reason": "Scripted continuous controller fixture; not real-model task validation."}), call_id="continuous-first")
+            if getattr(self, "execution_mode", "single_step") == "luna_navigation":
+                self.inputs.append(inputs)
+                if len(self.inputs) > 1:
+                    await self.release.wait()
+                return model_response("guide_navigation", json.dumps({"motion": "forward", "steps": 2,
+                    "look_yaw_rad": 0, "look_pitch_rad": .45, "status": "continue",
+                    "reason": "Scripted navigation supervisor fixture; not real-model task validation."}), call_id="guide-first")
             if getattr(self, "execution_mode", "single_step") == "supervised_policy":
                 self.inputs.append(inputs)
                 state = json.loads(inputs[-1]["content"][0]["text"])["skill"]
@@ -785,9 +1245,20 @@ if __name__ == "__main__":
     async def browser_fixture(application):
         async with lifespan(application):
             from tests.test_policy import BrowserPolicy
+            from backend.local_navigation import ResidentNavigationModel
+
+            class CancellationPolicy(BrowserPolicy):
+                async def predict(self, ticket, observation, image, instruction):
+                    if observation.simulated_time_s >= .25:
+                        await asyncio.Event().wait()
+                    return await super().predict(ticket, observation, image, instruction)
+
+            lab.local_navigation = ResidentNavigationModel(BrowserLocalNavigation)
             lab.agent = AgentController(FoundryConfig(), lambda config: BrowserModel([
                 model_response(arguments=json.dumps({"linear_mps": .2, "angular_radps": .4, "duration_s": 2})), "wait"]),
-                policy_factory=lambda config: BrowserPolicy())
+                policy_factory=lambda config: CancellationPolicy(), local_navigation_factory=lab.local_navigation)
+            lab.agent.record_sessions = True
+            lab.agent.recording_evidence = "scripted_test"
             lab.realtime_config = RealtimeConfig()
             lab.voice_factory = lambda config: RealtimeModel([tool_call(), []])
             yield

@@ -134,7 +134,7 @@ async def test_offline_arm_policy_explains_navigation_checkpoint_mismatch():
     assert not result["ready"] and result["status"] == "unavailable"
     assert result["metadata"] is None
     assert "milo-left-arm-v1" in result["message"] and "not a navigation checkpoint" in result["message"]
-    assert "CLI-only" in result["message"] and "selected LLM" in result["message"]
+    assert "Local SmolVLA navigation" in result["message"] and "selected LLM" in result["message"]
     assert client.client.is_closed
 
 
@@ -398,7 +398,7 @@ class BrowserPolicy:
         current = [positions[name] for name in ACTION_NAMES[:6]] + [max(0, min(.11, observation.grippers["left"].aperture_m))]
         await asyncio.sleep(.03)
         return PolicyChunk(ticket=ticket, actions=[
-            [current[0] + .0004 * (index + 1), *current[1:]] for index in range(50)])
+            [current[0] + .0004 * (index + 1), *current[1:]] for index in range(8)])
 
     async def close(self):
         pass
@@ -469,11 +469,12 @@ async def test_supervised_policy_failures_cancel_pending_supervisor_and_motion(f
         await worker.close()
 
 
-async def test_policy_motion_never_calls_the_physics_threads_camera_renderer():
+@pytest.mark.parametrize("rendering", ["tiny", "enhanced"])
+async def test_policy_motion_never_calls_the_physics_threads_camera_renderer(rendering):
     import asyncio
     from backend.contracts import Command
     from backend.worker import SimulationWorker
-    worker = SimulationWorker(pace=True)
+    worker = SimulationWorker(pace=True, rendering=rendering)
     try:
         await asyncio.wrap_future(worker.ready)
         await worker.begin_skill_mode(trained_metadata(), worker.stop_revision)
@@ -492,7 +493,7 @@ async def test_policy_motion_never_calls_the_physics_threads_camera_renderer():
         ticket, observation, image = await worker.policy_feedback()
         positions = {joint.name: joint.position for joint in observation.joints}
         action = [positions[name] for name in ACTION_NAMES[:6]] + [.11]
-        await worker.accept_policy(PolicyChunk(ticket=ticket, actions=[action] * 50))
+        await worker.accept_policy(PolicyChunk(ticket=ticket, actions=[action] * 10))
         async with asyncio.timeout(3):
             while worker.latest["snapshot"]["simulated_time_s"] < .2:
                 assert worker.latest["skill"]["status"] != "failed", worker.latest["skill"]

@@ -1,12 +1,18 @@
 export type Vec3 = [number, number, number];
 export type Quat = [number, number, number, number];
 export type Pose = { key: string; position: Vec3; quaternion: Quat };
-export type Geometry = Pose & { type: number; dimensions: number[]; color: number[]; texture: string | null };
+export type Geometry = Pose & { type: number; dimensions: number[]; color: number[]; texture: string | null; name?: string };
 export type ProximitySensors = { simulated_time_s: number; max_range_m: number;
   distances: { direction: string; bearing_rad: number; distance_m: number | null; status: 'hit' | 'clear' | 'occluded' }[];
   collisions: { direction: string; force_n: number }[] };
 export type CameraFrame = { seq: number; frame_ref: string; simulated_time_s: number; url: string };
-export type ExecutionMode = 'single_step' | 'navigation_plan' | 'supervised_policy';
+export type ExecutionMode = 'single_step' | 'navigation_plan' | 'supervised_policy' | 'local_navigation' | 'luna_navigation' | 'luna_continuous';
+export type LocalModelStatus = {
+  run_id: string; checkpoint: string; case?: number; challenge_id?: string; challenge_title?: string;
+  phase: 'checking' | 'loading' | 'warming' | 'supervising' | 'running' | 'saving' | 'completed' | 'failed' | 'interrupted';
+  supervisor_turns?: number; instruction?: string;
+  requests_completed: number; request_limit: number; elapsed_s: number; success: boolean | null;
+};
 export type SkillState = {
   revision: number; motion_revision: number; status: 'idle' | 'running' | 'awaiting_policy' | 'completed' | 'cancelled' | 'failed';
   skill: string | null; instruction: string; reason: string; remaining_s: number; checkpoint: string;
@@ -20,9 +26,11 @@ export type NavigationState = {
     status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'; evidence: string }[];
 };
 export type ManualPlacement = { run_id: string; episode_epoch: number; observation_seq: number; xy_m: [number, number] };
-export type ChallengeId = 'bench' | 'park' | 'tidy' | 'sort' | 'recharge' | 'apartment' | 'kitchen_bathroom' | 'clinic_delivery' | 'warehouse' | 'inspection' | 'workshop';
-export type ChallengePreset = { id: ChallengeId; title: string; skill: string; goal: string; objectives: string[]; suggested_turn_limit: number;
-  category?: 'Navigation' | 'Perception' | 'Manipulation'; difficulty?: 'Foundation' | 'Advanced' };
+export type ChallengeId = 'bench' | 'park' | 'tidy' | 'sort' | 'recharge' | 'apartment' | 'kitchen_bathroom' | 'clinic_delivery' | 'warehouse' | 'inspection' | 'workshop' | 'local_park' | 'pedestrian_crossing' | 'flat_kitchen' | 'furniture_circuit';
+export type ChallengeEnvironment = 'standalone' | 'shared_apartment_v1';
+export type ChallengePreset = { id: ChallengeId; environment?: ChallengeEnvironment; title: string; skill: string; goal: string; objectives: string[]; suggested_turn_limit: number;
+  category?: 'Navigation' | 'Perception' | 'Manipulation'; difficulty?: 'Foundation' | 'Advanced';
+  orbit?: {target: 'table' | 'sofa' | 'chair' | 'floor lamp'; direction: 'clockwise' | 'counterclockwise'} };
 export type ChallengeState = ChallengePreset & {
   status: 'in_progress' | 'completed' | 'failed'; completed_objectives: number;
   progress: { label: string; complete: boolean; detail: string }[];
@@ -47,7 +55,7 @@ export type ExchangeEntry = {
   id: number; title: string; timestamp: number; turn: number; image_url: string | null; image_urls?: string[];
 } & (
   { kind: 'session'; payload: { model?: string; deployment?: string; reasoning?: string; goal?: string; instructions?: string; tools?: unknown[]; feedback_interval_s?: number; max_turns?: number; status?: string; message?: string; reason?: string } } |
-  { kind: 'feedback'; payload: { observation: Observation; image_detail: string; history_turns: number[]; input_items: number; images_in_request: number; tool_result_call_ids: string[]; context_mode?: string; memory_frame_seq?: number | null; recent_actions?: Partial<AgentAction>[]; collision_feedback?: CollisionFeedback | null; images_per_request?: number; context_tokens?: number; retained_context_tokens_estimate?: number; context_estimator?: string; camera_frames?: { seq: number; frame_ref: string; simulated_time_s: number; wall_timestamp: number; current: boolean }[] } } |
+  { kind: 'feedback'; payload: { observation: Observation; image_detail: string; history_turns: number[]; input_items: number; images_in_request: number; tool_result_call_ids: string[]; context_mode?: string; memory_frame_seq?: number | null; recent_actions?: Partial<AgentAction>[]; collision_feedback?: CollisionFeedback | null; images_per_request?: number; context_tokens?: number; retained_context_tokens_estimate?: number; context_estimator?: string; camera_frames?: { seq: number; frame_ref: string; simulated_time_s: number; wall_timestamp: number; current: boolean }[]; camera_history?: { frames: { frame_id: string; simulated_time_s: number }[] }; historical_original?: { frame_id: string; simulated_time_s: number } | null } } |
   { kind: 'response'; payload: { text: string; text_truncated: boolean; status: string; latency_s: number; input_tokens: number | null; output_tokens: number | null; calls: { call_id: string; name: string; arguments: string }[]; calls_truncated: boolean; refusals: string[] } } |
   { kind: 'tool'; payload: { tool: string; arguments: unknown; call_id: string } } |
   { kind: 'policy'; payload: Record<string, unknown> } |
@@ -56,6 +64,12 @@ export type ExchangeEntry = {
 export type ExchangeFeed = { session_id: string | null; revision: number; first_id: number; capacity: number; events: ExchangeEntry[] };
 export type AgentState = {
   execution_mode: ExecutionMode;
+  navigation_backend?: 'builtin' | 'nav2';
+  run_messages?: {id:string;role:'user'|'assistant';text:string;status:string;source?:string}[];
+  run_memory?: {revision:number;visited_positions_m:number[][];inspected_heading_sectors_here:number[];
+    rotation_without_translation_rad:number;recent_actions:{action:string;status:string;distance_m:number;turn_rad:number;reason:string}[];
+    progress?:{stagnant_actions:number;recovery_needed:boolean;recovery_attempts:number;recovery_limit:number}};
+  local_model?: LocalModelStatus | null;
   context_usage?: {
     turn: number; observation_seq: number; retained_tokens_estimate: number; retained_budget: number;
     retained_turns: number; images_sent: number; image_limit: number; input_tokens: number | null;
@@ -77,6 +91,12 @@ export type AgentState = {
   configuration: { provider: string; endpoint: string; ollama_endpoint: string; default_model_id: string; models: ModelProfile[] };
 };
 export type LiveState = {
+  rendering?: 'tiny' | 'enhanced';
+  continuous_navigation?: {status: string; reason: string; remaining_m: number; updates: number; buffer_stops: number} | null;
+  local_navigation_model?: {
+    phase: 'unloaded' | 'loading' | 'ready' | 'inferencing' | 'error';
+    checkpoint: string; load_count: number; process_id: number | null;
+  };
   navigation?: NavigationState | null;
   skill?: SkillState | null;
   proximity: ProximitySensors;

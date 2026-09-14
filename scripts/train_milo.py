@@ -72,6 +72,7 @@ def run(options):
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     report = {"status": "running", "steps": options.steps, "batch_size": options.batch_size,
+              "learning_rate": getattr(options, "learning_rate", 1e-4),
               "base_revision": MODEL_REVISION, "training_episodes": training_episodes, "validation_episodes": validation_episodes,
               "embodiment": embodiment, "state_names": state_names, "action_names": action_names, "fps": fps,
               "balance_stops": options.balance_stops,
@@ -158,7 +159,7 @@ def run(options):
         print(json.dumps({key: value for key, value in report.items() if key != "updates"}), flush=True)
         torch.manual_seed(713)
         sampler = torch.Generator().manual_seed(713)
-        optimizer = torch.optim.AdamW(parameters, lr=1e-4, betas=(.9, .95), eps=1e-8, weight_decay=1e-10)
+        optimizer = torch.optim.AdamW(parameters, lr=getattr(options, "learning_rate", 1e-4), betas=(.9, .95), eps=1e-8, weight_decay=1e-10)
         policy.train()
         for step in range(1, options.steps + 1):
             began = time.perf_counter()
@@ -220,4 +221,5 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, choices=range(1, MAX_TRAINING_STEPS + 1), default=100)
     parser.add_argument("--batch-size", type=int, choices=range(1, 5), default=1)
+    parser.add_argument("--learning-rate", type=float, choices=[1e-4, 3e-5, 1e-5], default=1e-4)
     run(parser.parse_args())

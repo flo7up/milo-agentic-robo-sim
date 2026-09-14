@@ -68,12 +68,10 @@ def challenge_for(case):
 
 
 def apply(runtime, sim, name, arguments):
-    from backend.navigation import CompleteNavigationSkill, NavigationPlan, ReplaceMotionBuffer
+    from backend.navigation import NAVIGATION_TOOLS
     observation = sim.observe(render=False)
     runtime.observe(sim, observation)
-    models = {"set_navigation_plan": NavigationPlan, "replace_motion_buffer": ReplaceMotionBuffer,
-              "complete_navigation_skill": CompleteNavigationSkill}
-    runtime.apply(sim, name, models[name](expected_revision=runtime.revision, **arguments), observation.seq)
+    runtime.apply(sim, name, NAVIGATION_TOOLS[name](expected_revision=runtime.revision, **arguments), observation.seq)
 
 
 def prepare(sim, runtime):
@@ -315,15 +313,18 @@ def bounded_velocity(prediction):
 
 
 def inference(options):
+    print("Loading local navigation runtime", file=sys.stderr, flush=True)
     with redirect_stdout(sys.stderr):
         from PIL import Image
         import torch
-        from backend.smolvla_server import PolicyRequest
+        from backend.local_navigation import NavigationRequest, NavigationReset
         from lerobot.policies.factory import make_pre_post_processors
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+        print("Validating navigation checkpoint", file=sys.stderr, flush=True)
         checkpoint, _ = load_checkpoint(options.checkpoint)
         torch.set_num_threads(8)
         torch.manual_seed(options.seed)
+        print("Loading checkpoint weights on GPU", file=sys.stderr, flush=True)
         policy = SmolVLAPolicy.from_pretrained(checkpoint, local_files_only=True, strict=True).float().eval()
         config = policy.config
         if (config.device != "cuda" or config.chunk_size != 1 or config.n_obs_steps != 1 or
@@ -331,11 +332,20 @@ def inference(options):
                 tuple(config.output_features["action"].shape) != (2,) or
                 set(config.image_features) != {"observation.images.head"}):
             raise ValueError("The saved model is not a compatible navigation policy")
-        preprocess, postprocess = make_pre_post_processors(config, pretrained_path=str(checkpoint))
+        preprocess, postprocess = make_pre_post_processors(config, pretrained_path=str(checkpoint),
+            preprocessor_overrides={"tokenizer_processor": {"truncation": False}})
     print(json.dumps({"ready": True, "device": torch.cuda.get_device_name(0)}), flush=True)
     for line in sys.stdin:
+        payload = json.loads(line)
+        if isinstance(payload, dict) and payload.get("reset") is True:
+            NavigationReset.model_validate(payload)
+            with redirect_stdout(sys.stderr):
+                policy.reset()
+                torch.manual_seed(options.seed)
+            print(json.dumps({"reset": True}), flush=True)
+            continue
         with redirect_stdout(sys.stderr):
-            request = PolicyRequest.model_validate_json(line)
+            request = NavigationRequest.model_validate(payload)
             with Image.open(BytesIO(base64.b64decode(request.image, validate=True))) as image:
                 if image.size != (320, 240):
                     raise ValueError("Expected the synchronized 320x240 head image")

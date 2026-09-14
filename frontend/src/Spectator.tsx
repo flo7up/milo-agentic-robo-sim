@@ -3,6 +3,7 @@ import { MousePointer2 } from 'lucide-react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { LiveState, ManualPlacement } from './types';
+import { enhancedLighting, visualGeometry, visualMaterial, type GraphicsQuality } from './sceneGraphics';
 
 export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState; axes: boolean; enabled: boolean; onPlace: (placement: ManualPlacement) => Promise<void> }) {
   const host = useRef<HTMLDivElement>(null);
@@ -14,6 +15,10 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
   const [preview, setPreview] = useState<[number, number] | null>(null);
   const [placing, setPlacing] = useState(false);
   const [error, setError] = useState('');
+  const [preferredQuality, setQuality] = useState<GraphicsQuality>(() =>
+    new URLSearchParams(location.search).get('graphics') === 'enhanced' || localStorage.getItem('milo-spectator-graphics') === 'enhanced' ? 'enhanced' : 'standard');
+  const quality = state.rendering === 'enhanced' ? 'enhanced' : preferredQuality;
+  const savedView = useRef<{ run: string; position: THREE.Vector3; target: THREE.Vector3 } | null>(null);
   current.current = state;
   axesVisible.current = axes;
   options.current = { enabled, onPlace };
@@ -31,9 +36,10 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     scene.background = new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue('--cp-surface-soft').trim());
     const camera = new THREE.PerspectiveCamera(43, 1, .01, 80);
     const parking = current.current.challenge?.id === 'park';
-    const recharging = current.current.challenge?.id === 'recharge';
+    const recharging = ['recharge', 'pedestrian_crossing'].includes(current.current.challenge?.id ?? '');
     const apartment = ['apartment', 'kitchen_bathroom'].includes(current.current.challenge?.id ?? '');
-    const facility = ['clinic_delivery', 'warehouse', 'inspection'].includes(current.current.challenge?.id ?? '');
+    const facility = current.current.challenge?.environment === 'shared_apartment_v1'
+      || ['clinic_delivery', 'warehouse', 'inspection', 'flat_kitchen', 'furniture_circuit'].includes(current.current.challenge?.id ?? '');
     const workshop = current.current.challenge?.id === 'workshop';
     const floor = current.current.geometry.find(asset => asset.type === 3 && asset.dimensions[0] >= 4 && asset.dimensions[1] >= 4 && asset.dimensions[2] <= .11);
     const floorWidth = floor?.dimensions[0] ?? 6, floorDepth = floor?.dimensions[1] ?? 6;
@@ -50,13 +56,18 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     element.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(facility ? 0 : workshop ? .5 : apartment ? .45 : recharging ? .65 : parking ? .6 : .12, .25, 0);
+    if (savedView.current?.run === state.run_id) {
+      camera.position.copy(savedView.current.position);
+      controls.target.copy(savedView.current.target);
+    }
     controls.enableDamping = true;
     controls.minDistance = .45;
     controls.maxDistance = facility ? 45 : apartment ? 12 : 8;
     let cameraAdjusted = false;
     controls.addEventListener('start', () => { cameraAdjusted = true; });
     controls.maxPolarAngle = Math.PI / 2 - .02;
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x777777, 2));
+    const hemisphere = new THREE.HemisphereLight(0xffffff, 0x777777, 2);
+    scene.add(hemisphere);
     const sun = new THREE.DirectionalLight(0xffffff, 2.4);
     sun.position.set(2, 5, 3);
     sun.castShadow = true;
@@ -65,6 +76,11 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     Object.assign(sun.shadow.camera, { left: -shadowExtent, right: shadowExtent, top: shadowExtent, bottom: -shadowExtent, near: .1, far: 30 });
     sun.shadow.normalBias = .015;
     scene.add(sun);
+    let disposeLighting = () => {};
+    if (quality === 'enhanced') {
+      scene.remove(hemisphere, sun);
+      disposeLighting = enhancedLighting(scene, renderer, shadowExtent);
+    }
     const world = new THREE.Group();
     world.rotation.x = -Math.PI / 2;
     scene.add(world);
@@ -78,10 +94,7 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     const textureLoader = new THREE.TextureLoader();
     for (const asset of current.current.geometry) {
       const dimensions = asset.dimensions;
-      const geometry = asset.type === 2 ? new THREE.SphereGeometry(dimensions[0], 24, 16)
-        : asset.type === 4 ? new THREE.CylinderGeometry(dimensions[1], dimensions[1], dimensions[0], 32)
-        : new THREE.BoxGeometry(dimensions[0], dimensions[1], dimensions[2]);
-      if (asset.type === 4) geometry.rotateX(Math.PI / 2);
+      const geometry = visualGeometry(asset, quality);
       let texture: THREE.Texture | undefined;
       if (asset.texture) {
         texture = textures.get(asset.texture);
@@ -92,8 +105,7 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
           textures.set(asset.texture, texture);
         }
       }
-      const material = new THREE.MeshStandardMaterial({ color: new THREE.Color(...asset.color.slice(0, 3) as [number, number, number]),
-        map: texture, roughness: texture ? .9 : .65, metalness: texture ? 0 : .12 });
+      const material = visualMaterial(asset, texture, quality);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.castShadow = dimensions[2] > .01;
       mesh.receiveShadow = true;
@@ -269,6 +281,7 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     animate();
     return () => {
       active = false;
+      savedView.current = { run: state.run_id, position: camera.position.clone(), target: controls.target.clone() };
       interaction.current = { select: () => {}, cancel: () => {} };
       cancelAnimationFrame(frameId);
       releasePointer();
@@ -287,11 +300,13 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
         (mesh.material as THREE.Material).dispose();
       }
       for (const texture of textures.values()) texture.dispose();
+      disposeLighting();
+      sun.shadow.map?.dispose();
       axisHelper.dispose();
       renderer.dispose();
       element.replaceChildren();
     };
-  }, [state.run_id]);
+  }, [state.run_id, quality]);
   return <div className="spectator-shell">
     <div className="spectator" ref={host} />
     <div className="placement-toolbar">
@@ -301,6 +316,12 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
       <span role="status">{placing ? 'Applying position' : preview ? 'Placement preview' : selected ? 'Milo selected' : ''}</span>
       {preview && <span className="placement-coordinates">X {preview[0].toFixed(2)} / Y {preview[1].toFixed(2)} m</span>}
     </div>
+    {state.rendering !== 'enhanced' && <div className="graphics-quality" role="group" aria-label="Spectator graphics">
+      {(['standard', 'enhanced'] as const).map(mode => <button key={mode} type="button" aria-pressed={quality === mode}
+        title={`${mode === 'standard' ? 'Standard' : 'Enhanced'} spectator graphics; robot camera unchanged`}
+        onClick={() => { localStorage.setItem('milo-spectator-graphics', mode); setQuality(mode); }}>
+        {mode === 'standard' ? 'Standard' : 'Enhanced'}</button>)}
+    </div>}
     {error && <div className="placement-error" role="alert">{error}</div>}
   </div>;
 }

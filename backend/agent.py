@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from types import SimpleNamespace
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -19,6 +20,7 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 from backend.contracts import AgentObservation, Command, StrictModel, TOOL_MODELS, tool_schemas
 from backend.feedback import camera_batch, compact_numbers, context_token_estimate, feedback_json, model_tool_result, observation_collision, retain_context, text_context
 from backend.navigation import NAVIGATION_DESCRIPTIONS, NAVIGATION_TOOLS
+from backend.local_navigation import CHECKPOINT, LocalNavigationClient
 from backend.policy import LocalPolicyClient, PolicyConfig, PolicyRunner, SKILL_DESCRIPTIONS, SKILL_TOOLS
 from backend.simulation import MotionError
 
@@ -117,14 +119,22 @@ class FoundryConfig(StrictModel):
             "models": models}
 
 
-def robot_tools(execution_mode="single_step"):
+def robot_tools(execution_mode="single_step", skill_composer=False):
+    if execution_mode == "luna_continuous":
+        from backend.continuous_supervisor import tools
+        return tools(skill_composer)
+    if execution_mode == "luna_navigation":
+        from backend.navigation_supervisor import navigation_supervisor_tools
+        return navigation_supervisor_tools()
+    if execution_mode == "local_navigation":
+        return []
     if execution_mode == "supervised_policy":
         return [{"type": "function", "name": name, "description": SKILL_DESCRIPTIONS[name],
                  "parameters": model.model_json_schema(), "strict": False} for name, model in SKILL_TOOLS.items()] + [
                      {**schema, "strict": False} for schema in tool_schemas() if schema["name"] in {"observe", "stop"}]
     if execution_mode == "navigation_plan":
         return [{"type": "function", "name": name, "description": NAVIGATION_DESCRIPTIONS[name],
-                 "parameters": model.model_json_schema(), "strict": False} for name, model in NAVIGATION_TOOLS.items()] + [
+                 "parameters": model.model_json_schema(), "strict": False} for name, model in NAVIGATION_TOOLS.items() if name != "begin_local_subgoal"] + [
                      {**schema, "strict": False} for schema in tool_schemas() if schema["name"] in {"observe", "stop"}]
     return [{**schema, "strict": False} for schema in tool_schemas()
             if schema["name"] not in ("finish_task", "submit_answer")]
@@ -217,7 +227,13 @@ A text-only response ends supervision and stops motion. Do not reveal private re
 """
 
 
-def controller_instructions(execution_mode):
+def controller_instructions(execution_mode, skill_composer=False):
+    if execution_mode == "luna_continuous":
+        from backend.continuous_supervisor import INSTRUCTIONS as CONTINUOUS_INSTRUCTIONS, SKILL_GUIDANCE
+        return CONTINUOUS_INSTRUCTIONS + ("\n" + SKILL_GUIDANCE if skill_composer else "")
+    if execution_mode == "luna_navigation":
+        from backend.navigation_supervisor import SUPERVISED_NAVIGATION_INSTRUCTIONS
+        return SUPERVISED_NAVIGATION_INSTRUCTIONS
     if execution_mode == "supervised_policy":
         return SUPERVISOR_INSTRUCTIONS
     return INSTRUCTIONS + (NAVIGATION_INSTRUCTIONS if execution_mode == "navigation_plan" else "")
@@ -238,9 +254,12 @@ class FoundryModel:
 
     async def respond(self, profile, reasoning, goal, inputs):
         mode = getattr(self, "execution_mode", "single_step")
+        composer = getattr(self, "skill_composer", False)
         return await self.client.responses.create(
-            model=profile.deployment, instructions=controller_instructions(mode) + "\nUser goal: " + goal,
-            input=inputs, tools=robot_tools(mode), parallel_tool_calls=False,
+            model=profile.deployment, instructions=controller_instructions(mode, composer) + "\nUser goal: " + goal,
+            input=inputs, tools=robot_tools(mode, composer), parallel_tool_calls=False,
+                **({"tool_choice": {"type": "function", "name": "guide_continuous" if mode == "luna_continuous" else "guide_navigation"}}
+                    if mode in {"luna_navigation", "luna_continuous"} else {}),
             reasoning={"effort": reasoning}, include=["reasoning.encrypted_content"],
             max_output_tokens=4096, store=False)
 
@@ -355,6 +374,7 @@ class ConfiguredModel:
             self.adapter.execution_mode = getattr(self, "execution_mode", "single_step")
             self.adapter.context_tokens = getattr(self, "context_tokens", 4096)
             self.adapter.images_per_request = getattr(self, "images_per_request", 1)
+            self.adapter.skill_composer = getattr(self, "skill_composer", False)
         return await self.adapter.respond(profile, reasoning, goal, inputs)
 
     async def close(self):
@@ -371,12 +391,30 @@ class AgentStart(FeedbackRate):
     episode_epoch: int = Field(ge=0)
     model_id: str = Field(default="luna", min_length=1, max_length=80)
     reasoning: Literal["none", "low", "medium", "high"] = "low"
-    execution_mode: Literal["single_step", "navigation_plan", "supervised_policy"] = "single_step"
+    execution_mode: Literal["single_step", "navigation_plan", "supervised_policy", "local_navigation", "luna_navigation", "luna_continuous"] = "single_step"
+    navigation_backend: Literal["builtin", "nav2"] = "builtin"
+    compact_arms: bool = True
+    continuous_handoff: bool = False
+    skill_composer: bool = False
+    adaptive_navigation: bool = True
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     images_per_request: int = Field(default=1, ge=1, le=8)
     context_tokens: int = Field(default=4096, ge=0, le=32768)
     goal: str = Field(min_length=1, max_length=2000)
     max_turns: int = Field(default=30, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def navigation_backend_contract(self):
+        if self.navigation_backend == "nav2" and (self.execution_mode != "luna_continuous" or self.skill_composer or self.continuous_handoff):
+            raise ValueError("Nav2 requires continuous goal control without built-in composer or moving handoff")
+        return self
+
+    @field_validator("skill_composer")
+    @classmethod
+    def continuous_skills_only(cls, value, info):
+        if value and info.data.get("execution_mode") != "luna_continuous":
+            raise ValueError("Motion skills require observed continuous control")
+        return value
 
     @field_validator("goal")
     @classmethod
@@ -384,6 +422,25 @@ class AgentStart(FeedbackRate):
         if not value.strip():
             raise ValueError("A robot goal is required")
         return value.strip()
+
+
+class RunInstruction(StrictModel):
+    run_id: str = Field(min_length=1, max_length=80)
+    episode_epoch: int = Field(ge=0)
+    session_id: str = Field(min_length=1, max_length=80)
+    message: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("message")
+    @classmethod
+    def nonempty_message(cls, value):
+        if not value.strip():
+            raise ValueError("An instruction is required")
+        return value.strip()
+
+
+class NavigationEvaluationBudget(StrictModel):
+    max_turns: int | None = Field(default=None, ge=1, le=1000)
+    timeout_s: float = Field(gt=0, le=3600)
 
 
 class InteractionMode(StrictModel):
@@ -409,15 +466,28 @@ class AgentController:
     idle_delay_s = 5
     camera_poll_s = .5
 
-    def __init__(self, config=None, model_factory=ConfiguredModel, request_timeout_s=45, policy_factory=LocalPolicyClient):
+    def __init__(self, config=None, model_factory=ConfiguredModel, request_timeout_s=45, policy_factory=LocalPolicyClient,
+                 local_navigation_factory=LocalNavigationClient, evaluation_budget: NavigationEvaluationBudget | None = None):
         self.config = config or FoundryConfig()
         self.model_factory = model_factory
         self.request_timeout_s = request_timeout_s
         self.policy_factory = policy_factory
+        self.local_navigation_factory = local_navigation_factory
+        self.evaluation_budget = evaluation_budget
+        self.record_sessions = False
+        self.recording_active = False
+        self.recording_finished = asyncio.Event()
+        self.recording_finished.set()
+        self.recording_evidence = "unknown"
+        self.local_started = None
         self.task = None
         self.worker = None
         self.active = False
         self.cancelled = False
+        self.interruption_revision = 0
+        self.run_messages = []
+        from backend.navigation_memory import NavigationMemory
+        self.navigation_memory = NavigationMemory()
         self.rate_changed = asyncio.Event()
         self.trace_records = OrderedDict()
         self.trace_images = {}
@@ -435,6 +505,7 @@ class AgentController:
         default_profile = next(profile for profile in self.config.models if profile.id == self.config.public()["default_model_id"])
         self.state = {"phase": "idle", "mode": "llm", "session_id": None, "model_id": self.config.public()["default_model_id"],
                       "execution_mode": "single_step",
+                      "local_model": None,
                       "policy": PolicyConfig().model_dump(),
                       "images_per_request": 1, "context_tokens": 4096,
                       "context_usage": None,
@@ -446,8 +517,13 @@ class AgentController:
                       "auto_wake": False, "idle_reason": None, "idle_since": None, "camera_unchanged_s": 0, "wake_reason": None, "outcome": None}
 
     def public(self):
-        return {**self.state, "active": self.active, "configuration": self.config.public(),
-                "trace_revision": self.trace_revision}
+        state = {**self.state, "active": self.active or self.recording_active, "configuration": self.config.public(),
+                 "run_messages": list(self.run_messages),
+                 "run_memory": self.navigation_memory.summary(),
+                 "trace_revision": self.trace_revision}
+        if self.active and state.get("local_model") and self.local_started is not None:
+            state["local_model"] = {**state["local_model"], "elapsed_s": round(time.monotonic() - self.local_started)}
+        return state
 
     def _set_outcome(self, kind, message, source="controller"):
         self.state["outcome"] = {"kind": kind, "message": message[:2000], "source": source, "timestamp": time.time()}
@@ -475,12 +551,54 @@ class AgentController:
                 "capacity": self.trace_capacity,
                 "events": [entry for identifier, entry in self.trace_records.items() if identifier > after]}
 
+    def turn_limit(self, settings):
+        return self.evaluation_budget.max_turns if self.evaluation_budget else settings.max_turns
+
+    def turn_indices(self, settings, start=0):
+        from itertools import count
+        limit = self.turn_limit(settings)
+        return count(start) if limit is None else range(start, limit)
+
+    def local_request_limit(self, settings):
+        limit = self.turn_limit(settings)
+        return None if limit is None else limit * (8 if settings.execution_mode == "luna_navigation" else 1)
+
     def start(self, worker, settings: AgentStart):
+        if self.evaluation_budget and (isinstance(settings, ChatStart) or settings.execution_mode not in {
+                "luna_navigation", "luna_continuous", "single_step", "navigation_plan"}):
+            raise ValueError("Evaluation budgets support isolated navigation goal runs only")
+        if settings.execution_mode in {"local_navigation", "luna_navigation"}:
+            if isinstance(settings, ChatStart):
+                raise ValueError("Local navigation uses the Robot goal. Use Start LLM control, not chat.")
+            self.local_navigation_factory.check_available()
+            if settings.execution_mode == "luna_navigation":
+                profile = next((entry for entry in self.config.models if entry.id == "luna" and entry.provider == "foundry"), None)
+                if not profile or not self.config.configured(profile):
+                    raise ValueError("Configure Luna before starting supervised SmolVLA navigation")
+                if settings.reasoning not in profile.reasoning_efforts:
+                    raise ValueError("Luna does not support the selected reasoning effort")
+                settings = settings.model_copy(update={"model_id": "luna", "max_turns": min(80, settings.max_turns)})
+            else:
+                settings = settings.model_copy(update={"model_id": "local_navigation", "reasoning": "none", "max_turns": min(40, settings.max_turns)})
+                profile = SimpleNamespace(label="Local SmolVLA navigation", deployment=CHECKPOINT.parent.name, provider="local")
+            self._begin_session(worker, settings, profile,
+                controller_instructions(settings.execution_mode) if settings.execution_mode == "luna_navigation" else settings.goal, "llm")
+            self.local_started = time.monotonic()
+            self.state["local_model"] = {"run_id": self.state["session_id"], "checkpoint": CHECKPOINT.parent.name,
+                "challenge_id": worker.challenge.id if worker.challenge else "bench",
+                "challenge_title": worker.challenge.title if worker.challenge else "Practice bench",
+                "phase": "warming" if getattr(self.local_navigation_factory, "phase", None) == "ready" else "loading",
+                "requests_completed": 0, "request_limit": self.local_request_limit(settings),
+                "elapsed_s": 0, "success": None}
+            self.task = asyncio.create_task(self._run(worker, settings, profile, worker.stop_revision))
+            return
         profile = next((entry for entry in self.config.models if entry.id == settings.model_id), None)
         if not profile or not self.config.configured(profile):
             raise ValueError("Configure the selected provider endpoint and model before starting")
         if settings.reasoning not in profile.reasoning_efforts:
             raise ValueError("This model profile does not support the selected reasoning effort")
+        if settings.execution_mode == "luna_continuous" and (profile.id != "luna" or profile.provider != "foundry" or isinstance(settings, ChatStart)):
+            raise ValueError("Continuous goal control requires the configured Luna profile and a Robot goal")
         if settings.execution_mode == "supervised_policy" and profile.provider != "foundry":
             raise ValueError("Select a cloud supervisor profile for SmolVLA mode")
         chat = isinstance(settings, ChatStart)
@@ -490,7 +608,7 @@ class AgentController:
             raise RuntimeError("Chat conversation changed. Start a new message in the current episode.")
         messages = self.state["chat_messages"] if continuing else []
         cameras = list(self.camera_history) if continuing else []
-        self._begin_session(worker, settings, profile, controller_instructions(settings.execution_mode), "chat" if chat else "llm")
+        self._begin_session(worker, settings, profile, controller_instructions(settings.execution_mode, settings.skill_composer), "chat" if chat else "llm")
         self.camera_history.extend(cameras)
         if not continuing:
             self.chat_history.clear()
@@ -500,11 +618,18 @@ class AgentController:
         self.task = asyncio.create_task(self._run(worker, settings, profile, worker.stop_revision))
 
     def _begin_session(self, worker, settings, profile, instructions, mode):
-        if self.active or worker.latest.get("busy"):
+        if settings.navigation_backend == "nav2" and not worker.nav2_status()["ready"]:
+            raise ValueError(worker.nav2_status()["message"])
+        if self.active or self.recording_active or worker.latest.get("busy"):
             raise RuntimeError("The robot already has an active controller or command")
         if (settings.run_id != worker.latest["run_id"] or
                 settings.episode_epoch != worker.latest["episode_epoch"]):
             raise RuntimeError("Episode changed; refresh before starting LLM control")
+        if self.worker is not worker:
+            self.run_messages = []
+        self.navigation_memory.bind(settings.run_id, settings.episode_epoch)
+        if not self.navigation_memory.instructions or self.navigation_memory.instructions[-1] != settings.goal:
+            self.navigation_memory.instructions.append(settings.goal)
         self.worker = worker
         self._cancel_idle()
         self.cancelled = False
@@ -516,8 +641,11 @@ class AgentController:
         self.memory_frame_seq = None
         self.camera_history.clear()
         self.last_sent = None
-        self.session_deadline = time.monotonic() + 600
+        timeout_s = self.evaluation_budget.timeout_s if self.evaluation_budget else (1200 if settings.execution_mode in {"luna_navigation", "luna_continuous"} else 600)
+        self.session_deadline = time.monotonic() + timeout_s
         self.state = {**self.state, **settings.model_dump(), "session_id": str(uuid4()), "mode": mode,
+                      "max_turns": self.turn_limit(settings),
+                      "local_model": None,
                       "phase": "starting", "turns": 0, "last_feedback_at": None, "next_feedback_at": None,
                       "context_usage": None,
                       "observed_interval_s": None, "inference_latency_s": None,
@@ -529,10 +657,13 @@ class AgentController:
         self.trace_revision = 0
         self._trace("session", "Control session started", {
             "model": profile.label, "deployment": profile.deployment, "provider": profile.provider, "reasoning": settings.reasoning,
-            "goal": settings.goal, "instructions": instructions, "tools": robot_tools(settings.execution_mode),
+            "goal": settings.goal, "instructions": instructions, "tools": robot_tools(settings.execution_mode, settings.skill_composer),
+            "skill_composer": settings.skill_composer,
+            "navigation_backend": settings.navigation_backend,
             "execution_mode": settings.execution_mode,
             "images_per_request": settings.images_per_request, "context_tokens": settings.context_tokens,
-            "feedback_interval_s": settings.feedback_interval_s, "max_turns": settings.max_turns})
+            "feedback_interval_s": settings.feedback_interval_s, "max_turns": self.turn_limit(settings),
+            "evaluation_budget": self.evaluation_budget.model_dump() if self.evaluation_budget else None})
 
     def _cancel_idle(self):
         task, self.idle_task = self.idle_task, None
@@ -593,10 +724,64 @@ class AgentController:
             self._trace("session", "Feedback interval updated", settings.model_dump())
         self.rate_changed.set()
 
+    def navigation_reply(self, text, source="model"):
+        self.run_messages = [*self.run_messages[-39:], {"id": str(uuid4()), "role": "assistant", "source": source,
+            "text": text[:2000], "status": "reported", "timestamp": time.time()}]
+
+    async def redirect(self, worker, instruction: RunInstruction):
+        if (not self.active or worker is not self.worker or self.state["execution_mode"] not in {"luna_navigation", "luna_continuous"}
+                or instruction.run_id != worker.latest["run_id"] or instruction.episode_epoch != worker.epoch
+                or instruction.session_id != self.state["session_id"]):
+            raise RuntimeError("Instruction belongs to an inactive or changed navigation run")
+        remaining_turns = self.state["max_turns"] - self.state["turns"] if self.state["max_turns"] is not None else 80
+        deadline = self.session_deadline
+        stop_instruction = instruction.message.lower().strip(".!") in {"stop", "pause", "halt", "cancel"}
+        if not stop_instruction and (remaining_turns <= 0 or time.monotonic() >= deadline):
+            raise RuntimeError("Run budget exhausted; start a new run")
+        settings = AgentStart.model_validate({name: self.state[name] for name in AgentStart.model_fields if name in self.state})
+        settings = settings.model_copy(update={"goal": instruction.message, "max_turns": min(remaining_turns, 200)})
+        revision = self.interruption_revision + 1
+        self.run_messages = [*self.run_messages[-38:], {"id": str(uuid4()), "role": "user", "text": instruction.message,
+            "timestamp": time.time(), "status": "pending"}]
+        await self.halt("New operator instruction")
+        if (self.interruption_revision != revision or worker.closed or instruction.run_id != worker.latest["run_id"]
+                or (not stop_instruction and time.monotonic() >= deadline)):
+            self.run_messages[-1] = {**self.run_messages[-1], "status": "cancelled"}
+            raise RuntimeError("Instruction cancelled by Stop, episode change or run deadline")
+        input_tokens, output_tokens = self.state["input_tokens"], self.state["output_tokens"]
+        observation, _ = await worker.feedback()
+        if self.navigation_memory.last_observation is not None:
+            self.navigation_memory.remember(self.navigation_memory.last_observation, observation,
+                {"action": "operator_redirect"}, {"status": "cancelled", "reason": "Prior instruction interrupted by the operator"})
+        if self.interruption_revision != revision or (not stop_instruction and time.monotonic() >= deadline):
+            self.run_messages[-1] = {**self.run_messages[-1], "status": "cancelled"}
+            raise RuntimeError("Instruction cancelled before controller restart")
+        if stop_instruction:
+            self.run_messages[-1] = {**self.run_messages[-1], "status": "applied"}
+            self.run_messages.append({"id": str(uuid4()), "role": "assistant", "text": "Motion stopped.", "status": "applied", "timestamp": time.time()})
+            return self.public()
+        try:
+            self.start(worker, settings)
+        except (ValueError, RuntimeError):
+            self.run_messages[-1] = {**self.run_messages[-1], "status": "rejected"}
+            raise
+        self.session_deadline = min(self.session_deadline, deadline)
+        self.state["input_tokens"] = input_tokens
+        self.state["output_tokens"] = output_tokens
+        self.run_messages[-1] = {**self.run_messages[-1], "status": "applied"}
+        self.run_messages.append({"id": str(uuid4()), "role": "assistant", "text": "Instruction applied. Replanning from the current position.",
+            "timestamp": time.time(), "status": "applied"})
+        self._trace("session", "Operator instruction applied", {"message": instruction.message})
+        return self.public()
+
     def interrupt(self, reason="Stopped by operator"):
+        self.interruption_revision += 1
         self._cancel_idle()
         was_cancelled = self.cancelled
         self.cancelled = True
+        if self.active and self.state.get("local_model"):
+            self.state["local_model"].update(phase="interrupted", success=False,
+                elapsed_s=round(time.monotonic() - self.local_started))
         self.state.update(phase="stopped", message=reason, next_feedback_at=None)
         if not was_cancelled:
             self._set_outcome("interrupted", reason)
@@ -617,7 +802,7 @@ class AgentController:
             with suppress(asyncio.CancelledError):
                 await self.task
         if self.worker and not self.worker.closed:
-            await self.worker.call(lambda sim: sim.hold_current())
+            await self.worker.hold_stopped()
         self.active = False
 
     def _check_live(self, worker, settings):
@@ -625,12 +810,14 @@ class AgentController:
         if getattr(settings, "execution_mode", "single_step") == "supervised_policy" and skill and skill["status"] == "failed":
             raise ValueError(skill["reason"])
         navigation = worker.latest.get("navigation")
-        if getattr(settings, "execution_mode", "single_step") == "navigation_plan" and navigation and navigation["status"] == "failed":
+        if getattr(settings, "execution_mode", "single_step") in {"navigation_plan", "local_navigation", "luna_navigation", "luna_continuous"} and navigation and navigation["status"] == "failed":
             raise ValueError(navigation["reason"])
         if (self.cancelled or worker.closed or worker.latest["stopped"] or
                 worker.latest["run_id"] != settings.run_id or
                 worker.latest["episode_epoch"] != settings.episode_epoch):
             raise asyncio.CancelledError
+        if self.evaluation_budget and time.monotonic() >= self.session_deadline:
+            raise TimeoutError("Evaluation deadline reached")
 
     async def _wait_for_feedback(self, last_sent):
         if last_sent is None:
@@ -699,18 +886,152 @@ class AgentController:
             with suppress(asyncio.CancelledError):
                 await pending
 
+    async def _run_local_navigation(self, worker, settings, model, stop_revision):
+        if not await worker.resume_manual(expected_stop_revision=stop_revision):
+            raise asyncio.CancelledError
+        await model.start()
+        self._check_live(worker, settings)
+        self.state["local_model"]["phase"] = "warming"
+        dimensions = await worker.call(lambda sim: (sim.width, sim.height))
+        try:
+            await worker.call(lambda sim: (setattr(sim, "width", 320), setattr(sim, "height", 240)))
+            observation, image = await worker.feedback()
+            await model.predict(observation, image)
+            self._check_live(worker, settings)
+            await worker.begin_navigation(stop_revision)
+
+            async def command(tool, arguments):
+                self._check_live(worker, settings)
+                current, _ = await worker.feedback()
+                result = await worker.execute_navigation(Command(run_id=settings.run_id, episode_epoch=settings.episode_epoch,
+                    observation_seq=current.seq, action_id=str(uuid4()), tool=tool,
+                    arguments={"expected_revision": current.navigation.revision, **arguments}))
+                if result.status != "ok":
+                    raise ValueError(result.message)
+                return result
+
+            async def drain():
+                async with asyncio.timeout(5):
+                    while worker.latest["navigation"]["remaining_s"] > 0:
+                        self._check_live(worker, settings)
+                        await asyncio.sleep(.02)
+                self._check_live(worker, settings)
+
+            await command("set_navigation_plan", {"steps": [{"skill": skill, "goal": f"Local navigation: {skill}"}
+                for skill in ("inspect_room", "locate_doorway", "approach", "cross")]})
+            self.state.update(phase="acting", message="Scripted head scans preparing local navigation")
+            for scan in range(2):
+                await command("replace_motion_buffer", {"segments": [
+                    {"kind": "head", "yaw_rad": yaw, "pitch_rad": .45, "duration_s": .6} for yaw in (-.5, .5, 0)]})
+                await drain()
+                await command("complete_navigation_skill", {"evidence": "Scripted preparation scan; no learned semantic claim"})
+            self.state["local_model"]["phase"] = "running"
+            stop_votes = 0
+            last_sent = None
+            for index in range(settings.max_turns):
+                await self._wait_for_feedback(last_sent)
+                self._check_live(worker, settings)
+                observation, image = await worker.feedback()
+                self.state.update(phase="thinking", turns=index + 1, last_feedback_at=time.time(), next_feedback_at=None)
+                last_sent = time.monotonic()
+                self._trace("policy", "Local navigation input", {"observation": observation.model_dump(), "instruction": settings.goal}, image=image)
+                reply = await model.predict(observation, image)
+                self._check_live(worker, settings)
+                if not 0 <= time.time() - observation.wall_timestamp <= 2:
+                    raise ValueError("Local navigation feedback became stale; robot stopped.")
+                from scripts.navigation_policy import bounded_velocity
+                action, saturated = bounded_velocity(reply["action"])
+                self.state["inference_latency_s"] = time.monotonic() - last_sent
+                stopped = abs(action[0]) < .025 and abs(action[1]) < .05
+                stop_votes = stop_votes + 1 if stopped else 0
+                execution = [0., 0.] if stopped else action
+                self.state["phase"] = "acting"
+                result = await worker.execute_navigation(Command(run_id=settings.run_id, episode_epoch=settings.episode_epoch,
+                    observation_seq=observation.seq, action_id=str(uuid4()), tool="replace_motion_buffer",
+                    arguments={"expected_revision": observation.navigation.revision, "segments": [
+                        {"kind": "drive", "linear_mps": execution[0], "angular_radps": execution[1], "duration_s": 1.}]}))
+                if result.status != "ok":
+                    raise ValueError(result.message)
+                await drain()
+                self.state["local_model"]["requests_completed"] = index + 1
+                self._trace("policy", "Local navigation velocity", {"raw_action": reply.get("raw_action", reply["action"]),
+                    "executed_action": execution, "saturated_axes": reply.get("saturated_axes", saturated), "stop_votes": stop_votes})
+                if stop_votes >= 2:
+                    challenge = worker.latest.get("challenge")
+                    success = bool(challenge and challenge["status"] == "completed" and not worker.latest["proximity"]["collisions"])
+                    message = "Selected challenge completed" if success else "Local model stopped; goal completion not verified"
+                    self.state.update(phase="completed", message=message)
+                    self.state["local_model"].update(phase="completed", success=success)
+                    self._set_outcome("completed" if success else "ended", message, "physics" if success else "controller")
+                    return
+            self.state.update(phase="completed", message="Local navigation request limit reached")
+            self.state["local_model"].update(phase="completed", success=False)
+            self._set_outcome("limited", self.state["message"])
+        finally:
+            worker.stop()
+            if not worker.closed:
+                await worker.call(lambda sim: (setattr(sim, "width", dimensions[0]), setattr(sim, "height", dimensions[1])))
+
     async def _run(self, worker, settings, profile, stop_revision):
+        if not self.record_sessions or worker.recorder is not None:
+            return await self._run_controller(worker, settings, profile, stop_revision)
+        from backend.session_recording import run_recorded_session
+        self.recording_active = True
+        self.recording_finished.clear()
+        try:
+            await run_recorded_session(self, worker, settings, profile, stop_revision)
+        except asyncio.CancelledError:
+            worker.stop()
+            self.active = False
+        except Exception as error:
+            worker.stop()
+            self.active = False
+            self.state.update(phase="error", error=f"Recording failed ({type(error).__name__})")
+            self._set_outcome("error", self.state["error"])
+        finally:
+            self.recording_active = False
+            self.recording_finished.set()
+
+    async def _run_controller(self, worker, settings, profile, stop_revision):
         model = None
         policy_runner = None
+        navigation_supervisor = None
+        session_timeout = None
         pending_command = None
         pending_call_id = None
         idle_reason = None
         try:
             self.state["outcome"] = None
+            if settings.execution_mode in {"local_navigation", "luna_navigation"}:
+                model = self.local_navigation_factory()
+                model.instruction = settings.goal
+                async with asyncio.timeout(max(0, self.session_deadline - time.monotonic())) as session_timeout:
+                    if settings.execution_mode == "luna_navigation":
+                        from backend.navigation_supervisor import run_supervised_navigation
+                        navigation_supervisor = self.model_factory(self.config)
+                        navigation_supervisor.execution_mode = "luna_navigation"
+                        await run_supervised_navigation(self, worker, settings, model, navigation_supervisor, profile, stop_revision)
+                    else:
+                        await self._run_local_navigation(worker, settings, model, stop_revision)
+                return
             model = self.model_factory(self.config)
             model.execution_mode = settings.execution_mode
             model.context_tokens = settings.context_tokens
             model.images_per_request = settings.images_per_request
+            model.skill_composer = settings.skill_composer
+            if settings.execution_mode == "luna_continuous":
+                from backend.continuous_supervisor import run
+                dimensions = await worker.call(lambda sim: (sim.width, sim.height))
+                try:
+                    await worker.call(lambda sim: (setattr(sim, "width", 320), setattr(sim, "height", 240)))
+                    async with asyncio.timeout(max(0, self.session_deadline - time.monotonic())) as session_timeout:
+                        await run(self, worker, settings, model, profile, stop_revision)
+                finally:
+                    worker.stop()
+                    if not worker.closed:
+                        await worker.hold_stopped()
+                        await worker.call(lambda sim: (setattr(sim, "width", dimensions[0]), setattr(sim, "height", dimensions[1])))
+                return
             if not await worker.resume_manual(expected_stop_revision=stop_revision):
                 raise asyncio.CancelledError
             await worker.begin_navigation(stop_revision, enabled=settings.execution_mode == "navigation_plan")
@@ -723,8 +1044,8 @@ class AgentController:
             memory_frame_seq = self.memory_frame_seq
             seen_calls = self.seen_text_calls
             last_sent = self.last_sent
-            async with asyncio.timeout(max(0, self.session_deadline - time.monotonic())):
-                for turn in range(self.state["turns"], settings.max_turns):
+            async with asyncio.timeout(max(0, self.session_deadline - time.monotonic())) as session_timeout:
+                for turn in self.turn_indices(settings, self.state["turns"]):
                     await self._wait_for_feedback(last_sent)
                     if settings.execution_mode == "navigation_plan":
                         await self._wait_for_buffer(worker, settings)
@@ -946,7 +1267,13 @@ class AgentController:
         except asyncio.CancelledError:
             self.state.update(phase="stopped", message="Control interrupted")
         except TimeoutError:
-            self.state.update(phase="error", error="Inference or session timed out; robot stopped")
+            if self.evaluation_budget and ((session_timeout and session_timeout.expired()) or time.monotonic() >= self.session_deadline):
+                self.state.update(phase="completed", error=None, message="Evaluation time budget exhausted; robot stopped")
+                if self.state.get("local_model"):
+                    self.state["local_model"].update(phase="completed", success=False)
+                self._set_outcome("limited", self.state["message"])
+            else:
+                self.state.update(phase="error", error="Inference or session timed out; robot stopped")
         except APIStatusError as error:
             self.state.update(phase="error", error=f"Foundry HTTP {error.status_code}. Check deployment, access, quota, and model capabilities.")
         except APIConnectionError:
@@ -956,6 +1283,10 @@ class AgentController:
         except Exception:
             self.state.update(phase="error", error="LLM control failed. Check the selected provider and model configuration.")
         finally:
+            if self.state.get("local_model"):
+                self.state["local_model"]["elapsed_s"] = round(time.monotonic() - self.local_started)
+                if self.state["phase"] in {"error", "stopped"}:
+                    self.state["local_model"].update(phase="failed" if self.state["phase"] == "error" else "interrupted", success=False)
             if self.state["phase"] == "error":
                 self._set_outcome("error", self.state["error"])
             elif self.state["phase"] == "stopped" and self.state["outcome"] is None:
@@ -968,7 +1299,7 @@ class AgentController:
                     if not worker.closed:
                         await worker.end_skill_mode()
                 if not worker.closed:
-                    await worker.call(lambda sim: sim.hold_current())
+                    await worker.hold_stopped()
                 if pending_command is not None:
                     interrupted_result = worker.latest.get("result")
                     if interrupted_result and interrupted_result.get("action_id") == pending_command.action_id:
@@ -978,6 +1309,8 @@ class AgentController:
                 try:
                     if model:
                         await model.close()
+                    if navigation_supervisor:
+                        await navigation_supervisor.close()
                 finally:
                     self.active = False
                     self.state["next_feedback_at"] = None
@@ -985,6 +1318,7 @@ class AgentController:
                         "status": self.state["phase"], "message": self.state["error"] or self.state["message"]})
                     if idle_reason and not self.cancelled and settings.execution_mode == "single_step":
                         async def wake():
+                            await self.recording_finished.wait()
                             if self.cancelled or worker.closed or worker.stop_revision != stop_revision:
                                 return
                             self.active = True

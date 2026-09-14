@@ -16,6 +16,22 @@ function Payload({ title, value }: { title: string; value: unknown }) {
   return <details className="exchange-payload"><summary>{title}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>;
 }
 
+function DecisionSummary({ arguments: arguments_ }: { arguments: string }) {
+  let decision: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(arguments_);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    decision = parsed as Record<string, unknown>;
+  } catch { return null; }
+  const reason = typeof decision.reason === 'string' ? decision.reason : null;
+  const action = typeof decision.action === 'string' ? decision.action : typeof decision.intent === 'string' ? decision.intent : null;
+  if (!reason) return null;
+  return <div className="decision-summary">
+    <strong>{action ? action.replaceAll('_', ' ') : 'Proposed decision'}</strong>
+    <span>Reported reason</span><p>{reason}</p>
+  </div>;
+}
+
 function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
   if (entry.kind === 'policy') {
     return <>
@@ -46,9 +62,13 @@ function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
       {!!entry.image_urls && entry.image_urls.length > 1 && <div className="exchange-camera-batch" aria-label="Historical camera frames">
         {entry.image_urls.slice(1).map((url, index) => {
           const frame = entry.payload.camera_frames?.[index + 1];
-          return <figure key={url}><a href={url} target="_blank" rel="noreferrer" title={`Open historical camera frame ${frame?.seq ?? index + 1}`}>
-            <img src={url} alt={`Historical input camera, frame ${frame?.seq ?? index + 1}`} width={128} height={96} loading="lazy" />
-          </a><figcaption>Frame {frame?.seq ?? index + 1} / {frame?.simulated_time_s.toFixed(2) ?? '-'} s</figcaption></figure>;
+          const historyCount = entry.payload.camera_history?.frames.length ?? 0;
+          const sheet = historyCount > 0 && index === 0;
+          const original = index === (historyCount > 0 ? 1 : 0) ? entry.payload.historical_original : null;
+          const label = sheet ? `Motion history / ${historyCount} views` : original ? `Historical original ${original.frame_id}` : `Historical input camera, frame ${frame?.seq ?? index + 1}`;
+          return <figure key={url}><a href={url} target="_blank" rel="noreferrer" title={`Open ${label}`}>
+            <img src={url} alt={label} width={128} height={sheet ? 128 : 96} style={sheet ? {aspectRatio:'1'} : undefined} loading="lazy" />
+          </a><figcaption>{sheet ? label : original ? `Original / ${original.simulated_time_s.toFixed(2)} s` : `Frame ${frame?.seq ?? index + 1} / ${frame?.simulated_time_s.toFixed(2) ?? '-'} s`}</figcaption></figure>;
         })}
       </div>}
       <div className="exchange-meta"><span>{entry.payload.context_mode === 'realtime_conversation' ? 'Realtime conversation' : `Replayed turns: ${entry.payload.history_turns.join(', ') || 'None'}`}</span><span>{entry.payload.images_in_request} image(s) in request</span></div>
@@ -67,6 +87,7 @@ function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
     const output = entry.payload;
     return <>
       {output.text && <p className="exchange-text">{output.text}</p>}
+      {output.calls.map(call => <DecisionSummary key={call.call_id} arguments={call.arguments} />)}
       {output.refusals.map((refusal, index) => <p className="exchange-text bad" key={index}>{refusal}</p>)}
       <div className="exchange-meta"><span>{output.status}</span><span>{output.latency_s.toFixed(2)} s inference</span><span>{output.input_tokens ?? '-'} in / {output.output_tokens ?? '-'} out tokens</span>{output.text_truncated && <span>Text truncated</span>}</div>
       {output.calls.length > 0 && <Payload title={`Tool calls (${output.calls.length}${output.calls_truncated ? '+' : ''})`} value={output.calls} />}
@@ -100,7 +121,7 @@ function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
   </>;
 }
 
-export function ExchangeFeed({ agent }: { agent: AgentState }) {
+export function ExchangeFeed({ agent, visible = true }: { agent: AgentState; visible?: boolean }) {
   const [feed, setFeed] = useState<FeedData>({ session_id: null, revision: 0, first_id: 1, capacity: 200, events: [] });
   const [filter, setFilter] = useState<typeof filters[number]>('All');
   const [follow, setFollow] = useState(true);
@@ -151,8 +172,8 @@ export function ExchangeFeed({ agent }: { agent: AgentState }) {
     (filter === 'Policy' && entry.kind === 'policy') ||
     (filter === 'Session' && entry.kind === 'session'));
   useLayoutEffect(() => {
-    if (follow && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
-  }, [feed.revision, follow, filter]);
+    if (visible && follow && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
+  }, [feed.revision, follow, filter, visible]);
 
   async function copyFeed() {
     const sessionId = agent.session_id;
@@ -177,7 +198,7 @@ export function ExchangeFeed({ agent }: { agent: AgentState }) {
   }
 
   return <section className="exchange-section" aria-label="Exchange feed">
-    <div className="panel-header"><h3><Radio size={16} /> Exchange feed</h3><span className="exchange-count">{entries.length} events{feed.first_id > 1 && ` / latest ${feed.capacity}`}</span></div>
+    <div className="panel-header"><h3><Radio size={16} /> Inputs, decisions & actions</h3><span className="exchange-count">{entries.length} events{feed.first_id > 1 && ` / latest ${feed.capacity}`}</span></div>
     <div className="exchange-toolbar">
       <div className="exchange-filters" role="group" aria-label="Exchange filter"><ListFilter size={14} />{filters.map(option => <button key={option} type="button" aria-pressed={filter === option} onClick={() => setFilter(option)}>{option}</button>)}</div>
       <div className="exchange-actions"><button type="button" className="icon-button" aria-label="Copy exchange feed"
@@ -188,11 +209,13 @@ export function ExchangeFeed({ agent }: { agent: AgentState }) {
     {copyMessage && <p role="status" className="exchange-meta">{copyMessage}</p>}
     {error && <div className="exchange-error" role="alert"><span>{error}</span><button type="button" className="icon-button" title="Retry loading exchanges" aria-label="Retry loading exchanges" onClick={() => setRetry(value => value + 1)}><RefreshCw size={16} /></button></div>}
     <div className="exchange-feed" role="log" aria-label="Robot and LLM exchanges" aria-live="off" ref={viewport} tabIndex={0} onScroll={() => {
+      if (!visible) return;
       const element = viewport.current!;
       if (follow && element.scrollHeight - element.scrollTop - element.clientHeight > 64) setFollow(false);
     }}>
       {shown.length ? shown.map(entry => {
-        const channel = channels[entry.kind];
+        const channel = entry.title === 'Luna navigation decision'
+          ? { icon: Bot, from: 'Luna', to: 'SmolVLA' } : channels[entry.kind];
         const Icon = channel.icon;
         return <article className={`exchange-entry exchange-${entry.kind}`} key={`${feed.session_id}:${entry.id}`} data-kind={entry.kind} data-turn={entry.turn}>
           <div className="exchange-icon"><Icon size={16} /></div>

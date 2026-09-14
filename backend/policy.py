@@ -321,7 +321,7 @@ class LocalPolicyClient:
             return PolicyMetadata.model_validate(response.json())
         except httpx.RequestError as error:
             raise PolicyConnectionError("unavailable",
-                "The SmolVLA left-arm server is offline or unreachable. This mode requires a milo-left-arm-v1 pick/place checkpoint, not a navigation checkpoint. Fine-tuned navigation checkpoints are currently CLI-only. Single step and Navigation plan use the selected LLM and do not require this server.") from error
+                "The SmolVLA left-arm server is offline or unreachable. This mode requires a milo-left-arm-v1 pick/place checkpoint, not a navigation checkpoint. For local driving select Local SmolVLA navigation. Single step and Navigation plan use the selected LLM and do not require this server.") from error
         except (httpx.HTTPStatusError, ValueError) as error:
             raise PolicyConnectionError("incompatible",
                 "This endpoint is not a compatible milo-left-arm-v1 pick/place service. Navigation checkpoints cannot be used in Luna + SmolVLA arm mode.") from error
@@ -351,7 +351,7 @@ async def check_policy_readiness(config, factory=LocalPolicyClient):
         return {"ready": False, "status": error.status, "message": str(error), "metadata": None}
     except (TimeoutError, httpx.RequestError):
         return {"ready": False, "status": "unavailable", "message":
-            "The SmolVLA left-arm server did not respond. This mode requires a milo-left-arm-v1 pick/place service; fine-tuned navigation checkpoints are currently CLI-only.", "metadata": None}
+            "The SmolVLA left-arm server did not respond. For local driving select Local SmolVLA navigation; this endpoint is for a milo-left-arm-v1 pick/place service.", "metadata": None}
     except ValueError:
         return {"ready": False, "status": "incompatible", "message": "Policy metadata is incompatible with Milo.", "metadata": None}
     finally:

@@ -1,8 +1,104 @@
 # Luna + SmolVLA
 
-The application now has an opt-in `supervised_policy` execution mode. The existing cloud Responses model supervises a local SmolVLA policy through a deterministic task manager. Single-step, navigation and voice modes retain their existing behavior.
+The operator UI offers `luna_navigation` (Luna supervising resident SmolVLA primitives) and `luna_continuous` (Luna selecting observed destinations for conventional local tracking). Continuous is the default; saved selection is retained. Manual controls remain available. Legacy single-step, voice and seven-axis arm controller APIs remain for compatibility/testing but are no longer offered by the main autonomous panel. Historical sections below describe earlier experiments, not the current UI.
 
-**Current status:** Separate native-Windows CUDA navigation and arm fine-tunes exist. A **1,500-total-step navigation candidate with stop-balanced sampling** now succeeds on the previously failed stopping case. On four new evaluation-only offsets, both it and the original 1,000-step checkpoint pass, with fewer commands but more velocity saturation for the new candidate. The original checkpoint remains the default. These are isolated short-range docking tests, not general navigation or live-UI model options. The **1,100-step left-arm checkpoint plus trajectory adapter** produces movement but has not completed pickup. No checkpoint was promoted to production policy serving, and no Ubuntu, WSL, cloud inference or uploads were used.
+**Current status:** The local default is `.runtime/navigation-recovery-6500/checkpoint`, trained for instruction-conditioned forward, backward, left/right turn and hold actions. Real supervised parking has succeeded, but **two distinct challenge completions have not been demonstrated**. Recharge and kitchen/bathroom attempts remain unsuccessful. Model action-learning loss is not a task-success metric. The arm checkpoint is unchanged and has no verified pickup. Training remained native Windows CUDA; evaluation invoked the user's configured Luna deployment and did not provision cloud resources.
+
+## Observed Local-Goal Experiment: 2026-09-13
+
+The isolated docking-v1 runner now accepts `--conditioning task|waypoint`. Waypoint conditioning acquires a goal from the head-camera green marker and updates robot-relative forward/left text using measured wheel odometry. It does not supply hidden target coordinates or substitute conventional velocity outputs. With identical preexisting task-waypoints-12500 weights and seed 716, six fixed cases passed **4/6 with waypoint text versus 0/6 with task-only text**. The same one-second buffers, stop votes, measured rest, full-bay containment and 60-second deadline apply. No retraining, live promotion or learned action sequence was added; the live SmolVLA primitive adapter is unchanged. [Evidence and limitations](VALIDATION.md#adaptive-navigation-and-goal-conditioning-2026-09-13).
+
+```powershell
+./.runtime/env/python.exe -m scripts.audit_architecture --stage docking --source smolvla --checkpoint .runtime/navigation-task-waypoints-12500/checkpoint --conditioning waypoint --seeds 716 --output .runtime/my-waypoint-docking
+```
+
+Use a separate output directory and `--conditioning task` for the matched ablation. Keep the 1500 parking checkpoint as a learned positive control. These small structured docking results do not establish reliable natural-language room navigation.
+
+## Time-Bounded Navigation Tests
+
+The isolated `scripts/evaluate_supervised.py` evaluator now defaults to **1,800 seconds of monotonic wall time with no overall request-count limit**. Set `--time-limit-s` to change the time budget (positive, at most 3,600 seconds). Model preload and scene initialization are measured separately and excluded; controller startup, warm-up, inference, feedback waits and motion are included. Saved reports distinguish termination reason, physics success, completion source and unverified model claims. Shutdown/report collection can add a small amount beyond the budget.
+
+```powershell
+./.runtime/env/python.exe -m scripts.evaluate_supervised --checkpoint .runtime/navigation-recovery-8500/checkpoint --challenges kitchen_bathroom recharge --time-limit-s 1800 --reasoning high --output .runtime/my-timed-evaluation
+```
+
+For staged comparisons, use explicit `--turns 80 --session-limit-s 1200`, then `--turns 120 --session-limit-s 1800`, with fresh output directories. `--turns` accepts 1-1,000 supervision turns and cannot be combined with `--time-limit-s`. A supervision turn can request up to eight local motion steps; reported `model_commands` counts completed local commands, not Luna requests or every attempted prediction. The default time-only mode reports both request limits as null rather than inventing a large count cap.
+
+This is an **evaluation-only** budget supplied internally to `AgentController`, not a new public Start API field. The browser retains its existing 80-turn/20-minute limit and live checkpoint. Local-only waypoint benchmarks and `start.ps1 -NavigationTest` retain their existing separate budgets. Per-request inference timeouts, eight-step subgoal bounds, 60-second skill deadlines, motion leases, velocity/clearance/freshness checks, Stop/takeover/reset/disconnect and serialized inference remain intact. Time-only means success, model termination or a safety fault can still stop before the deadline.
+
+Six real tests used the same recovery-8500 weights and supervisor prompt: 80 turns, 120 turns, then time-only, on kitchen and recharge. All six failed physics completion. Time-only runs passed the old count caps (135 and 138 turns), ending on an unverified completion claim and battery depletion respectively, not on request limits. **No extra fine-tuning was performed in this budget experiment:** the traces need corrected planning/docking examples; increased runtime alone did not establish a training benefit. [Results and qualifications](VALIDATION.md#navigation-budget-expansion-2026-09-12).
+
+## Task-Skill Training: 2026-09-12
+
+Completed **4,000 additional CUDA optimizer updates** from recovery-8500, producing experimental checkpoints at 10,500 and 12,500 total updates. Neither is promoted: the new training reduced imitation loss but did not produce a full-route or autonomous-task improvement in the tests below. The live default and resident process were left unchanged.
+
+`scripts/task_navigation.py` records docking, Kitchen to Bathroom doorway routes, an obstacle detour to the recharge survey zone, and retreat/re-approach routes. Each frame pairs the real head image and 20 measured state values with a short robot-relative waypoint instruction and the demonstrated velocity. Teacher routes use known fixture coordinates offline; the relative waypoint is explicit teacher assistance, not camera-only route discovery. Only paired images, measured state, instruction and actions enter training. No evaluator labels, private scene geometry, task-stage metadata or world poses are input features. The existing live supervisor still sends its five canonical primitive instructions; the new waypoint text is currently used only in the isolated training/benchmark pipeline.
+
+- **Data:** 16 recorded episodes, 997 new frames, all replayed exactly (maximum state error 0.0). Twelve episodes satisfy the full parking/bathroom physical destination scorer; four recharge episodes satisfy only the survey objective, not return-and-recharge. Rejected northern-route clearance and battery-depleted round-trip pilots remain excluded and retained under `.runtime/task-waypoint-pilot-v1` and `-v2`.
+- **Retention:** appended 704 replay-verified primitive frames from `.runtime/recovery-demonstrations-v2`, matched by episode split. Export has 1,701 frames: 1,278 training and 423 held out; loss samples 143 held-out frames. RGB pixels, states, actions and instructions were read back exactly from LeRobot. Train episodes 0-11 and validation 12-15 remain separate. Offsets are nearby variants of the same layouts, not generalization proof.
+- **Training:** batch four, frozen vision/language backbone, 99,880,992 trainable parameters. First 2,000 updates at 1e-5 reduced held-out loss 3.63850 -> 0.60064; next 2,000 at 3e-5 reduced it 0.60064 -> 0.23599. Both saved checkpoints reloaded strictly; each used a new AdamW optimizer state and about 3,321 MiB peak allocated VRAM. Total training wall time was about 23.8 minutes.
+
+| Test | Recovery-8500 | Task-10500 | Task-12500 |
+| --- | --- | --- | --- |
+| Teacher-waypoint routes completed, four evaluation-only offset cases | 0/4 | 0/4 | 0/4 |
+| Individual waypoints completed across those cases | 0 | 0 | 2 |
+| Full Luna-supervised kitchen/recharge tasks, 40 turns each | 0/2 | Not run | 0/2 |
+| Primitive movement signs correct, three samples per command on three scenes | 36/36 | Not run | 36/36 |
+| Hold predictions within existing stop deadband | 6/9 | Not run | 7/9 |
+
+The 10,500-step model reached a physically valid parking position in one assisted trial but did not finish the requested waypoint; a safety stop ended the run. It remains a benchmark failure. The 12,500-step model completed one detour waypoint and one retreat waypoint, then timed out or stopped early. The supervised comparison used the unchanged five-primitive Luna flow, not the new waypoint policy interface. Same settings do not fix cloud sampling variation; one run per task/checkpoint cannot establish a ranking.
+
+**Next training decision:** do not add more updates to this dataset unchanged. Improve goal representation and examples near stopping/turning boundaries, including corrective states visited by the learned policy. Goal vectors supplied as numeric features are a candidate experiment; they are not implemented or validated here. Any later integration must use Luna-selected or observed local goals, never the offline teacher's hidden route.
+
+Artifacts and full qualifications: [validation record](VALIDATION.md#task-skill-training-and-tests-2026-09-12).
+
+```powershell
+./.runtime/env/python.exe -m scripts.task_navigation --output .runtime/new-task-demos
+./.runtime/smolvla-env/Scripts/python.exe -m scripts.task_navigation --stage export --source .runtime/new-task-demos --retain-primitives .runtime/recovery-demonstrations-v2 --output .runtime/datasets/new-task-waypoints
+./.runtime/env/python.exe -m scripts.task_navigation --stage evaluate --checkpoint .runtime/navigation-task-waypoints-12500/checkpoint --cases 16 17 18 19 --output .runtime/new-task-skill-evaluation
+```
+
+Use fresh output directories. Cases 16-19 are evaluation-only and rejected by recording. This benchmark explicitly supplies teacher waypoints, advances only through learned stop decisions within 0.07 m, and preserves the original one-second segments, stop deadband, two-second freshness, 60-second skill deadline and validated worker clearance. It must never be described as autonomous challenge success.
+
+## Live Browser Navigation
+
+Run `./start.ps1`, configure **Luna connection**, load the chosen challenge, and click **Start LLM control**. The same worker shown in the browser owns all physics. The app loads the local Python 3.12 CUDA checkpoint once, validates its hash/contract, warms up without motion, and then asks Luna for bounded navigation decisions. No server on port 8085 is required. Camera movements follow supervisor decisions; drive velocities come from SmolVLA, not Luna or a scripted route.
+
+Luna receives the user goal, current and labeled initial head images, measured AgentObservation, its own compact route memory and execution feedback. It must call `guide_navigation`; raw wheel velocities/code are not accepted. It selects 1-8 local steps, a movement intention, visible floor-pixel/marker target, or retracing of the measured encoder path. Pixel projection assumes a flat floor and the calibrated upright camera; it has no access to the hidden map or goal centers. Marker segmentation is a camera-only geometric assist, not a learned SmolVLA skill. Encoder retracing follows previously measured positions, not an oracle path.
+
+SmolVLA receives the paired head image/AgentObservation and the selected canonical movement instruction. It generates both velocity components, subject to unchanged 0.15 m/s and 0.5 rad/s limits, acceleration bounds, two-second observation age, per-buffer leases and whole-robot clearance checks. A predicted clearance obstruction brakes and invalidates tickets, then requests a different supervisor subgoal; actual contact, instability, expired sensor feedback and operator Stop remain terminal. Each new supervisor subgoal has its own bounded travel/time window; total supervision is bounded by 80 turns and 20 minutes. Near-zero predictions pause and return to Luna instead of silently ending the task. Stop, takeover, reset and disconnect still cancel the run and discard late results while retaining weights. Luna's completion statement is marked agent-reported; the independent physics scorer determines verified success.
+
+## Recovery Continuation
+
+`scripts/recovery_policy.py` recorded 16 fixed demonstration episodes across park/recharge fixtures: 704 paired frames, 528 training frames (episodes 0-11), 176 validation frames (12-15). All 16 episodes replayed with maximum measured-state error 0.0. Each repeats bounded forward/reverse/turn/hold intentions in varied starting views; these are **primitive-action demonstrations, not successful full-task routes**. Raw episode metadata and private fixture positions are not training features. LeRobot export readback verifies tasks, actions, measured states and image pixels. Original task evaluation starts were not demonstration starts. Repeated task trials informed supervisor changes, so those results are development evaluations, not an untouched independent benchmark.
+
+Three actual AdamW continuations from the 1,500-step checkpoint trained 1,500 + 1,500 + 2,000 further steps, batch size four. The last stage used learning rate 1e-5, earlier stages 1e-4. About 99.9 million of 450.0 million parameters were trainable. Fixed validation loss fell **6.6263 -> 0.0780 -> 0.0555 -> 0.01438**; every checkpoint was saved and strictly reloaded. This does not prove route planning or recovery success.
+
+| Candidate | New Updates | Wall Time | Weight SHA-256 |
+| --- | --- | --- | --- |
+| recovery-3000 | 1,500 | 549 s | `7f55850b661a8fa827072f282645ba6631d698d4b46c055bb64adfa32d85e4a1` |
+| recovery-4500 | 1,500 | 542 s | `08c1ebe8a113cf47b75dd4bd5a4a3860cf9392010286ccdad4682ef7f65ad0ef` |
+| recovery-6500 | 2,000 | 689 s | `b1e5f8f533bd0f2a982ee5bf39b12bef5ab98953f42013d17d3b1abeaff9c08f` |
+
+**Measured task results:** the recovery-6500 candidate passed **Park in the Bay** in `.runtime/supervised-challenges-6500-final/park/report.json`: 19 local commands, six Luna turns, 151.3 wall seconds, zero manual placements. An earlier recovery-4500 run also passed. Other parking trials failed due to premature Luna completion claims. **Remember and Recharge has not passed**; one calibrated trial completed its survey stage but timed out on return. The latest no-repeat recovery trial exhausted 80 supervisor turns. Kitchen to Bathroom did not pass its trial. All first outcomes, traces and camera captures remain under `.runtime/supervised-*`; no failed records were overwritten. No reliable aggregate success rate is claimed.
+
+Repeat an isolated task evaluation with the same production controller (this invokes paid Luna inference):
+
+```powershell
+./.runtime/env/python.exe -m scripts.evaluate_supervised --checkpoint .runtime/navigation-recovery-6500/checkpoint --output .runtime/my-supervised-evaluation --challenges park recharge --turns 80 --reasoning high
+```
+
+Further progress needs successful multi-stage route/recovery demonstrations and stronger validation of Luna's spatial decisions, not just more updates on the repeated primitive dataset. The two-challenge acceptance target remains open. Historical experiments below retain their original results and qualifications.
+
+### Resident Model Lifetime
+
+The browser backend owns one `ResidentNavigationModel`. Per-run sessions share it under a serialization lock. Loading begins on the first Start and continues if that run is stopped during startup; the stopped robot never receives an action from that abandoned session. Cancelled in-flight predictions are drained and discarded before a new session may reset or use the protocol stream. Requests queued for a closed session are skipped. The existing model ticket and robot-episode checks still apply to all returned actions.
+
+A strict motion-free reset message clears policy state and reseeds the existing model for every new run, preserving repeatability without reloading weights. The UI reports GPU residency independently of run completion. Explicit **Unload local model** is allowed only while no robot controller or motion is active; application shutdown also cancels pending service work and closes the process tree. A failed request or dead worker is discarded and the next Start reloads it. Ordinary Stop, reset, challenge changes, voice takeover and disconnect keep the weights resident. The optional CLI `-NavigationTest` remains a separate short-lived process and does not use this browser model service.
+
+The saved tokenizer pads to 48 tokens and originally truncated longer goals. Navigation inference now overrides truncation only: the short parking input remains identical, and the recharge instruction retains all 124 tokens in the real saved preprocessing pipeline. Weights and normalization files are unchanged. Cold model startup may take up to five minutes while the robot remains stationary; loading stages are written to `.runtime/local-navigation/*.log`. This does not extend the two-second observation-age limit or motion leases.
+
+**Experimental scope:** recovery-action training does not establish general-navigation ability. Long-route planning, charging-station memory, multi-stage completion, manipulation and reliable recovery remain unverified. The 3D view is live physical motion, not a replay or separate CLI scene. References to selectable legacy modes below are historical.
 
 ## Navigation Stopping Experiment
 
@@ -44,7 +140,7 @@ Reproduce the bounded continuation:
 ./.runtime/smolvla-env/Scripts/python.exe -m scripts.train_milo --embodiment navigation --dataset .runtime/datasets/milo-navigation --base .runtime/navigation-training-1000/checkpoint --balance-stops --steps 500 --batch-size 4 --output .runtime/navigation-stopping-training-repeat
 ```
 
-The candidate is available explicitly by checkpoint path; **neither the CLI default nor live model settings were switched**. Single step and planning both remain available. Broader starts/layouts, false-stop testing when no bay is present, and raw action-bound reliability are still open before live integration.
+The candidate is available explicitly by checkpoint path and through live local navigation. Single step and planning remain selectable; the browser's initial mode is now local navigation and explicit user choices are remembered. Broader starts/layouts, false-stop testing when no bay is present, and raw action-bound reliability remain open validation work for experimental use beyond parking.
 
 ## Local Navigation Fine-Tune
 
@@ -332,7 +428,7 @@ The direct public wheel was not downloaded during those probes, so its advertise
 
 ## Run The Policy Server
 
-**Browser scope:** `Luna + SmolVLA` connects to a `milo-left-arm-v1` pick/place service, not either of the two-output navigation checkpoints. An offline message means that arm service cannot be reached; starting it with a navigation checkpoint is not a fix. The browser connection panel explicitly labels the left-arm contract and notes that fine-tuned navigation is currently CLI-only. Single step and Navigation plan use the selected LLM, not the local navigation weights. See [Repeat Locally](#repeat-locally) or [Navigation Stopping Experiment](#navigation-stopping-experiment) for the separate model test. Refreshing the page loads the clarified panel; the API's revised error wording requires a backend restart.
+**Browser scope:** `Luna + SmolVLA` connects to a `milo-left-arm-v1` pick/place service, not either of the two-output navigation checkpoints. An offline message means that arm service cannot be reached; starting it with a navigation checkpoint is not a fix. For local driving use **Local SmolVLA navigation**, which starts its own process automatically. Single step and Navigation plan use the selected LLM, not the local navigation weights. See [Live Browser Navigation](#live-browser-navigation) or [Navigation Stopping Experiment](#navigation-stopping-experiment). Restart the app backend and refresh the page after updating.
 
 Keep LeRobot separate from `.runtime/env`, whose PyBullet setup uses NumPy 1.x. The published LeRobot 0.6.1 requires Python 3.12 and NumPy 2.x. The isolated Windows environment at `.runtime/smolvla-env` now contains the CUDA 12.8 runtime and has passed import, GPU execution, model smoke, and dependency checks.
 

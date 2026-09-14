@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Check, Hand, ListChecks, MessageSquare, Mic, Play, Plus, RefreshCw, Route, Send, Settings2, Square, StepForward, Timer } from 'lucide-react';
+import { Bot, Check, Cpu, Hand, ListChecks, MessageSquare, Mic, Play, Plus, Power, RefreshCw, Route, Send, Settings2, Square, StepForward, Timer } from 'lucide-react';
 import { ExchangeFeed } from './ExchangeFeed';
+import { LocalModelProgress } from './LocalModelProgress';
 import { VoiceControl } from './VoiceControl';
 import type { ExecutionMode, LiveState, Reasoning } from './types';
 
@@ -19,16 +20,23 @@ export function AgentControl({ state, connected, request }: {
   const defaultProfile = configuration.models.find(entry => entry.id === configuration.default_model_id) ?? configuration.models[0];
   const [modelId, setModelId] = useState(configuration.default_model_id);
   const [reasoning, setReasoning] = useState<Reasoning>(defaultProfile.reasoning_efforts.includes('low') ? 'low' : defaultProfile.reasoning_efforts[0]);
-  const [executionMode, setExecutionMode] = useState<ExecutionMode>(agent.execution_mode ?? 'single_step');
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>(() => {
+    if (agent.active) return agent.execution_mode;
+    try {
+      const saved = localStorage.getItem('milo-execution-mode');
+      if (saved && ['single_step', 'navigation_plan', 'supervised_policy', 'local_navigation'].includes(saved)) return saved as ExecutionMode;
+    } catch {}
+    return 'local_navigation';
+  });
   const [policyEndpoint, setPolicyEndpoint] = useState(agent.policy?.endpoint ?? 'http://127.0.0.1:8085');
   const [policyCheck, setPolicyCheck] = useState<{ endpoint: string; ready: boolean; message: string; checkpoint?: string } | null>(null);
   const [checkingPolicy, setCheckingPolicy] = useState(false);
   const [policyRetry, setPolicyRetry] = useState(0);
   const [imagesPerRequest, setImagesPerRequest] = useState(agent.images_per_request ?? 1);
   const [contextTokens, setContextTokens] = useState(agent.context_tokens ?? 4096);
-  const [interval, setInterval] = useState(agent.feedback_interval_s);
+  const [interval, setInterval] = useState(executionMode === 'local_navigation' ? 1 : agent.feedback_interval_s);
   const [goal, setGoal] = useState(state.challenge?.goal ?? 'Inspect the area, approach a visible cube, and stop before contact.');
-  const [turnLimit, setTurnLimit] = useState(state.challenge?.suggested_turn_limit ?? 30);
+  const [turnLimit, setTurnLimit] = useState(executionMode === 'local_navigation' ? 30 : state.challenge?.suggested_turn_limit ?? 30);
   const [pending, setPending] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [message, setMessage] = useState('');
@@ -44,6 +52,15 @@ export function AgentControl({ state, connected, request }: {
   const [addingModel, setAddingModel] = useState(false);
   const profile = configuration.models.find(entry => entry.id === modelId) ?? configuration.models[0];
   const mode = state.interaction_mode ?? 'chat';
+  const localNavigation = mode === 'chat' && executionMode === 'local_navigation';
+  const residentModel = state.local_navigation_model;
+  const residencyLabels = {
+    unloaded: 'Model not loaded / loads on first Start',
+    loading: 'Loading model into GPU memory',
+    ready: 'Model ready / kept in GPU memory',
+    inferencing: 'Model loaded / processing a request',
+    error: 'Model worker unavailable / reloads on Start',
+  };
   useEffect(() => {
     if (executionMode !== 'supervised_policy' || mode !== 'chat' || !connected || agent.active) return;
     const controller = new AbortController();
@@ -153,9 +170,10 @@ export function AgentControl({ state, connected, request }: {
     : !state.realtime.deployment.trim() ? 'GPT Realtime 2 deployment name missing' : `Configured / ${state.realtime.deployment}`;
   return <section className="agent-section" aria-label="LLM control">
     <div className="panel-header">
-      <h3><Bot size={17} /> Agent interaction <span className="tag">{mode === 'chat' && profile.provider === 'ollama' ? 'OLLAMA LOCAL' : 'MICROSOFT FOUNDRY'}</span></h3>
+      <h3><Bot size={17} /> Agent interaction <span className="tag">{localNavigation ? 'LOCAL SMOLVLA' : mode === 'chat' && profile.provider === 'ollama' ? 'OLLAMA LOCAL' : 'MICROSOFT FOUNDRY'}</span></h3>
       <span className={`agent-phase ${agent.phase === 'error' ? 'bad' : ''}`} role="status">{phaseLabels[agent.phase] ?? agent.phase}</span>
     </div>
+    {(!localNavigation || agent.local_model) && <LocalModelProgress live={agent.local_model} connected={connected} />}
     <div className="interaction-tabs tabs" role="tablist" aria-label="Interaction mode">
       {(['chat', 'voice'] as const).map(option => <button key={option} id={`mode-${option}`} role="tab" type="button"
         aria-selected={mode === option} aria-controls={`panel-${option}`} tabIndex={mode === option ? 0 : -1} disabled={switching || pending || !connected}
@@ -179,11 +197,13 @@ export function AgentControl({ state, connected, request }: {
         images_per_request: imagesPerRequest, context_tokens: contextTokens });
     }}>
       {mode === 'chat' && <div className="execution-modes tabs" role="group" aria-label="Execution mode">
-        {(['single_step', 'navigation_plan', 'supervised_policy'] as const).map(value => <button type="button" key={value}
+        {(['local_navigation', 'single_step', 'navigation_plan', 'supervised_policy'] as const).map(value => <button type="button" key={value}
           aria-pressed={executionMode === value} disabled={agent.active || state.busy || pending || switching}
-          title={value === 'single_step' ? 'One bounded action per model response' : value === 'navigation_plan' ? 'Feedback-checked navigation skills with a short, expiring motion buffer' : 'Cloud supervision with a local, Milo-trained left-arm policy'}
+          title={value === 'local_navigation' ? 'Local SmolVLA drives the current scene using its head camera, sensors and Robot goal' : value === 'single_step' ? 'One bounded action per model response' : value === 'navigation_plan' ? 'Feedback-checked navigation skills with a short, expiring motion buffer' : 'Cloud supervision with a local, Milo-trained left-arm policy'}
           onClick={() => {
             setExecutionMode(value);
+            try { localStorage.setItem('milo-execution-mode', value); } catch {}
+            if (value === 'local_navigation') { setInterval(1); setTurnLimit(30); }
             if (value === 'navigation_plan') setInterval(.25);
             if (value === 'supervised_policy') {
               setInterval(1);
@@ -192,15 +212,25 @@ export function AgentControl({ state, connected, request }: {
               if (supervisor) { setModelId(supervisor.id); setReasoning(supervisor.reasoning_efforts.includes('low') ? 'low' : supervisor.reasoning_efforts[0]); }
             }
           }}>
-          {value === 'single_step' ? <StepForward size={16} /> : value === 'navigation_plan' ? <Route size={16} /> : <Bot size={16} />}
-          {value === 'single_step' ? 'Single step' : value === 'navigation_plan' ? 'Navigation plan' : 'Luna + SmolVLA'}
+          {value === 'local_navigation' ? <Cpu size={16} /> : value === 'single_step' ? <StepForward size={16} /> : value === 'navigation_plan' ? <Route size={16} /> : <Bot size={16} />}
+          {value === 'local_navigation' ? 'Local SmolVLA navigation' : value === 'single_step' ? 'Single step' : value === 'navigation_plan' ? 'Navigation plan' : 'Luna + SmolVLA'}
         </button>)}
+      </div>}
+      {localNavigation && <div className="policy-readiness">
+        <div className="panel-header"><h4>navigation-stop-balanced-1500 / local CUDA</h4>
+          <button type="button" className="icon-button" aria-label="Unload local model" title="Unload SmolVLA and release GPU memory"
+            disabled={!connected || pending || agent.active || state.busy || !residentModel || residentModel.phase === 'unloaded'}
+            onClick={() => void perform('local-navigation/unload', {})}><Power size={16} /></button>
+        </div>
+        <p role="status" aria-label="Local model residency">{!connected ? 'Model residency unavailable' : residencyLabels[residentModel?.phase ?? 'unloaded']}</p>
+        <p>{state.challenge?.title ?? 'Practice bench'} / {agent.active ? 'Local model controls the browser robot' : 'Start LLM control to run the current goal'}</p>
+        <p className="context-note">Experimental navigation. Checkpoint validated for green-bay parking only; other challenge outcomes are unverified. Navigation only, no manipulation.</p>
       </div>}
       <div className={`agent-settings ${mode === 'voice' ? 'voice-settings' : ''}`}>
         {mode === 'chat' && executionMode === 'supervised_policy' && <label>SmolVLA endpoint<input
           aria-label="SmolVLA endpoint" type="url" required value={policyEndpoint} disabled={agent.active || pending}
           onChange={event => setPolicyEndpoint(event.target.value)} /></label>}
-        {mode === 'chat' && <>
+        {mode === 'chat' && !localNavigation && <>
         <label>Model<select aria-label="LLM model" value={profile.id} disabled={agent.active || pending} onChange={event => {
           setModelId(event.target.value); setAddingModel(false);
           const selected = configuration.models.find(entry => entry.id === event.target.value)!;
@@ -211,8 +241,8 @@ export function AgentControl({ state, connected, request }: {
         </select></label>
         </>}
         <label>Feedback interval (s)<input aria-label="Feedback interval (s)" title="Minimum wall-clock interval between fresh model inputs; inference and motion may take longer." type="number" min={.25} max={30} step={.25} required value={interval} onChange={event => setInterval(Number(event.target.value))} /></label>
-        <label>Turn limit<input aria-label="LLM turn limit" type="number" min={1} max={200} step={1} required value={turnLimit} disabled={agent.active || pending} onChange={event => setTurnLimit(Number(event.target.value))} /></label>
-        {mode === 'chat' && <>
+        <label>Turn limit<input aria-label="LLM turn limit" type="number" min={1} max={localNavigation ? 40 : 200} step={1} required value={turnLimit} disabled={agent.active || pending} onChange={event => setTurnLimit(Number(event.target.value))} /></label>
+        {mode === 'chat' && !localNavigation && <>
           <label>Images per request<input aria-label="Images per request" type="number" min={1} max={8} step={1} required
             title="Maximum distinct head-camera frames per request. Current frame first, plus recent real observations as they become available. More images use more tokens."
             value={imagesPerRequest} disabled={agent.active || pending} onChange={event => setImagesPerRequest(Number(event.target.value))} /></label>
@@ -226,7 +256,7 @@ export function AgentControl({ state, connected, request }: {
           <button type="button" className="icon-button" aria-label="Check policy connection" title="Check local server and checkpoint compatibility without running inference"
             disabled={!connected || agent.active || pending || checkingPolicy} onClick={() => setPolicyRetry(value => value + 1)}><RefreshCw size={16} /></button>
         </div>
-        <p>Left-arm pick/place only. Fine-tuned navigation checkpoints are currently CLI-only.</p>
+        <p>Left-arm pick/place only. For driving, select Local SmolVLA navigation.</p>
         <p role="status" aria-label="Policy connection status" className={policyAvailable ? 'ok' : 'bad'}>
           {!connected ? 'Connection unavailable' : checkingPolicy || policyCheck?.endpoint !== policyEndpoint
             ? 'Checking policy service...' : policyCheck.message}
@@ -239,12 +269,12 @@ export function AgentControl({ state, connected, request }: {
           {agent.active ? <>
             <button type="button" disabled={pending || !connected || interval < .25 || interval > 30} onClick={() => perform('agent/rate', { feedback_interval_s: interval })}><Timer size={16} /> Apply rate</button>
             <button type="button" className="primary" disabled={pending || !connected} onClick={() => perform('agent/takeover', {})}><Hand size={16} /> Take manual control</button>
-          </> : mode === 'chat' && <button type="submit" className="primary" disabled={pending || !connected || state.busy || !profile.configured || !goal.trim() || !validContext || !cloudSupervisor || !policyAvailable}><Play size={16} /> Start LLM control</button>}
+          </> : mode === 'chat' && <button type="submit" className="primary" disabled={pending || !connected || state.busy || (!localNavigation && (!profile.configured || !validContext)) || !goal.trim() || !cloudSupervisor || !policyAvailable}><Play size={16} />Start LLM control</button>}
           {!agent.active && agent.auto_wake && <button type="button" disabled={pending || !connected} onClick={() => perform('agent/takeover', {})}><Hand size={16} /> Take manual control</button>}
         </div>
       </div>
     </form>
-    {mode === 'chat' && <section className="request-context" aria-label="Request context">
+    {mode === 'chat' && !localNavigation && <section className="request-context" aria-label="Request context">
       <div className="panel-header"><h4>Request context</h4>
         <span className="tag">{!connected ? 'Last received' : contextUsage ? `Request ${contextUsage.turn}` : 'No request yet'}</span>
       </div>
@@ -308,7 +338,7 @@ export function AgentControl({ state, connected, request }: {
       {skill?.checkpoint && <div className="exchange-meta">{skill.checkpoint}</div>}
       {skill?.completion_source === 'supervisor' && <p>Supervisor-reported completion</p>}
     </section>}
-    {mode === 'chat' && <section className="chat-section" aria-label="Chat control">
+    {mode === 'chat' && !localNavigation && <section className="chat-section" aria-label="Chat control">
       <div className="chat-transcript" ref={transcript} role="log" aria-label="Chat conversation" aria-live="polite" aria-relevant="additions text"
         tabIndex={0} onScroll={event => {
           const element = event.currentTarget;
@@ -329,7 +359,7 @@ export function AgentControl({ state, connected, request }: {
     {mode === 'voice' && !switching && <VoiceControl state={state} connected={connected} request={request} interval={interval} maxTurns={turnLimit} />}
     </div>
     <div className="agent-metrics">
-      <span className="model-connection-status">{agent.active ? agent.mode === 'voice' ? `${state.realtime.deployment} / voice / ${state.realtime.reasoning_effort}` : `${activeProfile?.label ?? agent.model_id} / ${agent.reasoning}` : mode === 'voice' ? voiceConfigurationStatus : configurationStatus}</span>
+      <span className="model-connection-status">{localNavigation ? 'Local SmolVLA / navigation checkpoint' : agent.active ? agent.mode === 'voice' ? `${state.realtime.deployment} / voice / ${state.realtime.reasoning_effort}` : `${activeProfile?.label ?? agent.model_id} / ${agent.reasoning}` : mode === 'voice' ? voiceConfigurationStatus : configurationStatus}</span>
       <span>Target interval <strong>{(agent.active ? agent.feedback_interval_s : interval).toFixed(2)} s</strong></span>
       <span>Actual interval <strong>{agent.observed_interval_s?.toFixed(2) ?? '-'} s</strong></span>
       <span>Inference <strong>{agent.inference_latency_s?.toFixed(2) ?? '-'} s</strong></span>
@@ -338,7 +368,7 @@ export function AgentControl({ state, connected, request }: {
     </div>
     {(error || agent.error) && <div className="error" role="alert">{error || agent.error}</div>}
     {agent.message && agent.mode !== 'chat' && <p className="agent-message">{agent.message}</p>}
-    {mode === 'chat' && <details className="agent-connection">
+    {mode === 'chat' && !localNavigation && <details className="agent-connection">
       <summary><Settings2 size={15} /> Model connection</summary>
       <form onSubmit={saveConnection}>
         <fieldset disabled={agent.active || pending}>

@@ -11,6 +11,7 @@ export default defineConfig({
   use: { baseURL: 'http://127.0.0.1:8001', channel: 'msedge', screenshot: 'only-on-failure' },
   webServer: {
     command: `"${python}" -m tests.test_agent`, cwd: root,
-    url: 'http://127.0.0.1:8001/api/state', reuseExistingServer: false, timeout: 30000,
+    url: 'http://127.0.0.1:8001/api/state', reuseExistingServer: false,
+    timeout: process.env.MILO_RENDERER === 'enhanced' ? 90000 : 30000,
   },
 });

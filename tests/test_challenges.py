@@ -2,6 +2,7 @@ import asyncio
 from io import BytesIO
 import json
 import math
+import sys
 
 import numpy as np
 from PIL import Image
@@ -18,8 +19,86 @@ from tests.test_realtime import RealtimeModel, VoiceBrowser
 from tests.test_simulation import command
 
 
+@pytest.fixture(scope="session")
+def recorded_physics_tests():
+    from scripts.record_scenario_tests import PhysicsTestBatch
+    batch = PhysicsTestBatch(label="scripted-scenario-replays-v1")
+    try:
+        yield batch
+    finally:
+        batch.finish()
+
+
+def test_shared_apartment_uses_one_scene_and_rejects_unsupported_options():
+    from backend.challenges import ChallengeLoad, shared_apartment
+    from backend.materials import scene_material
+    standalone = get_challenge("furniture_circuit").model_dump()
+    variants = [shared_apartment(name) for name in ("furniture_circuit", "apartment", "flat_kitchen", "recharge")]
+    assert all(challenge.scene() == variants[0].scene() for challenge in variants)
+    materials = [[scene_material(item, challenge.id == "apartment") for item in challenge.scene()] for challenge in variants]
+    assert all(values == materials[0] for values in materials)
+    assert get_challenge("furniture_circuit").model_dump() == standalone
+    assert variants[0].orbit.center_m == [-4.4, 1.8]
+    assert variants[0].orbit.minimum_radius_m == standalone["orbit"]["minimum_radius_m"]
+    assert variants[1].search_target == "yellow_target"
+    for challenge in variants:
+        assert challenge.public()["environment"] == "shared_apartment_v1"
+        assert not {"objects", "initial_xy", "center_m", "search_target", "floor_size_m"} & challenge.public().keys()
+        assert not any(item["name"].startswith("zone_") for item in challenge.scene())
+    with pytest.raises(ValueError, match="supports"):
+        ChallengeLoad(challenge_id="park", environment="shared_apartment_v1")
+    with pytest.raises(ValueError, match="table"):
+        ChallengeLoad(challenge_id="furniture_circuit", environment="shared_apartment_v1", orbit_target="sofa")
+
+
+@pytest.mark.parametrize("identifier", ["furniture_circuit", "apartment", "flat_kitchen", "recharge"])
+def test_shared_apartment_starts_clear_and_has_connected_doorways(identifier):
+    from backend.challenges import shared_apartment
+    challenge = shared_apartment(identifier)
+    sim = BulletSimulation(challenge=challenge, width=160, height=120)
+    try:
+        observation = sim.observe()
+        assert not observation.proximity.collisions
+        assert observation.odometry_m_rad == [0, 0, 0]
+        assert sim.challenge_status()["status"] == "in_progress"
+        assert "yellow_target" not in observation.model_dump_json()
+        objects = {item["name"]: item for item in sim.objects}
+        assert {"fridge_body", "stove_hob", "toilet_bowl", "bedroom_mattress", "circuit_table_top", "yellow_target", "red_decoy", "charger_pad"} <= objects.keys()
+        for start, end in (([-2, 0, .55], [0, 0, .55]), *[([.2, doorway, .55], [2, doorway, .55]) for doorway in (-3.8, 0, 3.8)]):
+            assert bullet.rayTest(start, end, physicsClientId=sim.client)[0][0] == -1
+        target = objects["yellow_target"]
+        assert bullet.rayTest([-6.8, 1.8, .6], target["position"], physicsClientId=sim.client)[0][0] != target["id"]
+    finally:
+        sim.close()
+
+
+def test_shared_apartment_api_selection_and_reset_are_isolated():
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    with TestClient(app) as client:
+        catalogue = client.get("/api/challenges?environment=shared_apartment_v1").json()
+        assert {item["id"] for item in catalogue} == {"furniture_circuit", "apartment", "flat_kitchen", "recharge"}
+        assert all(item["environment"] == "shared_apartment_v1" and "objects" not in item for item in catalogue)
+        for identifier in ("furniture_circuit", "apartment", "flat_kitchen", "recharge"):
+            response = client.post("/api/challenges/load", json={"challenge_id": identifier, "environment": "shared_apartment_v1"})
+            assert response.status_code == 200
+            state = response.json()
+            reset = client.post("/api/reset").json()
+            assert reset["challenge"]["environment"] == "shared_apartment_v1"
+            assert reset["challenge"]["id"] == identifier
+            assert reset["run_id"] != state["run_id"]
+            assert reset["snapshot"]["simulated_time_s"] == 0
+            assert not reset["agent"]["active"]
+        rejected = client.post("/api/challenges/load", json={"challenge_id": "park", "environment": "shared_apartment_v1"})
+        assert rejected.status_code == 422
+        assert client.get("/api/state").json()["run_id"] == reset["run_id"]
+        state = client.post("/api/challenges/load", json={"challenge_id": "furniture_circuit"}).json()
+        assert state["challenge"]["environment"] == "standalone"
+        assert state["challenge"]["orbit"] == {"target": "table", "direction": "clockwise"}
+
+
 def test_presets_have_distinct_goals_and_private_geometry():
-    assert set(PRESETS) == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop"}
+    assert set(PRESETS) == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit"}
     for preset in PRESETS.values():
         assert preset.goal and preset.objectives
         assert "objects" not in preset.public()
@@ -28,6 +107,141 @@ def test_presets_have_distinct_goals_and_private_geometry():
         assert all(isinstance(label, str) for label in preset.public()["objectives"])
         assert any(item.get("marker") for item in preset.scene())
     assert get_challenge("bench") is None
+
+
+@pytest.mark.parametrize("direction", ["clockwise", "counterclockwise"])
+def test_furniture_circuit_requires_correct_translation_direction_and_rest(direction):
+    from backend.challenges import furniture_circuit
+    challenge = furniture_circuit("table", direction)
+    progress = ChallengeProgress(challenge)
+    center = challenge.orbit.center_m
+    now = 0.
+    def sample(angle, speed=.3, contact=False):
+        nonlocal now
+        now += .05
+        position = [center[0] + 1.7 * math.cos(angle), center[1] + 1.7 * math.sin(angle)]
+        return progress.update({"robot": {**robot_measurement(position, speed=speed), "position_xy": position, "contact": contact}}, set(), now)
+    sign = -1 if direction == "clockwise" else 1
+    for angle in np.linspace(0., -sign * 2 * math.pi, 720):
+        assert sample(angle)["status"] == "in_progress"
+    assert progress.orbit_angle < .01
+    for angle in np.linspace(0., sign * 2 * math.pi, 720):
+        assert sample(angle)["status"] == "in_progress"
+    for _ in range(12):
+        status = sample(sign * 2 * math.pi, speed=0.)
+    assert status["status"] == "completed"
+    assert "center_m" not in json.dumps(challenge.public())
+    assert sample(sign * 2 * math.pi, speed=0., contact=True)["status"] == "failed"
+
+
+def test_furniture_circuit_ignores_spin_wrong_object_and_teleports():
+    from backend.challenges import furniture_circuit
+    challenge = furniture_circuit()
+    progress = ChallengeProgress(challenge)
+    for index in range(30):
+        position = [2.6 + math.cos(index), -2.5 + math.sin(index)]
+        progress.update({"robot": {**robot_measurement(position), "position_xy": position, "contact": False}}, set(), index * .05)
+    assert progress.orbit_angle == 0.
+    for index in range(30):
+        position = [-2.4 + 1.7 * math.cos(index), 1.8 + 1.7 * math.sin(index)]
+        progress.update({"robot": {**robot_measurement(position), "position_xy": position, "contact": False}}, set(), 2 + index * .05)
+    assert progress.status["status"] == "in_progress" and progress.orbit_angle < .1
+    progress = ChallengeProgress(challenge)
+    for angle in np.linspace(0., -2 * math.pi, 720):
+        position = [-2.4 + 1.7 * math.cos(angle), 1.8 + 1.7 * math.sin(angle)]
+        progress.update({"robot": {**robot_measurement(position), "position_xy": position, "contact": False}}, set(), 0.)
+    assert progress.orbit_angle == 0. and not progress.orbit_lap
+
+
+def test_furniture_circuit_selection_persists_reset_and_keeps_geometry_private():
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    with TestClient(app) as client:
+        reply = client.post("/api/challenges/load", json={"challenge_id": "furniture_circuit", "orbit_target": "sofa", "orbit_direction": "counterclockwise"})
+        assert reply.status_code == 200
+        state = reply.json()
+        assert state["challenge"]["orbit"] == {"target": "sofa", "direction": "counterclockwise"}
+        assert "counterclockwise circuit around that sofa" in state["challenge"]["goal"]
+        assert "center_m" not in json.dumps(state["challenge"])
+        assert "circuit_" not in json.dumps(state["observation"])
+        reset = client.post("/api/reset", json={}).json()
+        assert reset["run_id"] != state["run_id"] and reset["challenge"]["orbit"] == state["challenge"]["orbit"]
+        assert client.post("/api/challenges/load", json={"challenge_id": "park", "orbit_target": "chair"}).status_code == 422
+
+
+@pytest.mark.parametrize("target,direction,environment", [
+    (target, direction, "standalone") for target in ("table", "sofa", "chair", "floor lamp")
+    for direction in ("clockwise", "counterclockwise")
+] + [("table", direction, "shared_apartment_v1") for direction in ("clockwise", "counterclockwise")])
+def test_furniture_circuit_is_feasible_with_real_wheels(target, direction, environment, recorded_physics_tests):
+    from backend.challenges import furniture_circuit, shared_apartment
+    from backend.robot import TRAVEL
+    challenge = shared_apartment("furniture_circuit", direction) if environment == "shared_apartment_v1" else furniture_circuit(target, direction)
+    radius = (challenge.orbit.minimum_radius_m + challenge.orbit.maximum_radius_m) / 2
+    center = np.array(challenge.orbit.center_m)
+    challenge.initial_xy = (center + [radius, 0.]).tolist()
+    sim = BulletSimulation(challenge=challenge, width=160, height=120)
+    sign = -1 if direction == "clockwise" else 1
+    recording = recorded_physics_tests.record(sim, f"{environment}-circle-{target.replace(' ', '-')}-{direction}",
+        "Known-geometry wheel steering. Test starts on the permitted annulus, stows arms and sets tangent orientation before the lap.")
+    try:
+        for side in ("left", "right"):
+            result = command(sim, "set_arm_joints", arm=side, joint_positions_rad=TRAVEL, duration_s=2.)
+            assert result.status == "ok", result.message
+        position = bullet.getBasePositionAndOrientation(sim.robot, physicsClientId=sim.client)[0]
+        bullet.resetBasePositionAndOrientation(sim.robot, position, bullet.getQuaternionFromEuler([0, 0, sign * math.pi / 2]), physicsClientId=sim.client)
+        sim.challenge_progress = ChallengeProgress(challenge)
+        for _ in range(240):
+            position, quaternion = bullet.getBasePositionAndOrientation(sim.robot, physicsClientId=sim.client)
+            heading = bullet.getEulerFromQuaternion(quaternion)[2]
+            relative = np.array(position[:2]) - center
+            angle = math.atan2(relative[1], relative[0])
+            desired_heading = angle + sign * math.pi / 2 + sign * .8 * (np.linalg.norm(relative) - radius)
+            error = math.atan2(math.sin(desired_heading - heading), math.cos(desired_heading - heading))
+            result = command(sim, "drive_base", linear_mps=.3, angular_radps=float(np.clip(sign * .3 / radius + error, -.5, .5)), duration_s=.5)
+            assert result.status == "ok", result.message
+            assert not sim.proximity_sensors().collisions
+            if sim.challenge_progress.orbit_lap:
+                break
+        assert sim.challenge_progress.orbit_lap, sim.challenge_status()
+        result = command(sim, "wait", duration_s=.6)
+        assert result.status == "ok" and sim.challenge_status()["status"] == "completed"
+        assert sim.path_length > 2 * math.pi * challenge.orbit.minimum_radius_m
+    finally:
+        try:
+            recording.finish(sys.exc_info()[0])
+        finally:
+            sim.close()
+
+
+def test_pedestrian_contact_latches_failure_and_fresh_episode_resets_without_sensor_leak():
+    from backend.simulation import MotionError
+    for collision in (True, False):
+        sim = BulletSimulation(challenge=get_challenge("pedestrian_crossing"), width=160, height=120)
+        try:
+            assert not sim.pedestrian_crossing["contact"]
+            assert sim.pedestrian_crossing["started_at"] is None
+            assert sim.challenge_status()["completed_objectives"] == 0
+            observation = sim.observe()
+            assert "pedestrian" not in observation.model_dump_json()
+            sim._ticks(120)
+            assert sim.pedestrian_crossing["started_at"] is None
+            if collision:
+                leg = next(item for item in sim.objects if item["name"] == "pedestrian_leg_left")
+                bullet.resetBasePositionAndOrientation(leg["id"], [.15, .2, .38], [0, 0, 0, 1], physicsClientId=sim.client)
+                sim._ticks(12)
+                assert sim.pedestrian_crossing["contact"]
+                assert sim.challenge_status()["status"] == "failed"
+                bullet.resetBasePositionAndOrientation(leg["id"], leg["position"], [0, 0, 0, 1], physicsClientId=sim.client)
+                sim._ticks(120)
+                assert sim.challenge_status()["status"] == "failed"
+            before = sim.snapshot()
+            sim.stop()
+            with pytest.raises(MotionError, match="interrupted"):
+                sim._ticks(12)
+            assert sim.snapshot() == before
+        finally:
+            sim.close()
 
 
 def test_kitchen_bathroom_starts_in_kitchen_without_room_labels_or_target_markers():
@@ -79,8 +293,10 @@ def robot_measurement(center, speed=0):
             "grounded": True, "speed": speed, "angular_speed": 0}
 
 
-def test_apartment_inspection_requires_visible_nearby_target_and_stationary_dwell():
-    progress = ChallengeProgress(get_challenge("apartment"))
+@pytest.mark.parametrize("environment", ["standalone", "shared_apartment_v1"])
+def test_apartment_inspection_requires_visible_nearby_target_and_stationary_dwell(environment):
+    from backend.challenges import shared_apartment
+    progress = ChallengeProgress(shared_apartment("apartment") if environment == "shared_apartment_v1" else get_challenge("apartment"))
     measurement = {**robot_measurement([1.1, 1.5]), "target_nearby": True, "target_visible": True, "head_stationary": True}
     elapsed = 0
     for invalid in ({"target_nearby": False}, {"target_visible": False}, {"speed": .1},
@@ -95,10 +311,13 @@ def test_apartment_inspection_requires_visible_nearby_target_and_stationary_dwel
     assert progress.search_dwell_s == 0
 
 
-def test_recharge_requires_departure_scan_low_battery_return_and_charging():
-    progress = ChallengeProgress(get_challenge("recharge"))
-    dock = {"robot": robot_measurement([0, 0])}
-    survey = {"robot": robot_measurement([1.45, 0])}
+@pytest.mark.parametrize("environment", ["standalone", "shared_apartment_v1"])
+def test_recharge_requires_departure_scan_low_battery_return_and_charging(environment):
+    from backend.challenges import shared_apartment
+    challenge = shared_apartment("recharge") if environment == "shared_apartment_v1" else get_challenge("recharge")
+    progress = ChallengeProgress(challenge)
+    dock = {"robot": robot_measurement(challenge.objectives[1].center[:2])}
+    survey = {"robot": robot_measurement(challenge.objectives[0].center[:2])}
     assert progress.update(dock, set(), 5, 0)["completed_objectives"] == 0
     assert progress.battery.charge_pct == 100
     assert progress.update(survey, set(), 5.5, 3)["completed_objectives"] == 0
@@ -163,6 +382,63 @@ def test_kitchen_to_bathroom_route_is_physically_feasible():
         assert not any(name in result.observation.model_dump_json() for name in ("current_room", "bathroom_floor", "toilet_cistern", "initial_xy"))
         drive_to(sim, [0, 1.4])
         assert sim.challenge_status()["status"] == "in_progress"
+    finally:
+        sim.close()
+
+
+def test_flat_kitchen_has_five_detailed_rooms_open_doors_and_private_destination():
+    preset = get_challenge("flat_kitchen")
+    sim = BulletSimulation(challenge=preset, width=160, height=120)
+    try:
+        objects = {item["name"]: item for item in sim.objects}
+        assert len(objects) == len(sim.objects)
+        assert len(objects) >= 120
+        assert {"living_floor", "bedroom_floor", "study_floor", "bathroom_floor", "kitchen_floor",
+                "living_tv_screen", "bedroom_pillow_0", "study_keyboard", "toilet_bowl", "stove_hob"} <= objects.keys()
+        assert objects["floor"]["size"][:2] == [12, 10]
+        assert not any(name.startswith("zone_") for name in objects)
+        assert not sim.proximity_sensors().collisions
+        for center_x, center_y in ((-4, 1.05), (0, 1.05), (4, 1.05), (-3, -1.05), (3, -1.05)):
+            assert bullet.rayTest([center_x, center_y - .3, .55], [center_x, center_y + .3, .55], physicsClientId=sim.client)[0][0] == -1
+        assert bullet.rayTest([-.3, -2.5, .55], [.3, -2.5, .55], physicsClientId=sim.client)[0][0] == -1
+        assert not sim._target_in_camera(objects["stove_hob"]["id"], np.array(objects["stove_hob"]["position"]))
+        observation = sim.observe()
+        assert observation.odometry_m_rad == [0, 0, 0]
+        assert sim.challenge_status()["status"] == "in_progress"
+        assert all(name not in observation.model_dump_json() for name in objects)
+        assert not {"initial_xy", "objects", "floor_size_m", "ordered_objectives"} & preset.public().keys()
+    finally:
+        sim.close()
+
+
+def test_flat_kitchen_requires_full_entry_grounding_rest_and_final_dwell():
+    progress = ChallengeProgress(get_challenge("flat_kitchen"))
+    elapsed = 0
+    for center, invalid in (([-3, -2], {}), ([0, 2], {}), ([4, 1.3], {}), ([3.4, 2.65], {"grounded": False}),
+                            ([3.4, 2.65], {"speed": .1}), ([3.4, 2.65], {"angular_speed": .2})):
+        elapsed += 1
+        assert progress.update({"robot": {**robot_measurement(center), **invalid}}, set(), elapsed)["status"] == "in_progress"
+    parked = {"robot": robot_measurement([3.4, 2.65])}
+    assert progress.update(parked, set(), elapsed + .25)["status"] == "in_progress"
+    assert progress.update(parked, set(), elapsed + .25)["status"] == "in_progress"
+    assert progress.update(parked, set(), elapsed + .5)["status"] == "completed"
+    assert progress.update({"robot": robot_measurement([4, 0])}, set(), elapsed + .6)["status"] == "in_progress"
+
+
+def test_flat_kitchen_all_rooms_and_alternate_living_route_are_physically_accessible():
+    sim = BulletSimulation(challenge=get_challenge("flat_kitchen"), width=160, height=120)
+    try:
+        for waypoint in ([-3, -2.2], [-3, 0], [-4, 0], [-4, 1.8], [-4, 0],
+                         [0, 0], [0, 2], [0, 0], [3, 0], [3, -1.7], [4.4, -1.7],
+                         [4.4, -2.1], [.8, -2.1], [-.8, -2.1], [-3, -2.1], [-3, 0], [4, 0]):
+            drive_to(sim, waypoint)
+            assert sim.challenge_status()["status"] == "in_progress"
+            assert not sim.proximity_sensors().collisions
+        drive_to(sim, [4, 2.6])
+        assert command(sim, "wait", duration_s=.6).status == "ok"
+        assert sim.challenge_status()["status"] == "completed", sim.challenge_status()
+        assert sim.path_length > 25
+        assert not sim.proximity_sensors().collisions
     finally:
         sim.close()
 
@@ -313,6 +589,50 @@ def test_apartment_search_route_is_physically_feasible_and_rejects_decoy():
         assert sim.challenge_progress.search_dwell_s == 0
     finally:
         sim.close()
+
+
+@pytest.mark.parametrize("identifier", ["flat_kitchen", "apartment", "recharge"])
+def test_shared_apartment_tasks_are_reachable_with_real_wheels(identifier, recorded_physics_tests):
+    from backend.challenges import shared_apartment
+    from backend.robot import TRAVEL
+    sim = BulletSimulation(challenge=shared_apartment(identifier), width=160, height=120)
+    recording = recorded_physics_tests.record(sim, f"shared_apartment_v1-{identifier}",
+        "Known-geometry waypoint steering from the scenario start; real wheels, sensing and task scorer. No model inference.")
+    try:
+        for side in ("left", "right"):
+            assert command(sim, "set_arm_joints", arm=side, joint_positions_rad=TRAVEL, duration_s=2.).status == "ok"
+        if identifier == "recharge":
+            command(sim, "wait", duration_s=2)
+            assert sim.challenge_status()["completed_objectives"] == 0
+            drive_to(sim, [.2, 0])
+            assert command(sim, "wait", duration_s=1.2).status == "ok"
+            assert sim.challenge_progress.survey_complete and sim.battery_sensor().low
+            assert sim.challenge_status()["status"] != "completed"
+            drive_to(sim, [-2.7, 0])
+            for _ in range(3):
+                assert command(sim, "wait", duration_s=2).status == "ok"
+            assert sim.battery_sensor().charge_pct >= 90
+        else:
+            for point in ([-6.8, 0], [-2.7, 0], [-.3, 0]):
+                drive_to(sim, point)
+            assert sim.challenge_status()["status"] == "in_progress"
+            if identifier == "flat_kitchen":
+                for point in ([3.4, 0], [-.3, 0], [-.3, 3.8], [3.4, 3.8]):
+                    drive_to(sim, point)
+                assert command(sim, "wait", duration_s=.6).status == "ok"
+            else:
+                for point in ([-.3, -3.8], [2.7, -3.8], [2.7, -2.6], [5.45, -2.6]):
+                    drive_to(sim, point)
+                assert command(sim, "set_head", yaw_rad=0, pitch_rad=.35, duration_s=1).status == "ok"
+                assert command(sim, "wait", duration_s=1.2).status == "ok"
+        assert not sim.proximity_sensors().collisions
+        assert sim.challenge_status()["status"] == "completed", sim.challenge_status()
+        assert sim.path_length > 5
+    finally:
+        try:
+            recording.finish(sys.exc_info()[0])
+        finally:
+            sim.close()
 
 
 def test_recharge_round_trip_is_physically_feasible_and_needs_waiting():

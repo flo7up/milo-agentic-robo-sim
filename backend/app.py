@@ -1,53 +1,95 @@
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
+from anyio import CancelScope
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from backend.agent import AgentController, AgentStart, ChatStart, FeedbackRate, FoundryConfig, InteractionMode, robot_tools
-from backend.challenges import ChallengeLoad, PRESETS, get_challenge
-from backend.contracts import Command, ManualPlacement, tool_schemas
+from backend.agent import AgentController, AgentStart, ChatStart, FeedbackRate, FoundryConfig, InteractionMode, RunInstruction, robot_tools
+from backend.challenges import ChallengeLoad, PRESETS, furniture_circuit, get_challenge, shared_apartment
+from backend.contracts import Command, ManualPlacement, SpatialSettings, tool_schemas
+from backend.continuous_navigation import ContinuousScan, ContinuousTarget
 from backend.local_progress import read_navigation_progress
+from backend.local_navigation import ResidentNavigationModel
 from backend.robot import calibration
 from backend.materials import TEXTURE_NAMES, TEXTURE_ROOT
 from backend.policy import PolicyConfig, check_policy_readiness
 from backend.realtime import FoundryRealtime, RealtimeConfig, VoiceController, VoiceStart
 from backend.simulation import MotionError
 from backend.worker import SimulationWorker
+from backend.ros_navigation import RosBridgeStatus, RosGoalResult, RosStart, RosVelocity
+from backend.home_mission import HomeRequest
 
 
 class Lab:
     def __init__(self):
         self.worker = None
+        self.render_resources = None
         self.epoch = 0
         self.lock = asyncio.Lock()
         self.connections = 0
-        self.agent = AgentController()
+        self.local_navigation = ResidentNavigationModel()
+        self.agent = AgentController(local_navigation_factory=self.local_navigation)
         self.realtime_config = RealtimeConfig()
         self.voice_factory = FoundryRealtime
         self.challenge_id = "bench"
+        self.environment = "standalone"
+        self.orbit_target = "table"
+        self.orbit_direction = "clockwise"
         self.interaction_mode = "chat"
 
     def state(self):
         return {**self.worker.latest, "agent": self.agent.public(), "realtime": self.realtime_config.public(),
-            "interaction_mode": self.interaction_mode}
+            "interaction_mode": self.interaction_mode, "local_navigation_model": self.local_navigation.public()}
 
-    async def reset(self, challenge_id=None):
+    async def reset(self, challenge_id=None, orbit_target=None, orbit_direction=None, environment=None):
         async with self.lock:
             await self.agent.halt("Episode reset")
+            spatial_enabled = bool(self.worker and not self.worker.closed and self.worker.spatial_enabled)
             if self.worker:
                 await self.worker.close()
             self.epoch += 1
             selected = self.challenge_id if challenge_id is None else challenge_id
-            replacement = SimulationWorker(epoch=self.epoch, challenge=get_challenge(selected))
+            target = self.orbit_target if challenge_id is None else orbit_target or "table"
+            direction = self.orbit_direction if challenge_id is None else orbit_direction or "clockwise"
+            layout = self.environment if challenge_id is None else environment or "standalone"
+            rendering = os.environ.get("MILO_RENDERER", "enhanced")
+            if rendering == "enhanced":
+                from backend.camera import EnhancedResources
+                if self.render_resources and (self.render_resources.renderer.closed or self.render_resources.renderer.process.poll() is not None):
+                    await asyncio.to_thread(self.render_resources.close)
+                    self.render_resources = None
+                if self.render_resources is None:
+                    self.render_resources = await asyncio.to_thread(EnhancedResources)
+            challenge = (shared_apartment(selected, direction) if layout == "shared_apartment_v1" else
+                furniture_circuit(target, direction) if selected == "furniture_circuit" else get_challenge(selected))
+            replacement = SimulationWorker(epoch=self.epoch, challenge=challenge,
+                rendering=rendering, render_resources=self.render_resources if rendering == "enhanced" else None)
             await asyncio.wrap_future(replacement.ready)
+            home_state = await replacement.home_state()
+            saved_home = next((item for item in home_state["maps"] if item["environment_id"] == home_state["environment_id"]), None)
+            if saved_home:
+                await replacement.home_command(HomeRequest(run_id=replacement.latest["run_id"], episode_epoch=self.epoch,
+                    action="load_map", map_id=saved_home["map_id"]))
+            if spatial_enabled:
+                await replacement.configure_spatial(SpatialSettings(run_id=replacement.latest["run_id"],
+                    episode_epoch=self.epoch, enabled=True))
             self.worker = replacement
             self.challenge_id = selected
-            self.agent = AgentController(self.agent.config, self.agent.model_factory, policy_factory=self.agent.policy_factory)
+            self.environment = layout
+            self.orbit_target, self.orbit_direction = target, direction
+            recording_evidence = self.agent.recording_evidence
+            self.agent = AgentController(self.agent.config, self.agent.model_factory, policy_factory=self.agent.policy_factory,
+                local_navigation_factory=self.agent.local_navigation_factory)
+            from backend.agent import ConfiguredModel
+            self.agent.record_sessions = True
+            self.agent.recording_evidence = "real_model" if self.agent.model_factory is ConfiguredModel else (
+                "scripted_test" if recording_evidence == "scripted_test" else "unknown")
             self.interaction_mode = "chat"
         return self.state()
 
@@ -60,10 +102,11 @@ async def lifespan(app):
     load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
     load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
     configuration_error = None
+    lab.local_navigation = ResidentNavigationModel()
     try:
-        lab.agent = AgentController(FoundryConfig.from_environment())
+        lab.agent = AgentController(FoundryConfig.from_environment(), local_navigation_factory=lab.local_navigation)
     except ValueError:
-        lab.agent = AgentController()
+        lab.agent = AgentController(local_navigation_factory=lab.local_navigation)
         configuration_error = "Invalid Foundry configuration. Check the endpoint and model profiles."
     await lab.reset("bench")
     try:
@@ -72,9 +115,19 @@ async def lifespan(app):
         lab.realtime_config = RealtimeConfig()
         configuration_error = "Invalid Foundry Realtime configuration. Use a resource endpoint and a Realtime deployment."
     lab.agent.state["error"] = configuration_error
-    yield
-    await lab.agent.halt("Server shutdown")
-    await lab.worker.close()
+    try:
+        yield
+    finally:
+        try:
+            await lab.agent.halt("Server shutdown")
+        finally:
+            try:
+                await lab.local_navigation.close()
+            finally:
+                await lab.worker.close()
+                if lab.render_resources:
+                    await asyncio.to_thread(lab.render_resources.close)
+                    lab.render_resources = None
 
 
 app = FastAPI(title="Embodied Robot Lab", lifespan=lifespan)
@@ -85,12 +138,249 @@ async def local_origin_guard(request: Request, call_next):
     origin = request.headers.get("origin")
     if origin and origin not in {f"http://{request.headers.get('host')}", f"https://{request.headers.get('host')}"}:
         return Response("Same-origin access required", status_code=403)
-    return await call_next(request)
+    ros = getattr(lab.worker, "ros_navigation", None)
+    if request.method == "POST" and ros and ros.active and request.url.path not in {
+            "/api/ros/velocity", "/api/ros/heartbeat", "/api/ros/result", "/api/agent/instruction",
+            "/api/stop", "/api/resume", "/api/agent/takeover", "/api/reset", "/api/challenges/load"}:
+        return Response("Stop ROS navigation before changing control", status_code=409)
+    response = await call_next(request)
+    if request.url.path in {"/", "/index.html"}:
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/api/state")
 async def state():
     return lab.state()
+
+
+@app.get("/api/test-variant")
+async def test_variant(execution_mode: Literal["luna_continuous", "luna_navigation"] = "luna_continuous",
+    model_id: str = "luna", reasoning: Literal["none", "low", "medium", "high"] = "high",
+        skill_composer: bool = False, navigation_backend: Literal["builtin", "nav2"] = "builtin"):
+    from backend.experiment_variants import variant_snapshot
+    profile = next((entry for entry in lab.agent.config.models if entry.id == model_id), None)
+    if profile is None:
+        raise HTTPException(404, "Model profile unavailable")
+    try:
+        settings = AgentStart(run_id=lab.worker.latest["run_id"], episode_epoch=lab.worker.epoch,
+            execution_mode=execution_mode, model_id=model_id, reasoning=reasoning,
+            skill_composer=skill_composer, navigation_backend=navigation_backend, goal="Architecture preview only")
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    return JSONResponse({**variant_snapshot(settings, profile), "supports_ai_generated_routes": False,
+        "supports_skill_composer": True, "supports_navigation_backend": True, "nav2": ros_status()},
+        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/test-results")
+async def test_results():
+    from backend.saved_results import saved_results
+    return JSONResponse(await asyncio.to_thread(saved_results), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/test-results/{batch_id}/images/{trial_index}")
+async def test_result_image(batch_id: str, trial_index: int):
+    from backend.saved_results import terminal_image
+    try:
+        path = await asyncio.to_thread(terminal_image, batch_id, trial_index)
+    except (OSError, ValueError):
+        raise HTTPException(404, "Saved camera image unavailable")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/api/test-results/{batch_id}/trajectories/{trial_index}")
+async def test_result_trajectory(batch_id: str, trial_index: int):
+    from backend.saved_results import recorded_trajectory
+    try:
+        route = await asyncio.to_thread(recorded_trajectory, batch_id, trial_index)
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        raise HTTPException(404, "Saved trajectory unavailable")
+    return JSONResponse(route, headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/api/spatial")
+async def spatial_state(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    worker = lab.worker
+    try:
+        return await worker.call(lambda sim: worker.spatial_state())
+    except RuntimeError as error:
+        if worker.closed or worker is not lab.worker:
+            raise HTTPException(409, "Spatial sensor episode changed; refresh state") from error
+        raise
+
+
+@app.get("/api/home")
+async def home_state():
+    try:
+        return JSONResponse(await lab.worker.home_state(), headers={"Cache-Control": "no-store"})
+    except RuntimeError as error:
+        raise HTTPException(409, "Home map episode changed") from error
+
+
+@app.post("/api/home")
+async def home_operation(request: HomeRequest):
+    worker = lab.worker
+    if request.run_id != worker.latest["run_id"] or request.episode_epoch != worker.epoch:
+        raise HTTPException(409, "Home request belongs to another episode")
+    if request.action == "cancel_task":
+        worker.stop()
+        await lab.agent.halt("Home task cancelled")
+        return await worker.home_command(request)
+    if lab.lock.locked() or lab.agent.active or worker.latest.get("busy") or not lab.connections:
+        raise HTTPException(409, "Keep the operator connected and take manual control before changing the map")
+    async with lab.lock:
+        try:
+            return await worker.home_command(request)
+        except (ValueError, MotionError, RuntimeError) as error:
+            raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/home/{map_id}/objects/{observation_id}/image.png")
+async def home_object_image(map_id: str, observation_id: str):
+    mission = lab.worker.home_mission
+    if mission is None or mission.home is None or mission.home.identity != map_id:
+        raise HTTPException(404, "Load the matching map to view object evidence")
+    try:
+        image = await asyncio.to_thread(mission.store.object_image, map_id, observation_id)
+        return Response(image, media_type="image/png", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+def require_ros():
+    if os.environ.get("MILO_ROS_ENABLED") != "1":
+        raise HTTPException(404, "ROS bridge is disabled")
+
+
+def require_ros_owner():
+    worker = lab.worker
+    session = worker.ros_navigation
+    agent_owned = bool(session and session.active and session.owner == "agent"
+        and lab.agent.state.get("navigation_backend") == "nav2")
+    if lab.lock.locked() or (lab.agent.active and not agent_owned) or not lab.connections:
+        raise HTTPException(409, "ROS motion ownership is unavailable")
+    return worker
+
+
+@app.get("/api/ros/status")
+def ros_status():
+    enabled = os.environ.get("MILO_ROS_ENABLED") == "1"
+    return {**lab.worker.nav2_status(), "enabled": enabled} if enabled else {
+        "enabled": False, "ready": False, "message": "Start with -Nav2 to enable the bridge"}
+
+
+@app.post("/api/ros/heartbeat")
+async def ros_heartbeat(status: RosBridgeStatus):
+    require_ros()
+    try:
+        return await lab.worker.ros_heartbeat(status)
+    except (MotionError, ValueError, RuntimeError) as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/api/ros/result")
+async def ros_result(result: RosGoalResult):
+    require_ros()
+    worker = require_ros_owner()
+    try:
+        return await worker.ros_result(result)
+    except (MotionError, ValueError, RuntimeError) as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/ros/odometry")
+async def ros_odometry():
+    require_ros()
+    try:
+        return JSONResponse(await lab.worker.ros_odometry(), headers={"Cache-Control": "no-store"})
+    except RuntimeError as error:
+        raise HTTPException(409, "ROS odometry episode changed") from error
+
+
+@app.get("/api/ros/sensors")
+async def ros_sensors(response: Response):
+    require_ros()
+    response.headers["Cache-Control"] = "no-store"
+    worker = lab.worker
+    try:
+        return JSONResponse(await worker.ros_sensors(), headers={"Cache-Control": "no-store"})
+    except RuntimeError as error:
+        raise HTTPException(409, "ROS sensor episode changed") from error
+
+
+@app.post("/api/ros/start")
+async def ros_start(request: RosStart):
+    require_ros()
+    if lab.lock.locked() or lab.agent.active or lab.worker.latest.get("busy") or not lab.connections:
+        raise HTTPException(409, "Keep the operator interface connected and take manual control")
+    async with lab.lock:
+        try:
+            return await lab.worker.start_ros(request)
+        except (MotionError, ValueError, RuntimeError) as error:
+            raise HTTPException(409, str(error)) from error
+
+
+@app.post("/api/ros/velocity")
+async def ros_velocity(command: RosVelocity):
+    require_ros()
+    worker = require_ros_owner()
+    try:
+        return await worker.ros_velocity(command)
+    except (MotionError, ValueError, RuntimeError) as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/api/spatial")
+async def configure_spatial(settings: SpatialSettings):
+    if lab.lock.locked() or (not settings.enabled and (lab.agent.active or lab.worker.latest.get("busy"))):
+        raise HTTPException(409, "Take manual control before changing spatial sensing")
+    async with lab.lock:
+        try:
+            return await lab.worker.configure_spatial(settings)
+        except MotionError as error:
+            raise HTTPException(409, str(error)) from error
+
+
+async def continuous_operation(request, scan=False):
+    if lab.agent.active or lab.lock.locked() or lab.worker.latest.get("busy"):
+        raise HTTPException(409, "Take manual control and wait for motion to finish")
+    if not lab.connections:
+        raise HTTPException(409, "Keep the operator interface connected during continuous navigation")
+    async with lab.lock:
+        try:
+            return await (lab.worker.scan_continuous(request) if scan else lab.worker.start_continuous(request))
+        except (MotionError, ValueError) as error:
+            raise HTTPException(409, str(error)) from error
+
+
+@app.post("/api/continuous/scan")
+async def continuous_scan(request: ContinuousScan):
+    return await continuous_operation(request, scan=True)
+
+
+@app.post("/api/continuous/start")
+async def continuous_start(request: ContinuousTarget):
+    return await continuous_operation(request)
+
+
+@app.get("/api/spatial/{run_id}/{sequence}/{kind}")
+async def spatial_frame(run_id: str, sequence: int, kind: Literal["rgb.png", "depth.png", "depth.json"]):
+    worker = lab.worker
+    def read(sim):
+        if sim.run_id != run_id or sequence not in worker.spatial_frames:
+            raise HTTPException(404, "Spatial frame no longer retained")
+        return worker.spatial_frames[sequence]
+    try:
+        observation, rgb, depth = await worker.call(read)
+    except RuntimeError as error:
+        if worker.closed or worker is not lab.worker:
+            raise HTTPException(404, "Spatial frame belongs to a closed episode") from error
+        raise
+    if kind == "depth.json":
+        return Response(observation.model_dump_json(), media_type="application/json", headers={"Cache-Control": "no-store"})
+    return Response(rgb if kind == "rgb.png" else depth, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/local-navigation/status")
@@ -100,6 +390,15 @@ def local_navigation_status(response: Response):
         return {"test": read_navigation_progress()}
     except (OSError, ValueError) as error:
         raise HTTPException(503, "Local navigation status is temporarily unavailable") from error
+
+
+@app.post("/api/local-navigation/unload")
+async def unload_local_navigation():
+    if lab.agent.active or lab.lock.locked() or lab.worker.latest.get("busy"):
+        raise HTTPException(409, "Stop robot control before unloading the local model")
+    async with lab.lock:
+        await lab.local_navigation.close()
+    return lab.local_navigation.public()
 
 
 @app.get("/api/textures/{name}.png")
@@ -115,7 +414,7 @@ async def robot_calibration():
 
 
 @app.get("/api/tools")
-async def tools(execution_mode: Literal["single_step", "navigation_plan", "supervised_policy"] = "single_step"):
+async def tools(execution_mode: Literal["single_step", "navigation_plan", "supervised_policy", "local_navigation", "luna_navigation", "luna_continuous"] = "luna_navigation"):
     return robot_tools(execution_mode) if execution_mode != "single_step" else tool_schemas()
 
 
@@ -138,6 +437,7 @@ async def place_robot(placement: ManualPlacement):
     async with lab.lock:
         try:
             await lab.worker.reposition(placement)
+            lab.agent.navigation_memory.bind(placement.run_id, placement.episode_epoch, reset=True)
         except MotionError as error:
             raise HTTPException(409 if error.code in {"STALE_STATE", "CANCELLED", "OBJECT_HELD"} else 422, str(error)) from error
     return lab.state()
@@ -168,7 +468,9 @@ async def reset():
 
 
 @app.get("/api/challenges")
-async def challenges():
+async def challenges(environment: Literal["standalone", "shared_apartment_v1"] = "standalone"):
+    if environment == "shared_apartment_v1":
+        return [shared_apartment(identifier).public() for identifier in ("furniture_circuit", "apartment", "flat_kitchen", "recharge")]
     return [preset.public() for preset in PRESETS.values()]
 
 
@@ -176,7 +478,7 @@ async def challenges():
 async def load_challenge(selection: ChallengeLoad):
     lab.worker.stop()
     await lab.agent.halt("Challenge changed")
-    return await lab.reset(selection.challenge_id)
+    return await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction, selection.environment)
 
 
 @app.get("/api/agent")
@@ -233,6 +535,17 @@ async def policy_readiness(config: PolicyConfig):
 @app.post("/api/agent/chat")
 async def chat_message(settings: ChatStart):
     return await start_agent(settings)
+
+
+@app.post("/api/agent/instruction")
+async def run_instruction(instruction: RunInstruction):
+    if not lab.connections or lab.lock.locked() or lab.interaction_mode != "chat":
+        raise HTTPException(409, "Keep the operator connected and wait for any episode transition")
+    async with lab.lock:
+        try:
+            return await lab.agent.redirect(lab.worker, instruction)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(409, str(error)) from error
 
 
 @app.post("/api/agent/start")
@@ -302,6 +615,7 @@ async def voice_session(socket: WebSocket):
                 raise ValueError("Configure the Foundry Realtime resource endpoint and deployment first")
             await lab.agent.halt("Voice takeover")
             controller = VoiceController(lab.agent.config, lab.realtime_config, lab.voice_factory)
+            controller.local_navigation_factory = lab.agent.local_navigation_factory
             controller.start_voice(lab.worker, settings, socket)
             lab.agent = controller
         await asyncio.shield(controller.task)
@@ -355,7 +669,8 @@ async def live(socket: WebSocket):
         lab.connections -= 1
         if lab.connections == 0:
             lab.worker.stop()
-            await lab.agent.halt("Operator disconnected")
+            with CancelScope(shield=True):
+                await lab.agent.halt("Operator disconnected")
 
 
 dist = Path(__file__).resolve().parents[1] / "frontend" / "dist"

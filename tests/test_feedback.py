@@ -89,3 +89,113 @@ def test_camera_batch_bounds_deduplicates_and_labels_paired_historical_sensors()
     assert len([part for part in message["content"] if part["type"] == "input_image"]) == 3
     assert camera_batch(frames[-1], frames, 1, frames[0])[1] == [frames[-1]]
     assert camera_batch(frames[-1], [frames[-1]] * 8, 8)[1] == [frames[-1]]
+
+
+def history_sample(sequence, color="gray", head=(0., .1), pose=(0., 0., 0.), flash=False):
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+    from backend.contracts import SpatialObservation
+    from backend.spatial import calibration
+    image = Image.new("RGB", (160, 120), color)
+    if flash:
+        ImageDraw.Draw(image).rectangle((75, 35, 95, 55), fill="red")
+    output = BytesIO()
+    image.save(output, format="PNG")
+    sensor = SpatialObservation(run_id="history-test", episode_epoch=0, sequence=sequence,
+        captured_at=sequence * .2, simulated_time_s=sequence * .2, head_rad=list(head), odometry_m_rad=list(pose),
+        calibration=calibration(160, 120), depth_m=[None] * (160 * 120))
+    return sensor, output.getvalue()
+
+
+def test_motion_camera_history_preserves_brief_sighting_across_long_review_interval():
+    from backend.visual_history import CameraHistory
+    now = [0.]
+    history = CameraHistory("history-test", 0, clock=lambda: now[0])
+    flash_image = None
+    for sequence in range(1, 301):
+        sensor, image = history_sample(sequence, flash=sequence == 5)
+        now[0] = sensor.captured_at
+        assert history.record(sensor, image)
+        if sequence == 5:
+            flash_image = image
+    metadata, sheet = history.review(300)
+    assert len(history.recent) == 50 and len(history.keyframes) == 2
+    assert [frame["sequence"] for frame in metadata["frames"]] == [1, 5]
+    assert sheet is not None and metadata["frames"][1]["age_s"] > 50
+    assert history.original(metadata["frames"][1]["frame_id"])[1] == flash_image
+    assert history.review(300)[0]["frames"] == metadata["frames"]
+    history.acknowledge(metadata["generation"], 300)
+    assert history.review(300)[1] is None
+    assert history.original(metadata["frames"][1]["frame_id"])[1] == flash_image
+    for sequence in range(301, 321):
+        sensor, image = history_sample(sequence)
+        now[0] = sensor.captured_at
+        history.record(sensor, image)
+    history.acknowledge(metadata["generation"], 300)
+    assert history.review(320)[1] is None
+
+
+def test_motion_camera_history_selects_pose_and_visual_diversity_and_keeps_native_pixels():
+    from io import BytesIO
+    from PIL import Image
+    from backend.visual_history import CameraHistory
+    now = [0.]
+    history = CameraHistory("history-test", 0, clock=lambda: now[0])
+    for sequence in range(1, 25):
+        sensor, image = history_sample(sequence, head=(sequence * .2, .1), pose=(sequence * .15, 0., 0.))
+        now[0] = sensor.captured_at
+        history.record(sensor, image)
+    metadata, sheet = history.review(24)
+    assert len(history.keyframes) <= 6 and len(metadata["frames"]) == 4
+    assert metadata["frames"][0]["sequence"] == 1
+    assert [frame["sequence"] for frame in metadata["frames"]] == sorted(frame["sequence"] for frame in metadata["frames"])
+    assert all(frame["sequence"] < 24 and not frame["authorizes_motion"] for frame in metadata["frames"])
+    with Image.open(BytesIO(sheet)) as montage:
+        assert montage.size == (332, 332)
+        for index, frame in enumerate(metadata["frames"]):
+            left, top = 4 + index % 2 * 164, 54 + index // 2 * 154
+            with Image.open(BytesIO(history.original(frame["frame_id"])[1])) as original:
+                assert montage.crop((left, top, left + 160, top + 120)).tobytes() == original.convert("RGB").tobytes()
+
+
+def test_motion_camera_history_rejects_stale_wrong_episode_and_invalidates_originals():
+    from backend.visual_history import CameraHistory
+    now = [1.]
+    history = CameraHistory("history-test", 0, clock=lambda: now[0])
+    sensor, image = history_sample(5)
+    assert not history.record(sensor.model_copy(update={"episode_epoch": 1}), image)
+    assert not history.record(sensor.model_copy(update={"captured_at": 2.}), image)
+    assert not history.record(sensor.model_copy(update={"captured_at": -1.}), image)
+    assert history.record(sensor, image)
+    assert not history.record(sensor, image)
+    metadata, _ = history.review(6)
+    identifier = metadata["frames"][0]["frame_id"]
+    with pytest.raises(ValueError, match="generation"):
+        history.acknowledge("old-generation", 5)
+    with pytest.raises(ValueError, match="not offered"):
+        CameraHistory("history-test", 1).original(identifier)
+    now[0] = 302.
+    with pytest.raises(ValueError, match="expired"):
+        history.original(identifier)
+    assert not history.recent and not history.keyframes and history.reference is None
+
+
+def test_motion_camera_history_bounds_originals_and_acknowledges_only_reviewed_capture():
+    from backend.visual_history import CameraHistory
+    now = [0.]
+    history = CameraHistory("history-test", 0, clock=lambda: now[0])
+    pending = None
+    for sequence in range(1, 101):
+        sensor, image = history_sample(sequence, pose=(sequence * .4, 0., 0.))
+        now[0] = sensor.captured_at
+        history.record(sensor, image)
+        if sequence % 5 == 0 and sequence <= 90:
+            review, _ = history.review(sequence)
+            assert len(history.retained) <= 24 and len(history.recent) <= 50 and len(history.keyframes) <= 6 and len(history.pending_keyframes) <= 6
+            for frame in review["available_frames"]:
+                assert history.original(frame["frame_id"])[1] == image
+            if sequence == 90:
+                pending = review
+    history.acknowledge(pending["generation"], pending["through_sequence"])
+    review, _ = history.review(100)
+    assert review["frames"] and all(90 < frame["sequence"] < 100 for frame in review["frames"])

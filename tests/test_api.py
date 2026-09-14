@@ -9,11 +9,423 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_foundry_environment(monkeypatch):
     from importlib import import_module
+    monkeypatch.setenv("MILO_RENDERER", "tiny")
     monkeypatch.setattr(import_module("backend.app"), "load_dotenv", lambda *args, **kwargs: None)
     for name in ("FOUNDRY_ENDPOINT", "FOUNDRY_PROJECT_ENDPOINT", "project_endpoint", "FOUNDRY_MODELS_JSON",
                  "FOUNDRY_DEPLOYMENT", "deployment_name", "AZURE_AI_MODEL_DEPLOYMENT_NAME",
                  "FOUNDRY_REALTIME_ENDPOINT", "FOUNDRY_REALTIME_DEPLOYMENT", "FOUNDRY_REALTIME_VOICE"):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize("ending", ["stop", "agent/takeover", "reset", "disconnect"])
+def test_browser_session_recording_survives_api_lifecycle(tmp_path, monkeypatch, ending):
+    import time
+    from backend import session_recording, saved_results
+    from tests.test_agent import ScriptedModel, model_response
+    monkeypatch.setattr(session_recording, "SESSION_RESULTS_ROOT", tmp_path / "performance")
+    monkeypatch.setattr(saved_results, "RESULTS_ROOT", tmp_path)
+    with TestClient(app) as client:
+        state = client.post("/api/challenges/load", json={"challenge_id": "park"}).json()
+        client.post("/api/agent/config", json={"endpoint": "https://test.openai.azure.com", "models": [
+            {"id": "luna", "label": "Scripted test", "deployment": "test-deployment"}]})
+        lab.agent.model_factory = lambda config: ScriptedModel([model_response(arguments='{"linear_mps":0.1,"angular_radps":0,"duration_s":0.5}'), "wait"])
+        lab.agent.recording_evidence = "scripted_test"
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            started = client.post("/api/agent/start", json={"run_id": state["run_id"], "episode_epoch": state["episode_epoch"],
+                "goal": "Scripted recording lifecycle", "max_turns": 2, "feedback_interval_s": .25})
+            assert started.status_code == 200
+            deadline = time.monotonic() + 10
+            while client.get("/api/state").json()["snapshot"]["simulated_time_s"] < .5:
+                assert time.monotonic() < deadline
+                time.sleep(.02)
+            if ending != "disconnect":
+                assert client.post(f"/api/{ending}").status_code == 200
+        deadline = time.monotonic() + 10
+        while True:
+            data = client.get("/api/test-results").json()["batches"]
+            if data and data[0]["trials"][0]["recording_complete"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(.02)
+        assert len(data) == 1 and data[0]["evidence"] == "scripted_test"
+        trial = data[0]["trials"][0]
+        assert trial["termination"] == "interrupted" and trial["distance_m"] > .02
+        route = client.get(trial["trajectory_url"])
+        assert route.status_code == 200 and route.json()["scene"]["source"] == "recorded_initial"
+        assert client.get(trial["image_url"]).status_code == 200
+        assert lab.worker.recorder is None and not lab.agent.recording_active
+
+
+def test_saved_test_results_are_read_only_private_and_support_legacy_reports(tmp_path, monkeypatch):
+    import json
+    from PIL import Image
+    from backend import saved_results
+    root = tmp_path / "runtime"
+    directory = root / "past-run"
+    (directory / "park").mkdir(parents=True)
+    (directory / "experiment.json").write_text(json.dumps({"mode": "luna_continuous", "stage": "challenges",
+        "cases": [{"case_id": "park", "challenge": "park"}, {"case_id": "missing", "challenge": "park"}], "secret": "not-public"}))
+    (directory / "summary.json").write_text(json.dumps([{"case_id": "park", "challenge": "park", "real_luna": True,
+        "physics_success": True, "input_tokens": 10, "secret": "not-public", "recording_scorecard": {
+            "complete_recording": True, "completion_time_s": 12., "contact_episodes": 0}}]))
+    Image.new("RGB", (160, 120), "red").save(directory / "park/terminal.png")
+    (directory / "park/recording").mkdir()
+    (directory / "park/recording/trajectory.jsonl").write_text("\n".join(json.dumps({
+        "position_m": [-2 + index / 1000, .5, .1], "wall_s": index / 20, "collisions": ["contact"] if index == 7 else [],
+        "manual_placements": int(index >= 10), "physics_status": "completed" if index == 3000 else "in_progress",
+        "activity": "driving", "secret": "not-public"}) for index in range(3001)))
+    (root / "older").mkdir()
+    (root / "older/experiment.json").write_text(json.dumps({"mode": "luna_continuous", "challenges": ["park", "apartment"]}))
+    (root / "older/summary.json").write_text(json.dumps([{"challenge": "park", "physics_success": True, "real_luna": True}]))
+    (root / "broken").mkdir()
+    (root / "broken/experiment.json").write_text("{")
+    (root / "performance").mkdir()
+    (root / "performance/index.jsonl").write_text(json.dumps({"output": str(tmp_path.parent)}) + "\ninvalid")
+    monkeypatch.setattr(saved_results, "RESULTS_ROOT", root)
+    with TestClient(app) as client:
+        before = client.get("/api/state").json()
+        connections = lab.connections
+        response = client.get("/api/test-results")
+        assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
+        data = response.json()
+        assert len(data["batches"]) == 2 and data["skipped"] == 1 and "not-public" not in response.text
+        older = next(batch for batch in data["batches"] if batch["name"] == "older")
+        assert older["planned"] == 2 and older["successes"] == 0 and older["trials"][0]["status"] == "Unverified pass"
+        assert older["trials"][1]["status"] == "Missing report"
+        batch = next(batch for batch in data["batches"] if batch["name"] == "past-run")
+        assert batch["legacy"] and batch["planned"] == 2 and batch["successes"] == 1
+        assert batch["trials"][1]["status"] == "Missing report"
+        image = client.get(batch["trials"][0]["image_url"])
+        assert image.status_code == 200 and image.headers["content-type"] == "image/png"
+        route = client.get(batch["trials"][0]["trajectory_url"])
+        assert route.status_code == 200 and "not-public" not in route.text
+        assert route.headers["cache-control"] == "no-store" and route.json()["evaluation_only"]
+        trajectory = route.json()
+        assert trajectory["sample_count"] == 3001 and trajectory["downsampled"] and len(trajectory["points"]) <= 1501
+        assert trajectory["points"][0]["x"] == -2 and trajectory["points"][-1]["x"] == 1
+        assert trajectory["points"][-1]["wall_s"] == 150 and trajectory["points"][-1]["status"] == "completed"
+        assert trajectory["points"][0]["segment"] == 0 and trajectory["points"][-1]["segment"] == 1
+        assert trajectory["contacts"][0]["wall_s"] == .35 and trajectory["bounds_m"] == [-2, .5, 1., .5]
+        assert trajectory["scene"]["source"] == "reconstructed_current"
+        assert trajectory["scene"]["evaluation_only"] and trajectory["scene"]["geometry"]
+        assert batch["trials"][1]["trajectory_url"] is None
+        assert client.get(f"/api/test-results/{batch['id']}/trajectories/-1").status_code == 404
+        assert client.get("/api/test-results/unknown/trajectories/0").status_code == 404
+        assert client.get(batch["trials"][0]["trajectory_url"], headers={"Origin": "https://untrusted.example"}).status_code == 403
+        assert client.get(f"/api/test-results/{batch['id']}/images/-1").status_code == 404
+        assert client.get("/api/test-results/unknown/images/0").status_code == 404
+        assert client.get("/api/test-results", headers={"Origin": "https://untrusted.example"}).status_code == 403
+        after = client.get("/api/state").json()
+        assert after["run_id"] == before["run_id"] and after["snapshot"] == before["snapshot"] and lab.connections == connections
+    assert saved_results.saved_results(tmp_path / "empty")["batches"] == []
+
+
+def test_saved_results_index_partial_reports_and_path_boundaries(tmp_path, monkeypatch):
+    import json
+    from backend import saved_results
+    root = tmp_path / "runtime"
+    nested = root / "performance/batches/deep/run"
+    (nested / "park").mkdir(parents=True)
+    (nested / "experiment.json").write_text(json.dumps({"schema_version": 2, "stage": "challenges", "mode": "reference",
+        "design": {"label": "control-v2", "source_sha256": "a" * 64}, "evidence": "scripted_reference",
+        "started_at": "2026-09-13T12:00:00Z", "cases": [{"case_id": "park", "challenge": "park"},
+            {"case_id": "../outside", "challenge": "park"}]}))
+    (nested / "park/report.json").write_text(json.dumps({"physics_success": True, "manual_placements": 1,
+        "input_tokens": float("nan"), "recording_scorecard": {"complete_recording": True, "completion_time_s": 5.}}))
+    (root / "performance/index.jsonl").write_text(json.dumps({"output": str(nested)}) + "\n" + json.dumps({"output": str(tmp_path)}))
+    data = saved_results.saved_results(root)
+    assert len(data["batches"]) == 1
+    batch = data["batches"][0]
+    assert batch["design"] == "control-v2" and not batch["legacy"] and batch["date_source"] == "recorded"
+    assert batch["evidence"] == "scripted_reference" and batch["successes"] == 0
+    assert batch["trials"][0]["status"] == "Assisted pass" and batch["trials"][0]["input_tokens"] is None
+    assert batch["trials"][1]["image_url"] is None
+    assert not saved_results.local_file(tmp_path / "outside.json", root)
+    with pytest.raises(ValueError, match="unavailable"):
+        saved_results.terminal_image(batch["id"], 1, root)
+    monkeypatch.setattr(saved_results, "MAX_FILE_BYTES", 1)
+    with pytest.raises(ValueError, match="Unavailable"):
+        saved_results.read_json(nested / "experiment.json", root)
+
+
+@pytest.mark.parametrize("content", ["", "{", "[]", '{"position_m":[NaN,0],"wall_s":0}',
+    '{"position_m":[0,0],"wall_s":-1}', '{"position_m":[0,0],"wall_s":1}\n{"position_m":[0,0],"wall_s":0}'])
+def test_saved_trajectory_rejects_invalid_records(tmp_path, monkeypatch, content):
+    import hashlib
+    import json
+    from backend import saved_results
+    directory = tmp_path / "run"
+    (directory / "park/recording").mkdir(parents=True)
+    (directory / "experiment.json").write_text(json.dumps({"cases": [{"case_id": "park", "challenge": "park"}]}))
+    path = directory / "park/recording/trajectory.jsonl"
+    path.write_text(content)
+    identifier = hashlib.sha256(b"run").hexdigest()[:20]
+    with pytest.raises(ValueError):
+        saved_results.recorded_trajectory(identifier, 0, tmp_path)
+    path.write_text('{"position_m":[0,0],"wall_s":0}')
+    assert len(saved_results.recorded_trajectory(identifier, 0, tmp_path)["points"]) == 1
+    monkeypatch.setattr(saved_results, "MAX_TRAJECTORY_BYTES", 1)
+    with pytest.raises(ValueError):
+        saved_results.recorded_trajectory(identifier, 0, tmp_path)
+
+
+def test_saved_scene_uses_recorded_transforms_and_rejects_unsafe_data(tmp_path):
+    import json
+    from backend.saved_results import trajectory_scene
+    scene = {"schema_version": 1, "coordinate_frame": "recorded_world_xy_m", "robot_body_id": 7,
+        "snapshot": {"simulated_time_s": 0, "poses": [
+            {"key": "1:-1", "position": [-2, 3, .5], "quaternion": [0, 0, 1, 0]},
+            {"key": "7:-1", "position": [0, 0, 0], "quaternion": [0, 0, 0, 1]}]},
+        "geometry": [{"key": "1:-1", "type": 3, "dimensions": [1, 2, 1], "color": [.5, .5, .5, 1],
+            "position": [.1, 0, 0], "quaternion": [0, 0, 0, 1], "name": "table", "texture": "https://untrusted.example/secret.png", "secret": "private"},
+            {"key": "7:-1", "name": "robot"}], "secret": "private"}
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps(scene))
+    result = trajectory_scene(tmp_path, "furniture_circuit", tmp_path)
+    assert result["source"] == "recorded_initial" and result["evaluation_only"]
+    assert len(result["geometry"]) == 1 and result["geometry"][0]["texture"] is None
+    assert result["poses"][0]["position"] == [-2, 3, .5] and result["poses"][0]["quaternion"] == [0, 0, 1, 0]
+    assert "private" not in json.dumps(result) and "untrusted" not in json.dumps(result)
+    scene["geometry"][0]["position"][0] = float("nan")
+    path.write_text(json.dumps(scene))
+    assert trajectory_scene(tmp_path, "furniture_circuit", tmp_path) is None
+    path.write_text("{")
+    assert trajectory_scene(tmp_path, "furniture_circuit", tmp_path) is None
+    path.unlink()
+    rebuilt = trajectory_scene(tmp_path, "furniture_circuit", tmp_path)
+    assert rebuilt["source"] == "reconstructed_current"
+    assert any("table" in asset["name"] for asset in rebuilt["geometry"])
+    assert trajectory_scene(tmp_path, "unknown-scenario", tmp_path) is None
+    shared = trajectory_scene(tmp_path, "apartment", tmp_path, "shared_apartment_v1")
+    assert shared["source"] == "reconstructed_current"
+    assert any(asset["name"] == "charger_pad" for asset in shared["geometry"])
+    assert not any(asset["name"] == "charger_pad" for asset in trajectory_scene(tmp_path, "apartment", tmp_path)["geometry"])
+    assert trajectory_scene(tmp_path, "apartment", tmp_path, "unknown-environment") is None
+    from backend.saved_results import normalize_trial
+    normalized = normalize_trial({}, {"challenge": "apartment", "environment": "shared_apartment_v1"}, 0, "batch", tmp_path, tmp_path, "scripted_test")
+    assert normalized["environment"] == "shared_apartment_v1"
+
+
+def test_enhanced_is_app_default_and_renderer_survives_episode_reset(monkeypatch):
+    monkeypatch.delenv("MILO_RENDERER", raising=False)
+    with TestClient(app) as client:
+        initial = client.get("/api/state").json()
+        assert initial["rendering"] == "enhanced"
+        resources = lab.render_resources
+        process = resources.renderer.process
+        initial_image = client.get(initial["camera"]["url"])
+        assert initial_image.status_code == 200 and initial_image.content.startswith(b"\x89PNG")
+        reset = client.post("/api/reset")
+        assert reset.status_code == 200
+        current = reset.json()
+        assert current["rendering"] == "enhanced" and current["run_id"] != initial["run_id"]
+        assert lab.render_resources is resources and resources.renderer.process is process
+        assert process.poll() is None and current["snapshot"]["simulated_time_s"] == 0
+        assert client.get(initial["camera"]["url"]).status_code == 404
+        assert client.get(current["camera"]["url"]).status_code == 200
+    assert process.poll() is not None and lab.render_resources is None
+
+
+@pytest.mark.parametrize("interruption", ["stop", "takeover", "reset", "disconnect", "stale_map", "blocked_map"])
+def test_continuous_navigation_ownership_and_interruptions(interruption):
+    import time
+    with TestClient(app) as client:
+        state = client.post("/api/challenges/load", json={"challenge_id": "park"}).json()
+        envelope = {"run_id": state["run_id"], "episode_epoch": state["episode_epoch"]}
+        assert client.post("/api/continuous/scan", json=envelope).status_code == 409
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            scanned = client.post("/api/continuous/scan", json=envelope | {"compact_arms": True})
+            assert scanned.status_code == 200
+            fresh = client.get("/api/spatial").json()
+            selection = envelope | {"spatial_sequence": fresh["frame"]["sequence"], "pixel": [.5, .4]}
+            started = client.post("/api/continuous/start", json=selection)
+            assert started.status_code == 200, started.text
+            assert client.post("/api/continuous/start", json=selection).status_code == 409
+            assert client.post("/api/spatial", json=envelope | {"enabled": False}).status_code == 409
+            worker = lab.worker
+            if interruption in {"stale_map", "blocked_map"}:
+                def invalidate(sim):
+                    worker._sample_spatial = lambda force=False: None
+                    if interruption == "stale_map":
+                        worker.spatial_map.captured_at = time.monotonic() - 2
+                    else:
+                        worker.spatial_map.cells[:] = 100
+                client.portal.call(worker.call, invalidate)
+                deadline = time.monotonic() + 3
+                while worker.continuous.active and time.monotonic() < deadline:
+                    time.sleep(.02)
+                assert worker.continuous.status == "blocked"
+                assert "SPATIAL_STALE" in worker.continuous.reason if interruption == "stale_map" else "OBSERVED_PATH_BLOCKED" in worker.continuous.reason
+                assert not worker.navigation.buffer
+            elif interruption != "disconnect":
+                path = {"stop": "/api/stop", "takeover": "/api/agent/takeover", "reset": "/api/reset"}[interruption]
+                assert client.post(path).status_code == 200
+        deadline = time.monotonic() + 3
+        while worker.continuous.active and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert not worker.continuous.active and not worker.navigation.buffer
+        ticks = worker.sim.ticks
+        time.sleep(.1)
+        assert worker.sim.ticks == ticks
+        assert client.post("/api/continuous/start", json=selection).status_code == 409
+
+
+@pytest.mark.parametrize("interruption", ["stop", "takeover", "reset", "disconnect"])
+def test_ros_navigation_ownership_and_interruptions(monkeypatch, interruption):
+    import time
+    monkeypatch.delenv("MILO_ROS_ENABLED", raising=False)
+    with TestClient(app) as client:
+        assert client.get("/api/ros/sensors").status_code == 404
+        assert client.get("/api/ros/status").json()["enabled"] is False
+        monkeypatch.setenv("MILO_ROS_ENABLED", "1")
+        state = client.post("/api/challenges/load", json={"challenge_id": "park"}).json()
+        assert client.get("/api/ros/status").json()["enabled"] is True
+        variant = client.get("/api/test-variant?navigation_backend=nav2").json()
+        assert variant["supports_navigation_backend"] and variant["architecture"]["id"] == "nav2-supervised"
+        assert client.get("/api/test-variant?navigation_backend=nav2&reasoning=none").status_code == 200
+        odometry = client.get("/api/ros/odometry").json()
+        assert odometry["run_id"] == state["run_id"] and "sequence" not in odometry and "head_rgb_png" not in odometry
+        goal = {"run_id": state["run_id"], "episode_epoch": state["episode_epoch"], "target_m_rad": [1., 0., 0.]}
+        assert client.post("/api/ros/start", json=goal).status_code == 409
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            result = client.post("/api/ros/start", json=goal)
+            assert result.status_code == 200, result.text
+            worker = lab.worker
+            sensor = client.get("/api/ros/sensors").json()
+            assert "snapshot" not in sensor and "objects" not in sensor and "challenge" not in sensor
+            assert len(sensor["laser"]["ranges_m"]) == 720
+            command = {"session_id": result.json()["session_id"], "sensor_sequence": sensor["sequence"],
+                "command_sequence": 1, "linear_mps": .1, "angular_radps": 0.}
+            accepted = client.post("/api/ros/velocity", json=command)
+            assert accepted.status_code == 200, accepted.text
+            assert client.post("/api/ros/velocity", json=command).status_code == 409
+            assert client.post("/api/command", json={}).status_code == 409
+            assert client.post("/api/agent/start", json={}).status_code == 409
+            if interruption != "disconnect":
+                path = {"stop": "/api/stop", "takeover": "/api/agent/takeover", "reset": "/api/reset"}[interruption]
+                assert client.post(path).status_code == 200
+        client.portal.call(worker.call, lambda sim: None) if not worker.closed else None
+        assert not worker.ros_navigation.active and not worker.navigation.buffer
+        ticks = worker.sim.ticks
+        time.sleep(.1)
+        assert worker.sim.ticks == ticks
+        assert client.post("/api/ros/velocity", json=command | {"command_sequence": 2}).status_code == 409
+
+
+@pytest.mark.parametrize("mode", ["luna_continuous", "luna_navigation"])
+def test_run_chat_redirects_same_episode_and_preserves_memory(monkeypatch, mode):
+    import asyncio
+    import time
+    from backend.agent import AgentController
+    from backend.contracts import Command
+    goals = []
+
+    async def scripted(self, worker, settings, profile, stop_revision):
+        goals.append(settings.goal)
+        try:
+            assert await worker.resume_manual(expected_stop_revision=stop_revision)
+            before, _ = await worker.feedback()
+            if len(goals) == 1:
+                result = await worker.execute(Command(run_id=worker.sim.run_id, episode_epoch=worker.epoch,
+                    observation_seq=before.seq, action_id="chat-test-drive", tool="drive_base",
+                    arguments={"linear_mps": .1, "angular_radps": 0., "duration_s": .5}), assisted=False)
+                self.navigation_memory.remember(before, result.observation, {"action": "navigate"}, {"status": "ok"})
+            self.state["phase"] = "thinking"
+            await asyncio.Event().wait()
+        finally:
+            worker.stop()
+            await worker.hold_stopped()
+
+    monkeypatch.setattr(AgentController, "_run", scripted)
+    with TestClient(app) as client:
+        state = client.post("/api/challenges/load", json={"challenge_id": "park"}).json()
+        client.post("/api/agent/config", json={"endpoint": "https://test.openai.azure.com"})
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            assert client.post("/api/agent/start", json={"run_id": state["run_id"], "episode_epoch": state["episode_epoch"],
+                "execution_mode": mode, "goal": "Original instruction"}).status_code == 200
+            deadline = time.monotonic() + 4
+            while lab.agent.state["phase"] != "thinking" and time.monotonic() < deadline:
+                time.sleep(.02)
+            previous = client.get("/api/state").json()
+            instruction = {"run_id": state["run_id"], "episode_epoch": state["episode_epoch"],
+                "session_id": previous["agent"]["session_id"], "message": "Inspect the doorway on the right"}
+            assert client.post("/api/agent/instruction", json=instruction | {"message": " "}).status_code == 422
+            assert client.post("/api/agent/instruction", json=instruction, headers={"Origin":"https://untrusted.example"}).status_code == 403
+            response = client.post("/api/agent/instruction", json=instruction)
+            assert response.status_code == 200, response.text
+            after = client.get("/api/state").json()
+            assert after["run_id"] == previous["run_id"] and after["episode_epoch"] == previous["episode_epoch"]
+            assert after["snapshot"]["simulated_time_s"] == previous["snapshot"]["simulated_time_s"] == .5
+            assert after["agent"]["goal"] == instruction["message"]
+            assert len(after["agent"]["run_memory"]["recent_actions"]) >= 2
+            assert client.post("/api/agent/instruction", json=instruction).status_code == 409
+            lab.agent.state["turns"] = lab.agent.state["max_turns"]
+            paused = client.post("/api/agent/instruction", json=instruction | {"session_id": after["agent"]["session_id"], "message": "stop"})
+            assert paused.status_code == 200 and not paused.json()["active"]
+            assert client.get("/api/state").json()["stopped"]
+            assert goals == ["Original instruction", instruction["message"]]
+        reset = client.post("/api/reset").json()
+        assert not reset["agent"]["run_memory"]["recent_actions"] and not reset["agent"]["run_messages"]
+
+
+def test_spatial_sensor_opt_in_pairing_and_episode_reset():
+    from io import BytesIO
+    from PIL import Image
+    with TestClient(app) as client:
+        before = client.get("/api/state").json()
+        assert not client.get("/api/spatial").json()["enabled"]
+        payload = {"run_id": before["run_id"], "episode_epoch": before["episode_epoch"], "enabled": True}
+        response = client.post("/api/spatial", json=payload)
+        assert response.status_code == 200
+        spatial = response.json()
+        assert spatial["enabled"] and not spatial["map"]["stale"]
+        frame = spatial["frame"]
+        rgb = client.get(frame["rgb_url"])
+        depth = client.get(frame["depth_url"])
+        raw = client.get(frame["data_url"]).json()
+        assert Image.open(BytesIO(rgb.content)).size == Image.open(BytesIO(depth.content)).size == (160, 120)
+        assert raw["sequence"] == frame["sequence"] and raw["captured_at"] == frame["captured_at"]
+        assert len(raw["depth_m"]) == 160 * 120
+        assert client.get("/api/state").json()["observation"] == before["observation"]
+        assert client.get("/api/state").json()["snapshot"]["simulated_time_s"] == 0
+        assert client.post("/api/spatial", json=payload | {"episode_epoch": 99}).status_code == 409
+        client.post("/api/reset")
+        reset_spatial = client.get("/api/spatial").json()
+        assert reset_spatial["enabled"] and reset_spatial["frame"]["run_id"] != raw["run_id"]
+        assert client.get(frame["data_url"]).status_code == 404
+        assert client.post("/api/challenges/load", json={"challenge_id": "kitchen_bathroom"}).status_code == 200
+        assert client.get("/api/spatial").json()["enabled"]
+
+
+def test_spatial_can_enable_but_not_disable_during_model_control():
+    with TestClient(app) as client:
+        before = client.get("/api/state").json()
+        settings = {"run_id": before["run_id"], "episode_epoch": before["episode_epoch"], "enabled": False}
+        assert client.post("/api/spatial", json=settings).status_code == 200
+        lab.agent.active = True
+        try:
+            assert client.post("/api/spatial", json=settings | {"enabled": True}).status_code == 200
+            assert client.post("/api/spatial", json=settings).status_code == 409
+            assert client.get("/api/state").json()["snapshot"]["simulated_time_s"] == 0
+        finally:
+            lab.agent.active = False
+
+
+def test_spatial_reads_during_episode_replacement_are_not_server_errors(monkeypatch):
+    from types import SimpleNamespace
+
+    async def closed_read(operation):
+        raise RuntimeError("Episode closed")
+
+    with TestClient(app) as client:
+        with monkeypatch.context() as temporary:
+            temporary.setattr(lab, "worker", SimpleNamespace(closed=True, call=closed_read))
+            assert client.get("/api/spatial").status_code == 409
+            assert client.get("/api/spatial/old-run/1/depth.json").status_code == 404
 
 
 @pytest.mark.parametrize("policy_status", ["unavailable", "incompatible", "untrained", "stop_during_check"])
@@ -51,6 +463,179 @@ def test_policy_start_preflight_does_not_create_failed_sessions_or_ignore_stop(p
             assert state["agent"]["error"] is None and not state["agent"]["active"]
             assert state["agent"]["turns"] == 0 and state["snapshot"]["simulated_time_s"] == 0
             assert client.post("/api/policy/check", json={"endpoint": "http://example.com"}).status_code == 422
+
+
+@pytest.mark.parametrize("stage", ["loading", "inference"])
+@pytest.mark.parametrize("interruption", ["stop", "takeover", "reset", "mode", "disconnect"])
+def test_live_local_navigation_lifecycle_rejects_late_motion(stage, interruption):
+    import asyncio
+    import time
+    closed = []
+    waiting = []
+
+    class LocalModel:
+        @staticmethod
+        def check_available():
+            pass
+
+        async def start(self):
+            if stage == "loading":
+                waiting.append(True)
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    return
+
+        async def predict(self, observation, image):
+            if observation.navigation:
+                waiting.append(True)
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    return {"action": [.15, 0.]}
+            return {"action": [0., 0.]}
+
+        async def close(self):
+            closed.append(True)
+
+    with TestClient(app) as client:
+        lab.agent.local_navigation_factory = LocalModel
+        initial = client.post("/api/challenges/load", json={"challenge_id": "local_park"}).json()
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            response = client.post("/api/agent/start", json={"run_id": initial["run_id"],
+                "episode_epoch": initial["episode_epoch"], "goal": initial["challenge"]["goal"], "execution_mode": "local_navigation"})
+            assert response.status_code == 200 and response.json()["local_model"]["phase"] == "loading"
+            deadline = time.monotonic() + 12
+            while not waiting and time.monotonic() < deadline:
+                time.sleep(.02)
+            assert waiting
+            original = lab.worker
+            before = original.latest["snapshot"]["simulated_time_s"]
+            if interruption != "disconnect":
+                path = {"stop": "/api/stop", "takeover": "/api/agent/takeover", "reset": "/api/reset", "mode": "/api/agent/mode"}[interruption]
+                payload = {"run_id": initial["run_id"], "episode_epoch": initial["episode_epoch"], "mode": "voice"} if interruption == "mode" else {}
+                assert client.post(path, json=payload).status_code == 200
+        deadline = time.monotonic() + 3
+        while not closed and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert closed == [True] and not lab.agent.active
+        assert original.latest["snapshot"]["simulated_time_s"] == before
+        assert original.navigation is None or not original.navigation.buffer
+
+
+@pytest.mark.parametrize("challenge_id", ["bench", "recharge", "warehouse"])
+def test_live_local_navigation_uses_current_challenge_and_position_without_reset(challenge_id):
+    import asyncio
+
+    class LocalModel:
+        @staticmethod
+        def check_available():
+            pass
+
+        async def start(self):
+            await asyncio.Event().wait()
+
+        async def close(self):
+            pass
+
+    with TestClient(app) as client:
+        lab.agent.local_navigation_factory = LocalModel
+        initial = client.post("/api/challenges/load", json={"challenge_id": challenge_id}).json()
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            assert client.post("/api/robot/placement", json={"run_id": initial["run_id"], "episode_epoch": initial["episode_epoch"],
+                "observation_seq": initial["observation"]["seq"], "xy_m": [-.2, 0]}).status_code == 200
+            initial = client.get("/api/state").json()
+            assert client.post("/api/command", json={"run_id": initial["run_id"], "episode_epoch": initial["episode_epoch"],
+                "observation_seq": initial["observation"]["seq"], "action_id": "wait-before-local", "tool": "wait", "arguments": {"duration_s": .1}}).status_code == 200
+            before = client.get("/api/state").json()
+            goal = initial["challenge"]["goal"] if initial["challenge"] else "Move forward carefully and stop"
+            payload = {"run_id": initial["run_id"], "episode_epoch": initial["episode_epoch"], "goal": goal,
+                "execution_mode": "local_navigation"}
+            assert client.get("/api/tools?execution_mode=local_navigation").json() == []
+            assert client.post("/api/agent/chat", json={**payload, "message": "Move"}).status_code == 400
+            response = client.post("/api/agent/start", json=payload)
+            assert response.status_code == 200
+            assert response.json()["local_model"]["challenge_id"] == challenge_id
+            assert response.json()["goal"] == goal
+            after = client.get("/api/state").json()
+            assert after["run_id"] == before["run_id"] and after["episode_epoch"] == before["episode_epoch"]
+            assert after["challenge"] == before["challenge"] and after["manual_placements"] == 1
+            assert after["snapshot"] == before["snapshot"]
+            assert client.post("/api/agent/start", json=payload).status_code == 409
+            assert client.post("/api/stop").status_code == 200
+
+
+@pytest.mark.parametrize("unload", [False, True])
+def test_resident_model_survives_sessions_reset_disconnect_and_shuts_down(monkeypatch, unload):
+    from importlib import import_module
+    from types import SimpleNamespace
+    import time
+    from backend.local_navigation import ResidentNavigationModel
+    created, goals, resets = [], [], []
+
+    class Client:
+        alive = True
+        process = SimpleNamespace(pid=12345)
+
+        def __init__(self):
+            created.append(self)
+
+        @staticmethod
+        def check_available():
+            pass
+
+        async def start(self):
+            pass
+
+        async def reset(self):
+            resets.append(True)
+
+        async def predict(self, observation, image):
+            goals.append(self.instruction)
+            return {"action": [0., 0.]}
+
+        async def close(self):
+            self.alive = False
+
+    monkeypatch.setattr(import_module("backend.app"), "ResidentNavigationModel", lambda: ResidentNavigationModel(Client))
+    with TestClient(app) as client:
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            for challenge_id in ("local_park", "recharge"):
+                initial = client.post("/api/challenges/load", json={"challenge_id": challenge_id}).json()
+                worker = lab.worker
+                response = client.post("/api/agent/start", json={"run_id": initial["run_id"],
+                    "episode_epoch": initial["episode_epoch"], "goal": initial["challenge"]["goal"],
+                    "execution_mode": "local_navigation", "max_turns": 1})
+                assert response.status_code == 200
+                assert client.post("/api/local-navigation/unload").status_code == 409
+                deadline = time.monotonic() + 15
+                while lab.agent.active and time.monotonic() < deadline:
+                    time.sleep(.02)
+                assert not lab.agent.active and lab.agent.state["error"] is None
+                current = client.get("/api/state").json()
+                assert current["local_navigation_model"]["phase"] == "ready"
+                assert current["local_navigation_model"]["load_count"] == 1
+                assert current["local_navigation_model"]["process_id"] == 12345
+                assert "local_navigation_model" not in current["observation"]
+                assert lab.worker is worker and worker.latest["stopped"]
+                assert goals[-1] == initial["challenge"]["goal"]
+                assert client.post("/api/stop").status_code == 200
+                reset = client.post("/api/reset").json()
+                assert reset["run_id"] != current["run_id"]
+                assert reset["local_navigation_model"] == current["local_navigation_model"]
+                assert reset["agent"]["local_model"] is None
+                assert reset["snapshot"]["simulated_time_s"] == 0
+        assert len(created) == 1 and len(resets) == 2 and created[0].alive
+        assert client.get("/api/state").json()["local_navigation_model"]["phase"] == "ready"
+        assert client.post("/api/local-navigation/unload", headers={"Origin": "https://untrusted.example"}).status_code == 403
+        if unload:
+            response = client.post("/api/local-navigation/unload")
+            assert response.status_code == 200 and response.json()["phase"] == "unloaded"
+            assert not created[0].alive
+    assert not created[0].alive
 
 
 def test_local_navigation_status_is_read_only_and_never_enters_model_observations(tmp_path, monkeypatch):
@@ -110,11 +695,12 @@ def test_local_navigation_progress_write_failure_is_nonfatal(tmp_path, monkeypat
 
 
 async def test_local_navigation_progress_records_startup_failure(tmp_path, monkeypatch):
+    from types import SimpleNamespace
     from backend import local_progress
+    from scripts.navigation_policy import evaluate
     monkeypatch.setattr(local_progress, "PROGRESS_ROOT", tmp_path)
-    with pytest.raises(RuntimeError, match="startup failed"):
-        async with local_progress.track_navigation_progress(tmp_path / "candidate" / "checkpoint", 15, 30):
-            raise RuntimeError("startup failed")
+    with pytest.raises(FileNotFoundError):
+        await evaluate(SimpleNamespace(checkpoint=tmp_path / "missing" / "checkpoint", case=15, requests=30))
     result = local_progress.read_navigation_progress()
     assert result["phase"] == "failed" and result["success"] is False
 
@@ -203,6 +789,37 @@ def test_manual_placement_api_validates_destination_and_episode():
         assert replacement["manual_placements"] == 0
         assert client.post("/api/robot/placement", json=placement).status_code == 409
         assert all(tool["name"] not in {"reposition", "placement"} for tool in client.get("/api/tools").json())
+
+
+async def test_last_disconnect_finishes_cleanup_in_cancelled_socket_scope(monkeypatch):
+    import anyio
+    from types import SimpleNamespace
+    from backend.app import live
+
+    cleanup = []
+
+    async def halt(reason):
+        await anyio.lowlevel.checkpoint()
+        cleanup.append(reason)
+
+    class Socket:
+        headers = {}
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, state):
+            scope.cancel()
+            await anyio.lowlevel.checkpoint()
+
+    monkeypatch.setattr(lab, "connections", 0)
+    monkeypatch.setattr(lab, "worker", SimpleNamespace(stop=lambda: cleanup.append("stop")))
+    monkeypatch.setattr(lab, "agent", SimpleNamespace(halt=halt))
+    monkeypatch.setattr(lab, "state", lambda: {})
+    with anyio.CancelScope() as scope:
+        await live(Socket())
+    assert lab.connections == 0
+    assert cleanup == ["stop", "Operator disconnected"]
 
 
 @pytest.mark.parametrize("interruption", ["stop", "takeover", "reset", "mode", "disconnect"])
@@ -503,7 +1120,7 @@ def test_challenge_loading_resets_scene_goal_progress_and_preserves_model_config
         initial = client.get("/api/state").json()
         assert initial["challenge"] is None
         presets = client.get("/api/challenges").json()
-        assert {preset["id"] for preset in presets} == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop"}
+        assert {preset["id"] for preset in presets} == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit"}
         assert all("objects" not in preset for preset in presets)
         config = {"endpoint": "https://test.openai.azure.com", "models": [
             {"id": "model", "label": "Model", "deployment": "test-model"}]}

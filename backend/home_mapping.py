@@ -1,0 +1,352 @@
+import json
+import math
+from pathlib import Path
+import sqlite3
+import time
+from typing import Protocol
+from uuid import uuid4
+
+import numpy as np
+from scipy.ndimage import binary_dilation, distance_transform_edt, label
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import dijkstra
+
+
+class ObjectMemory(Protocol):
+    def remember_object(self, observation: dict, image: bytes) -> None: ...
+    def object_observations(self, map_id: str) -> list[dict]: ...
+
+
+def transform_pose(pose, transform):
+    cosine, sine = math.cos(transform[2]), math.sin(transform[2])
+    return [transform[0] + cosine * pose[0] - sine * pose[1],
+        transform[1] + sine * pose[0] + cosine * pose[1],
+        math.atan2(math.sin(pose[2] + transform[2]), math.cos(pose[2] + transform[2]))]
+
+
+def inverse_pose(pose):
+    cosine, sine = math.cos(pose[2]), math.sin(pose[2])
+    return [-cosine * pose[0] - sine * pose[1], sine * pose[0] - cosine * pose[1], -pose[2]]
+
+
+def laser_points(laser, pose):
+    ranges = np.array([np.nan if value is None else value for value in laser["ranges_m"]])
+    angles = laser["angle_min"] + np.arange(len(ranges)) * laser["angle_increment"] + pose[2]
+    origin = transform_pose([*laser["origin_m"][:2], 0.], pose)[:2]
+    valid = np.isfinite(ranges) & (ranges >= laser["range_min"])
+    hits = valid & (ranges <= laser["range_max"])
+    distances = np.minimum(ranges[valid], laser["range_max"])
+    endpoints = np.array(origin) + np.column_stack((np.cos(angles[valid]), np.sin(angles[valid]))) * distances[:, None]
+    return np.array(origin), endpoints, hits[valid]
+
+
+class HomeMap:
+    resolution_m = .1
+    size = 400
+
+    def __init__(self, environment_id, map_id=None):
+        self.identity = map_id or str(uuid4())
+        self.environment_id = environment_id
+        self.name = "Unsaved home"
+        self.origin = np.array([-20., -20.])
+        self.evidence = np.zeros((self.size, self.size), dtype=np.int16)
+        self.visits = np.zeros_like(self.evidence, dtype=np.uint16)
+        self.places = []
+        self.edges = []
+        self.objects = []
+        self.frontier_attempts = {}
+        self.created_at = time.time()
+        self.updated_at = self.created_at
+        self.revision = 0
+        self.scan_count = 0
+        self.saved = False
+        self.annotations_dirty = False
+
+    @property
+    def cells(self):
+        return np.where(self.evidence > 0, 100, np.where(self.evidence < 0, 0, -1)).astype(np.int8)
+
+    def indices(self, points):
+        return np.floor((np.asarray(points) - self.origin) / self.resolution_m).astype(int)
+
+    def inside(self, indices):
+        indices = np.asarray(indices)
+        return np.all((indices >= 0) & (indices < self.size), axis=-1)
+
+    def observe(self, laser, pose, timestamp):
+        if self.saved:
+            raise ValueError("SAVED_MAP_READ_ONLY: scenario observations belong to the live layer")
+        if not all(math.isfinite(value) for value in [*pose, timestamp]):
+            raise ValueError("Map pose and timestamp must be finite")
+        origin, endpoints, hits = laser_points(laser, pose)
+        free_indices = []
+        for endpoint in endpoints:
+            samples = np.linspace(origin, endpoint, max(2, math.ceil(np.linalg.norm(endpoint - origin) / .04) + 1))[:-1]
+            free_indices.append(self.indices(samples))
+        if free_indices:
+            free = np.unique(np.concatenate(free_indices), axis=0)
+            free = free[self.inside(free)]
+            self.evidence[free[:, 1], free[:, 0]] = np.maximum(-20, self.evidence[free[:, 1], free[:, 0]] - 1)
+        occupied = np.unique(self.indices(endpoints[hits]), axis=0)
+        occupied = occupied[self.inside(occupied)]
+        self.evidence[occupied[:, 1], occupied[:, 0]] = np.minimum(20, self.evidence[occupied[:, 1], occupied[:, 0]] + 4)
+        position = self.indices(pose[:2])
+        if not self.inside(position):
+            raise ValueError("MAP_BOUNDS: mapping area exceeded")
+        self.visits[position[1], position[0]] = min(65535, int(self.visits[position[1], position[0]]) + 1)
+        self.scan_count += 1
+        self.updated_at = timestamp
+
+    def allowed(self, radius_m, obstacles=()):
+        known = self.cells == 0
+        if len(obstacles):
+            indices = self.indices(obstacles)
+            indices = indices[self.inside(indices)]
+            known[indices[:, 1], indices[:, 0]] = False
+        clearance = distance_transform_edt(np.pad(known, 1))[1:-1, 1:-1] * self.resolution_m
+        return known & (clearance > radius_m + self.resolution_m)
+
+    def route(self, start, goal, radius_m, obstacles=()):
+        allowed = self.allowed(radius_m, obstacles)
+        indices = self.indices([start, goal])
+        if not self.inside(indices).all() or not allowed[indices[:, 1], indices[:, 0]].all():
+            raise ValueError("UNREACHABLE: destination or current footprint is not in mapped free space")
+        nodes = np.arange(self.size ** 2).reshape(allowed.shape)
+        sources, targets = [], []
+        for row_delta, column_delta in ((1, 0), (0, 1)):
+            source = nodes[:self.size - row_delta, :self.size - column_delta]
+            target = nodes[row_delta:, column_delta:]
+            valid = allowed[:self.size - row_delta, :self.size - column_delta] & allowed[row_delta:, column_delta:]
+            sources.extend(source[valid])
+            targets.extend(target[valid])
+        graph = coo_matrix((np.ones(len(sources)), (sources, targets)), shape=(self.size ** 2, self.size ** 2)).tocsr()
+        start_node, goal_node = indices[:, 1] * self.size + indices[:, 0]
+        distances, predecessors = dijkstra(graph, directed=False, indices=start_node, return_predecessors=True)
+        if not np.isfinite(distances[goal_node]):
+            raise ValueError("UNREACHABLE: no connected mapped route")
+        route = [list(goal)]
+        current = int(goal_node)
+        while current != start_node:
+            current = int(predecessors[current])
+            row, column = divmod(current, self.size)
+            route.append((self.origin + (np.array([column, row]) + .5) * self.resolution_m).tolist())
+        route[-1] = list(start)
+        return route[::-1]
+
+    def document(self):
+        return {"schema": "milo-home-map-v1", "map_id": self.identity, "environment_id": self.environment_id,
+            "name": self.name, "frame": "map", "units": "m_rad", "resolution_m": self.resolution_m,
+            "origin_m": self.origin.tolist(), "width": self.size, "height": self.size,
+            "created_unix_s": self.created_at, "updated_unix_s": self.updated_at, "revision": self.revision,
+            "source": "simulated_laser_and_wheel_odometry", "scan_count": self.scan_count,
+            "evidence": self.evidence.ravel().tolist(), "visits": self.visits.ravel().tolist(),
+            "places": self.places, "edges": self.edges, "objects": self.objects,
+            "frontier_attempts": self.frontier_attempts}
+
+    def add_place(self, name, kind, pose, radius_m, connects=()):
+        if not name.strip() or len(name) > 80 or kind not in {"room", "doorway", "destination"}:
+            raise ValueError("A place needs a name and a valid kind")
+        if len(self.places) >= 100 or any(place["name"].casefold() == name.strip().casefold() for place in self.places):
+            raise ValueError("Place name already exists or the map has 100 places")
+        self.route(pose[:2], pose[:2], radius_m)
+        neighbours = []
+        for identity in connects:
+            neighbour = next((place for place in self.places if place["place_id"] == identity), None)
+            if neighbour is None:
+                raise ValueError("UNKNOWN_PLACE: graph connection does not exist")
+            self.route(pose[:2], neighbour["pose_m_rad"][:2], radius_m)
+            neighbours.append(identity)
+        place = {"place_id": str(uuid4()), "name": name.strip(), "kind": kind,
+            "pose_m_rad": list(pose), "frame": "map", "map_id": self.identity,
+            "created_unix_s": time.time(), "source": "operator_annotation"}
+        self.places.append(place)
+        self.annotations_dirty = True
+        self.edges.extend({"from": place["place_id"], "to": identity, "source": "operator_connected_observed_route"}
+            for identity in neighbours)
+        return place
+
+    def frontiers(self, pose, radius_m, obstacles=(), region_id=None):
+        allowed = self.allowed(radius_m, obstacles)
+        position = self.indices(pose[:2])
+        components, _ = label(allowed)
+        if not self.inside(position) or not components[position[1], position[0]]:
+            return []
+        connected = components == components[position[1], position[0]]
+        nearby_unknown = binary_dilation(self.cells == -1, iterations=math.ceil((radius_m + .4) / self.resolution_m))
+        groups, count = label(connected & nearby_unknown)
+        region = None
+        if region_id:
+            region = next((place for place in self.places if place["place_id"] == region_id and place["kind"] == "room"), None)
+            if region is None:
+                raise ValueError("UNKNOWN_REGION: select a named room or the whole mapped area")
+        result = []
+        for group_id in range(1, count + 1):
+            rows, columns = np.where(groups == group_id)
+            if len(rows) < 3:
+                continue
+            points = self.origin + (np.column_stack((columns, rows)) + .5) * self.resolution_m
+            distances = np.linalg.norm(points - pose[:2], axis=1)
+            selected = int(np.argmin(distances + self.visits[rows, columns] * .2))
+            point = points[selected].tolist()
+            if region and math.dist(point, region["pose_m_rad"][:2]) > 3.:
+                continue
+            key = ":".join(str(int(math.floor(value / .5))) for value in point)
+            previous = self.frontier_attempts.get(key, {})
+            known = int(np.count_nonzero(self.evidence))
+            if previous.get("attempts", 0) >= 2 and known - previous.get("known_cells", known) < 25:
+                continue
+            result.append({"frontier_id": key, "position_m": point, "distance_m": float(distances[selected]),
+                "attempts": previous.get("attempts", 0), "region_scope": "within_3m_of_room_annotation" if region else "all_connected"})
+        return sorted(result, key=lambda item: item["distance_m"] + item["attempts"])[:20]
+
+    def mark_frontier(self, identity):
+        previous = self.frontier_attempts.get(identity, {})
+        self.frontier_attempts[identity] = {"attempts": previous.get("attempts", 0) + 1,
+            "known_cells": int(np.count_nonzero(self.evidence)), "last_attempt_unix_s": time.time()}
+
+    def match_scan(self, laser, seed=None):
+        _, local, hits = laser_points(laser, [0., 0., 0.])
+        local = local[hits][::4]
+        if len(local) < 20 or np.count_nonzero(self.cells == 100) < 20:
+            raise ValueError("LOCALIZATION_UNRELIABLE: insufficient measured wall returns")
+        field = distance_transform_edt(self.cells != 100) * self.resolution_m
+
+        def score(poses):
+            results = []
+            for pose in poses:
+                cosine, sine = math.cos(pose[2]), math.sin(pose[2])
+                points = local @ np.array([[cosine, sine], [-sine, cosine]]) + pose[:2]
+                indices = self.indices(points)
+                inside = self.inside(indices)
+                residuals = np.ones(len(points))
+                residuals[inside] = field[indices[inside, 1], indices[inside, 0]]
+                results.append((float(np.minimum(residuals, .6).mean()), float(np.mean(residuals <= .2)), list(pose)))
+            return sorted(results, key=lambda item: item[0])
+
+        if seed is None:
+            rows, columns = np.where(self.allowed(.25))
+            positions = np.unique(np.floor((self.origin + np.column_stack((columns, rows)) * self.resolution_m) / .4) * .4, axis=0)
+            if len(positions) > 6000:
+                raise ValueError("LOCALIZATION_SEED_REQUIRED: select an approximate saved place")
+            candidates = ([*point, heading] for point in positions for heading in np.arange(-math.pi, math.pi, math.pi / 12))
+        else:
+            if len(seed) != 3 or not np.isfinite(seed).all():
+                raise ValueError("Localization seed must be a finite map pose")
+            candidates = ([seed[0] + horizontal, seed[1] + lateral, seed[2] + heading]
+                for horizontal in np.arange(-.3, .301, .1) for lateral in np.arange(-.3, .301, .1)
+                for heading in np.arange(-.2, .201, .05))
+        coarse = score(candidates)
+        if not coarse:
+            raise ValueError("LOCALIZATION_UNRELIABLE: no known free seed positions")
+        seeds = []
+        for item in coarse:
+            if all(math.dist(item[2][:2], other[:2]) > .3 or abs(math.atan2(math.sin(item[2][2] - other[2]), math.cos(item[2][2] - other[2]))) > .3 for other in seeds):
+                seeds.append(item[2])
+            if len(seeds) == 4:
+                break
+        refined = score([point[0] + horizontal, point[1] + lateral, point[2] + heading]
+            for point in seeds for horizontal in np.arange(-.1, .101, .05)
+            for lateral in np.arange(-.1, .101, .05) for heading in np.arange(-.06, .061, .02))
+        best = refined[0]
+        ambiguous = any(item[0] < best[0] + .025 and (math.dist(item[2][:2], best[2][:2]) > .5
+            or abs(math.atan2(math.sin(item[2][2] - best[2][2]), math.cos(item[2][2] - best[2][2]))) > .4) for item in refined[1:])
+        if best[0] > .16 or best[1] < .65 or ambiguous:
+            raise ValueError("LOCALIZATION_UNRELIABLE: scan mismatch or ambiguous location; select a known place and rescan")
+        return best[2], {"mean_residual_m": best[0], "matched_fraction": best[1], "seeded": seed is not None}
+
+    def scan_quality(self, laser, pose):
+        _, endpoints, hits = laser_points(laser, pose)
+        indices = self.indices(endpoints[hits])
+        indices = indices[self.inside(indices)]
+        if len(indices) < 40:
+            raise ValueError("LOCALIZATION_UNRELIABLE: insufficient measured returns")
+        field = distance_transform_edt(self.cells != 100) * self.resolution_m
+        residuals = field[indices[:, 1], indices[:, 0]]
+        fraction = float(np.mean(residuals <= .25))
+        residual = float(np.minimum(residuals, .6).mean())
+        if fraction < .5 or residual > .25:
+            raise ValueError("LOCALIZATION_LOST: live scan disagrees with mapped pose")
+        return {"mean_residual_m": residual, "matched_fraction": fraction, "method": "fixed_pose_scan_consistency"}
+
+    @classmethod
+    def restore(cls, data):
+        if (data["schema"] != "milo-home-map-v1" or data["width"] != cls.size or data["height"] != cls.size
+                or data["resolution_m"] != cls.resolution_m or data["frame"] != "map"):
+            raise ValueError("Unsupported saved map schema")
+        result = cls(data["environment_id"], data["map_id"])
+        result.name, result.origin = data["name"], np.array(data["origin_m"])
+        result.evidence = np.array(data["evidence"], dtype=np.int16).reshape(cls.size, cls.size)
+        result.visits = np.array(data["visits"], dtype=np.uint16).reshape(cls.size, cls.size)
+        result.created_at, result.updated_at = data["created_unix_s"], data["updated_unix_s"]
+        result.revision, result.scan_count = data["revision"], data["scan_count"]
+        result.places, result.edges, result.objects = data["places"], data["edges"], data["objects"]
+        result.frontier_attempts = data["frontier_attempts"]
+        result.saved = True
+        return result
+
+
+class MapStore:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS maps (map_id TEXT PRIMARY KEY, environment_id TEXT UNIQUE, revision INTEGER, document TEXT)")
+            connection.execute("CREATE TABLE IF NOT EXISTS object_observations (observation_id TEXT PRIMARY KEY, map_id TEXT, timestamp REAL, document TEXT, image BLOB)")
+
+    def connect(self):
+        return sqlite3.connect(self.path, timeout=5.)
+
+    def catalog(self):
+        with self.connect() as connection:
+            return [{key: data[key] for key in ("map_id", "environment_id", "name", "revision", "updated_unix_s")}
+                for (document,) in connection.execute("SELECT document FROM maps ORDER BY environment_id")
+                for data in [json.loads(document)]]
+
+    def save(self, home, name):
+        if not name.strip() or len(name) > 80 or not home.scan_count:
+            raise ValueError("A name and observed map are required")
+        data = home.document()
+        data.update(name=name.strip(), revision=home.revision + 1, updated_unix_s=time.time())
+        with self.connect() as connection:
+            if home.revision:
+                changed = connection.execute("UPDATE maps SET revision=?, document=? WHERE map_id=? AND revision=?",
+                    (data["revision"], json.dumps(data, allow_nan=False), home.identity, home.revision)).rowcount
+                if changed != 1:
+                    raise ValueError("MAP_CONFLICT: reload the current revision before saving")
+            else:
+                try:
+                    connection.execute("INSERT INTO maps VALUES (?, ?, ?, ?)",
+                        (home.identity, home.environment_id, data["revision"], json.dumps(data, allow_nan=False)))
+                except sqlite3.IntegrityError as error:
+                    raise ValueError("MAP_EXISTS: load the saved home instead of mapping this environment again") from error
+        home.name, home.revision, home.updated_at, home.saved = data["name"], data["revision"], data["updated_unix_s"], True
+        home.annotations_dirty = False
+
+    def load(self, map_id, environment_id):
+        with self.connect() as connection:
+            row = connection.execute("SELECT document FROM maps WHERE map_id=? AND environment_id=?", (map_id, environment_id)).fetchone()
+        if row is None:
+            raise ValueError("MAP_NOT_FOUND: map is unknown or belongs to another environment")
+        return HomeMap.restore(json.loads(row[0]))
+
+    def remember_object(self, observation, image):
+        if len(image) > 1024 * 1024 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Object evidence requires a bounded PNG camera image")
+        with self.connect() as connection:
+            if connection.execute("SELECT 1 FROM maps WHERE map_id=?", (observation["map_id"],)).fetchone() is None:
+                raise ValueError("SAVE_REQUIRED: object memory requires a saved map")
+            connection.execute("INSERT INTO object_observations VALUES (?, ?, ?, ?, ?)",
+                (observation["observation_id"], observation["map_id"], observation["observed_unix_s"], json.dumps(observation, allow_nan=False), image))
+            connection.execute("DELETE FROM object_observations WHERE map_id=? AND observation_id NOT IN (SELECT observation_id FROM object_observations WHERE map_id=? ORDER BY timestamp DESC LIMIT 1000)",
+                (observation["map_id"], observation["map_id"]))
+
+    def object_observations(self, map_id):
+        with self.connect() as connection:
+            return [json.loads(row[0]) for row in connection.execute("SELECT document FROM object_observations WHERE map_id=? ORDER BY timestamp DESC LIMIT 64", (map_id,))]
+
+    def object_image(self, map_id, observation_id):
+        with self.connect() as connection:
+            row = connection.execute("SELECT image FROM object_observations WHERE map_id=? AND observation_id=?", (map_id, observation_id)).fetchone()
+        if row is None:
+            raise ValueError("Object image not found")
+        return row[0]
