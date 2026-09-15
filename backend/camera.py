@@ -136,6 +136,16 @@ def process_spatial(observed_map, observation, image):
     return mapped, observation, image, output.getvalue()
 
 
+def capture_spatial_snapshot(renderer, packet, metadata):
+    import numpy as np
+    from backend.contracts import SpatialObservation
+    image, depth = renderer.capture(packet, depth=True)
+    intrinsics = metadata["calibration"]
+    valid = np.isfinite(depth) & (depth >= intrinsics["near_m"]) & (depth <= intrinsics["usable_range_m"])
+    observation = SpatialObservation(**metadata, depth_m=np.where(valid, depth, None).ravel().tolist())
+    return observation, image
+
+
 class EnhancedResources:
     def __init__(self):
         from concurrent.futures import ProcessPoolExecutor

@@ -50,7 +50,14 @@ class SensorCondition(StrictModel):
 
 
 class GuideContinuous(StrictModel):
-    action: Literal["navigate", "explore", "approach_target", "circle", "look", "turn", "scan", "wait", "wait_until", "inspect_history", "inspect_arrival", "finish", "continue", "advance_subgoal", "compose", "navigate_place", "explore_map", "cancel_task", "spatial_state", "remember_object"]
+    action: Literal["navigate", "explore", "approach_target", "circle", "look", "turn", "scan", "wait", "wait_until", "inspect_history", "inspect_arrival", "finish", "continue", "advance_subgoal", "compose", "navigate_place", "explore_map", "explore_frontier", "cancel_task", "spatial_state", "remember_object", "observe_room"]
+    room_name: str = Field(default="", max_length=80)
+    return_place_id: str | None = Field(default=None, max_length=80)
+    place_kind: Literal["room", "doorway"] = "room"
+    connects: list[str] = Field(default_factory=list, max_length=8)
+    evidence_text: str = Field(default="", max_length=500)
+    room_matches: bool | None = None
+    frontier_id: str | None = Field(default=None, max_length=80)
     confidence: float = Field(default=.5, ge=0., le=1., allow_inf_nan=False)
     place_id: str | None = Field(default=None, max_length=80)
     region_id: str | None = Field(default=None, max_length=80)
@@ -701,18 +708,21 @@ async def execute_motion_skills(controller, worker, settings, sensor, guide, can
 
 async def execute_home_capability(controller, worker, settings, guide, sensor, stop_revision, task_revision, image=None):
     from backend.home_mission import HomeRequest
-    actions = {"navigate_place": "navigate_to", "explore_map": "explore", "cancel_task": "cancel_task", "spatial_state": "get_spatial_state", "remember_object": "remember_object"}
+    actions = {"navigate_place": "navigate_to", "explore_map": "explore", "explore_frontier": "explore_frontier",
+        "cancel_task": "cancel_task", "spatial_state": "get_spatial_state", "remember_object": "remember_object", "observe_room": "observe_room"}
     controller._check_live(worker, settings)
-    if guide.action in {"navigate_place", "explore_map"} and not 0 <= time.monotonic() - sensor.captured_at <= 15.:
+    if guide.action in {"navigate_place", "explore_map", "explore_frontier"} and not 0 <= time.monotonic() - sensor.captured_at <= 15.:
         raise ValueError("STALE_PLAN: mapped task selection expired during inference")
     state = await worker.home_state(compact=True)
     request = HomeRequest(run_id=settings.run_id, episode_epoch=settings.episode_epoch,
-        action=actions[guide.action], map_id=state["map_id"], place_id=guide.place_id,
+        action=actions[guide.action], map_id=state["map_id"], place_id=guide.place_id, return_place_id=guide.return_place_id,
         region_id=guide.region_id, time_budget=guide.time_budget, object_label=guide.object_label,
         object_bounds=guide.object_bounds, confidence=guide.confidence,
-        spatial_sequence=sensor.sequence if guide.action == "remember_object" else None)
+        name=guide.room_name, kind=guide.place_kind, connects=guide.connects,
+        evidence_text=guide.evidence_text, room_matches=guide.room_matches, frontier_id=guide.frontier_id,
+        spatial_sequence=sensor.sequence if guide.action in {"remember_object", "observe_room"} else None)
     await worker.home_command(request, stop_revision, task_revision,
-        selected_evidence=(sensor, image) if guide.action == "remember_object" and image is not None else None)
+        selected_evidence=(sensor, image) if guide.action in {"remember_object", "observe_room"} and image is not None else None)
     while worker.home_mission.active:
         controller._check_live(worker, settings)
         await asyncio.sleep(.1)
@@ -856,8 +866,9 @@ async def run(controller, worker, settings, model, profile, stop_revision):
             model_images.append(historical_original[1])
         inputs = [*history[-8:], message]
         inputs.insert(0, {"role": "user", "content": [{"type": "input_text", "text": MEMORY_GUIDANCE + PLACE_GUIDANCE
-            + " Saved-home capabilities: when observation.spatial is available, navigate_place selects an exact reachable place_id from that summary. Never invent coordinates or IDs. explore_map selects an optional named room region_id with time_budget in seconds (1-300); this deliberately expands the map. spatial_state obtains fresh progress; cancel_task stops the mapped mission. remember_object stores object_label, normalized object_bounds from the CURRENT image, and confidence (0-1) with measured surface location and original image. Object memory is last-seen evidence, not current visibility or verified identity; currently_observed is explicit. The independent worker owns route planning, wheel control, retries and timeouts. Named arrival is not proof of object identity, task success, or whole-home coverage. An unlocalized map requires operator localization before mapped motion."
+            + " Saved-home capabilities: use observation.spatial.places and room_graph for named-room tasks. navigate_place selects an exact reachable place_id; never invent coordinates or IDs. operator_confirmed labels have operator review; tentative and operator_named_unreviewed labels are not confirmed room identities. If the requested room is unknown, choose a supplied frontier_id with explore_frontier (time_budget1-300s) or explore_map; inspect fresh images to identify rooms. Unknown room names do not authorize arbitrary destinations or completion. observe_room records room_name, place_kind, confidence and evidence_text from the CURRENT image at the measured robot position; optional connects references supplied IDs and requires observed routes. This creates tentative labels, never operator confirmation. For an existing room use place_id. After navigate_place arrives, a NEW post-arrival image and observe_room(place_id,room_matches=true/false,evidence_text) are required before reporting visual room identification. Physical arrival alone and old room photographs are insufficient; mismatch means reassess, not success. Room reports remain model claims, not independent semantic verification. room_graph connections describe current clearance of recorded paths, not proof that a door is open. spatial_state obtains progress; cancel_task stops. remember_object stores object_label, CURRENT normalized object_bounds and confidence with measured surface position and original image. Historical observations never authorize motion. The worker owns planning, wheels, retries and timeouts. Unlocalized maps require operator localization."
             + (NAV2_GUIDANCE if settings.navigation_backend == "nav2" else "")}]})
+        inputs[0]["content"].append({"type": "input_text", "text": "For room-and-return requests, navigate_place(place_id=room,return_place_id=Home,time_budget=...) starts one bounded workflow. After physical arrival, observe_room with a NEW current image reports match or mismatch. A match authorizes automatic worker return to Home; a mismatch fails the workflow. A completed round trip requires room_workflow.status=completed. Semantic identity remains a reported annotation."})
         task_revision = worker.task_revision
         controller.state.update(phase="thinking", turns=turn + 1, last_feedback_at=time.time())
         controller._trace("feedback", "Continuous navigation camera + sensors", {"observation": observation.model_dump(),
@@ -961,7 +972,7 @@ async def run(controller, worker, settings, model, profile, stop_revision):
             memory += " Historical inspection finished. Select movement or completion only after this new current view; old image coordinates are not actionable."
             controller._trace("policy", "Historical motion selection deferred", {"action": guide.action, "frame_id": historical_original[0]["frame_id"], "reason": memory})
             continue
-        if guide.action in {"navigate_place", "explore_map", "cancel_task", "spatial_state", "remember_object"}:
+        if guide.action in {"navigate_place", "explore_map", "explore_frontier", "cancel_task", "spatial_state", "remember_object", "observe_room"}:
             controller.state.update(phase="acting", message=guide.reason)
             try:
                 last_execution = await execute_home_capability(controller, worker, settings, guide, sensor, stop_revision, task_revision, image)
@@ -1046,6 +1057,17 @@ async def run(controller, worker, settings, model, profile, stop_revision):
             controller.navigation_reply(guide.reason)
         controller._trace("policy", "Continuous goal selected", {**guide.model_dump(), "source": "controller" if recovery else "model"})
         if guide.action in {"finish", "inspect_arrival"}:
+            home_state = await worker.home_state(compact=True) if worker.home_mission else {}
+            room_workflow = home_state.get("room_workflow")
+            if room_workflow:
+                if guide.action == "finish" and room_workflow["status"] == "completed":
+                    controller.state["phase"] = "completed"
+                    controller._set_outcome("completed", room_workflow["reason"], "agent")
+                    return
+                last_execution = {"status": "rejected", "reason": "Room workflow is not complete; use fresh room evidence or report the limitation", "room_workflow": room_workflow}
+                memory += " Physical arrival alone cannot complete the round trip. " + room_workflow["reason"]
+                controller._trace("policy", "Room workflow completion rejected", last_execution)
+                continue
             if (worker.latest.get("challenge") or {}).get("id") == "furniture_circuit":
                 memory = "Circling is not a room-entry task. Identify the requested object and use circle; the independent circuit scorer ends the scenario after a full lap and rest."
                 continue

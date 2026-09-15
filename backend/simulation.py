@@ -595,7 +595,7 @@ class BulletSimulation:
     def frame(self, reference):
         return self.frames[reference]
 
-    def execute(self, command: Command):
+    def execute(self, command: Command, *, drive_guard=None):
         started = self.ticks
         prior = self.odometry.copy()
         status, code, message = "ok", None, ""
@@ -622,6 +622,8 @@ class BulletSimulation:
                 count = math.ceil(arguments.duration_s / TIMESTEP)
 
                 def drive(tick):
+                    if drive_guard is not None and tick % 12 == 0:
+                        drive_guard(arguments)
                     ramp = min(1, (tick + 1) * TIMESTEP / .3, (count - tick) * TIMESTEP / .3)
                     for index, speed in zip(self.wheels, desired * ramp):
                         bullet.setJointMotorControl2(self.robot, index, bullet.VELOCITY_CONTROL, targetVelocity=speed, force=5, physicsClientId=self.client)

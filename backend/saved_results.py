@@ -2,8 +2,10 @@ import hashlib
 import json
 import math
 import re
+import statistics
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 from backend.recording import read_recording_json
@@ -70,17 +72,36 @@ def normalize_trial(result, case, index, batch_id, directory, root, evidence):
         status = "Test failed"
     if unfinished:
         status = "Running" if running else "Interrupted recording"
+    if result.get("verification_eligible") is False and result.get("evidence") == "operator_session" and complete and not unfinished:
+        status = "Recorded workflow"
     case_id = text(case.get("case_id"), text(result.get("case_id"), "case"))
     terminal = directory / case_id / "terminal.png"
     safe_case = case_id not in {".", ".."} and "/" not in case_id and "\\" not in case_id
     has_image = safe_case and local_file(terminal, root)
     has_route = safe_case and local_file(directory / case_id / "recording/trajectory.jsonl", root)
+    spatial = score.get("spatial_recording") or {}
+    spatial = spatial if isinstance(spatial, dict) else {}
+    benchmark = result.get("benchmark")
+    benchmark = benchmark if isinstance(benchmark, dict) else None
+    if benchmark:
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        outcome = benchmark.get("status")
+        valid = complete and all(metrics.get(key) is True for key in ("source_unchanged", "original_map_unchanged", "recording_complete"))
+        outcome = "invalid" if outcome == "passed" and (not valid or benchmark.get("passed") is not True) else outcome
+        status = {"passed": "Benchmark pass", "failed": "Benchmark failed", "blocked": "Blocked prerequisite", "invalid": "Invalid benchmark"}.get(outcome, "Unscored benchmark")
+        benchmark = {"suite_id": text(benchmark.get("suite_id")), "task_id": text(benchmark.get("task_id")),
+            "provenance_valid": valid and not assisted,
+            "status": outcome, "reason": text(benchmark.get("reason")), "criteria": text(result.get("criteria")),
+            "budget_s": number(result.get("budget_s")), "setup_s": number(metrics.get("setup_s")),
+            "position_error_m": number(metrics.get("position_error_m")), "new_free_m2": number(metrics.get("new_free_m2"))}
+        verified = False
     return {"case_id": case_id, "challenge": text(case.get("challenge"), text(result.get("challenge"))),
+        "benchmark": benchmark,
         "challenge_sha256": text(case.get("challenge_sha256"), ""), "running": running, "updated_at": last_updated,
         "task_sha256": hashlib.sha256(json.dumps([case.get("challenge_sha256"), result.get("initial_goal"), result.get("final_goal")], sort_keys=True).encode()).hexdigest(),
         "goal": text(result.get("final_goal"), text(challenge.get("goal"), "Scenario goal")),
         "environment": text(case.get("environment"), text(challenge.get("environment"), "standalone")),
-        "title": text(challenge.get("title"), text(result.get("challenge"), text(case.get("challenge")))),
+        "title": text(result.get("title"), text(case.get("title"))) if benchmark else text(challenge.get("title"), text(result.get("challenge"), text(case.get("challenge")))),
         "evidence": text(result.get("evidence"), evidence), "status": status, "verified_success": verified,
         "physics_success": physics if isinstance(physics, bool) else None, "recording_complete": complete, "assisted": assisted,
         "completion_s": number(score.get("completion_time_s")) if verified else None,
@@ -93,6 +114,11 @@ def normalize_trial(result, case, index, batch_id, directory, root, evidence):
         "termination": text(result.get("termination_reason"), text(result.get("phase"))), "rendering": text(result.get("rendering")),
         "false_completion_claim": result.get("unverified_completion_claim") is True,
         "trajectory_url": f"/api/test-results/{batch_id}/trajectories/{index}" if has_route else None,
+        "replay_url": f"/api/test-results/{batch_id}/replay/{index}" if has_route else None,
+        "spatial_progress": {"snapshots": number(spatial.get("snapshots")), "events": number(spatial.get("events")),
+            "map_id": text(spatial.get("map_id"), ""), "map_revision": number(spatial.get("map_revision")),
+            "complete": spatial.get("complete") is True, "initial": spatial.get("initial"), "final": spatial.get("final"),
+            "final_task": spatial.get("final_task")},
         "image_url": f"/api/test-results/{batch_id}/images/{index}" if has_image else None}
 
 
@@ -115,6 +141,59 @@ def normalized_variant(manifest):
         "variant_id": text(manifest.get("variant_id"), "Unknown")}
 
 
+def benchmark_comparability(manifest, trials):
+    suite = manifest.get("suite")
+    if not isinstance(suite, dict) or not isinstance(suite.get("tasks"), list):
+        return None
+    reasons = []
+    fingerprint = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+    for field in ("suite_sha256", "derived_map_sha256", "fixture_sha256"):
+        if not isinstance(manifest.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", manifest[field]):
+            reasons.append("Missing " + field.replace("_sha256", "").replace("_", " ") + " fingerprint")
+    if manifest.get("suite_sha256") != fingerprint(suite):
+        reasons.append("Suite fingerprint does not match its definition")
+    design = manifest.get("design") or {}
+    if not design.get("source_sha256") or not design.get("runtime"):
+        reasons.append("Source or runtime provenance missing")
+    if not manifest.get("finished_at"):
+        reasons.append("Run is not finalized")
+    if manifest.get("source_changed_during_run") is not False:
+        reasons.append("Source stability not established")
+    if manifest.get("original_map_unchanged") is not True:
+        reasons.append("Map stability not established")
+    if manifest.get("preflight_only"):
+        reasons.append("Preflight only")
+    if manifest.get("evidence") not in {"scripted_test", "real_model", "scripted_reference"}:
+        reasons.append("Evidence is not a controlled test series")
+    cases = manifest.get("cases", [])
+    task_ids = [task.get("id") for task in suite["tasks"]]
+    repeats = len(suite.get("start_offsets_m", [])) or suite.get("repetitions", 0)
+    if (not repeats or len(cases) != repeats * len(task_ids)
+            or len({case.get("case_id") for case in cases}) != len(cases)
+            or any(sum(case.get("task_id") == task_id for case in cases) != repeats for task_id in task_ids)):
+        reasons.append("Planned cases do not match the full suite")
+    for trial in trials:
+        result = trial.get("benchmark") or {}
+        if result.get("status") not in {"passed", "failed", "blocked"}:
+            reasons.append("Missing, invalid or unfinished outcomes")
+        elif result["status"] != "blocked" and not result.get("provenance_valid"):
+            reasons.append("Incomplete or assisted trial evidence")
+        if result.get("suite_id") != suite.get("suite_id"):
+            reasons.append("Trial belongs to a different suite")
+    settings = {field: manifest.get(field) for field in ("mode", "evidence", "reasoning", "supervisor_deployment",
+        "images_per_request", "context_tokens", "feedback_interval_s", "session_timeout_s", "camera_history",
+        "continuous_handoff", "skill_composer", "exploration")}
+    if manifest.get("evidence") == "real_model" and not isinstance(manifest.get("model_variant"), dict):
+        reasons.append("Model configuration provenance missing")
+    inputs = {field: manifest.get(field) for field in ("suite_sha256", "derived_map_sha256", "fixture_sha256")}
+    inputs.update(settings=settings, runtime=design.get("runtime"),
+        model_configuration=(manifest.get("model_variant") or {}).get("configuration"),
+        cases=[{key: case.get(key) for key in ("case_id", "task_id", "challenge_sha256", "budget_s", "start_offset_m")} for case in cases])
+    return {"eligible": not reasons, "reasons": list(dict.fromkeys(reasons)),
+        "cohort_id": fingerprint(inputs), "experiment_id": text(manifest.get("experiment_id"), ""),
+        "baseline_experiment_id": text(manifest.get("baseline_experiment_id"), "")}
+
+
 def saved_results(root=None):
     root = root or RESULTS_ROOT
     batches, skipped = [], 0
@@ -122,7 +201,7 @@ def saved_results(root=None):
     for directory in directories[:500]:
         try:
             manifest = read_json(directory / "experiment.json", root)
-            if not isinstance(manifest, dict) or manifest.get("stage", "challenges") != "challenges":
+            if not isinstance(manifest, dict) or manifest.get("stage", "challenges") not in {"challenges", "spatial_workflow"}:
                 continue
             cases = manifest.get("cases")
             summary = directory / "summary.json"
@@ -155,7 +234,26 @@ def saved_results(root=None):
                         result = read_json(report, root)
                 trials.append(normalize_trial(result, case, index, identifier, directory, root, evidence))
             modified = (directory / "experiment.json").stat().st_mtime
+            suite = manifest.get("suite") if isinstance(manifest.get("suite"), dict) else None
+            benchmark_summary = None
+            if suite and isinstance(suite.get("tasks"), list):
+                task_rows = []
+                for task in suite["tasks"][:30]:
+                    if not isinstance(task, dict):
+                        continue
+                    selected_cases = [index for index, case in enumerate(cases[:500]) if case.get("task_id") == task.get("id")]
+                    outcomes = [(trials[index].get("benchmark") or {}).get("status", "not_run") for index in selected_cases]
+                    times = [trials[index]["elapsed_s"] for index in selected_cases
+                        if (trials[index].get("benchmark") or {}).get("status") == "passed" and trials[index]["elapsed_s"] is not None]
+                    task_rows.append({"task_id": text(task.get("id")), "title": text(task.get("title")), "planned": len(selected_cases),
+                        "successful_median_s": statistics.median(times) if times else None,
+                        **{key: outcomes.count(key) for key in ("passed", "failed", "blocked", "invalid", "not_run")}})
+                benchmark_summary = {"suite_id": text(suite.get("suite_id")), "suite_sha256": text(manifest.get("suite_sha256")),
+                    "map_sha256": text(manifest.get("derived_map_sha256")), "preflight": manifest.get("preflight_only") is True,
+                    "comparison": benchmark_comparability(manifest, trials),
+                    "tasks": task_rows}
             batches.append({"id": identifier, "name": directory.relative_to(root).as_posix(),
+                "benchmark": benchmark_summary,
                 "session_id": text(manifest.get("session_id"), ""), "running": any(trial["running"] for trial in trials),
                 **normalized_variant(manifest),
                 "date": text(manifest.get("started_at"), datetime.fromtimestamp(modified, timezone.utc).isoformat()),
@@ -313,3 +411,160 @@ def terminal_image(batch_id, trial_index, root=None):
     if not local_file(path, root) or path.stat().st_size > MAX_FILE_BYTES or path.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
         raise ValueError("Saved camera image unavailable")
     return path
+
+
+@lru_cache(maxsize=128)
+def replay_batch_directory(batch_id, root):
+    directory = next((directory for directory in result_directories(root)
+        if hashlib.sha256(directory.relative_to(root).as_posix().encode()).hexdigest()[:20] == batch_id), None)
+    if directory is None:
+        raise ValueError("Unknown recorded trial")
+    return directory
+
+
+def replay_directory(batch_id, trial_index, root):
+    if not re.fullmatch(r"[a-f0-9]{20}", batch_id):
+        raise ValueError("Unknown recorded trial")
+    batch_directory = replay_batch_directory(batch_id, root)
+    manifest = read_json(batch_directory / "experiment.json", root)
+    cases = manifest.get("cases")
+    summary = batch_directory / "summary.json"
+    results = read_json(summary, root) if summary.exists() else []
+    if isinstance(results, dict):
+        results = [results]
+    if cases is None:
+        cases = [{"case_id": result.get("case_id", result.get("challenge")), "challenge": result.get("challenge")}
+            for result in results if isinstance(result, dict) and isinstance(result.get("challenge"), str)]
+    if not isinstance(cases, list) or not 0 <= trial_index < min(len(cases), 500):
+        raise ValueError("Unknown recorded trial")
+    case = cases[trial_index]
+    case_id = case.get("case_id")
+    if not isinstance(case_id, str) or case_id in {".", ".."} or "/" in case_id or "\\" in case_id:
+        raise ValueError("Invalid recording case")
+    report = batch_directory / case_id / "report.json"
+    result = read_json(report, root) if report.exists() else next((result for result in results
+        if isinstance(result, dict) and result.get("case_id", result.get("challenge")) == case_id), {})
+    trial = normalize_trial(result, case, trial_index, batch_id, batch_directory, root, text(manifest.get("evidence")))
+    directory = batch_directory / case_id / "recording"
+    path = directory / "trajectory.jsonl"
+    if not local_file(path, root) or path.stat().st_size > MAX_TRAJECTORY_BYTES:
+        raise ValueError("Recorded replay unavailable")
+    return directory, path, trial
+
+
+def replay_samples(path):
+    previous = -1.
+    with path.open(encoding="utf-8") as stream:
+        for index, line in enumerate(stream):
+            if index >= 50000 or len(line) > 262144:
+                raise ValueError("Replay exceeds display limits")
+            sample = json.loads(line)
+            elapsed = number(sample.get("wall_s"))
+            if elapsed is None or elapsed < previous:
+                raise ValueError("Replay timestamps are invalid")
+            previous = elapsed
+            yield sample
+
+
+def replay_media_names(sample):
+    home = sample.get("home") or {}
+    return [value for value in [(sample.get("camera") or {}).get("path"),
+        (sample.get("spatial") or {}).get("rgb"), (sample.get("spatial") or {}).get("depth"),
+        (home.get("map") or {}).get("path"), home.get("telemetry_path")] if isinstance(value, str)]
+
+
+def recorded_replay(batch_id, trial_index, root=None):
+    root = root or RESULTS_ROOT
+    directory, path, trial = replay_directory(batch_id, trial_index, root)
+    frames, events, last_key, last_time, count = [], [], None, -1., 0
+    previous_sample = None
+    segment = 0
+    prefix = f"/api/test-results/{batch_id}/replay/{trial_index}/media/"
+    for sample in replay_samples(path):
+        count += 1
+        home = sample.get("home") or {}
+        camera = sample.get("camera") or {}
+        spatial = sample.get("spatial") or {}
+        previous_home = (previous_sample or {}).get("home") or {}
+        discontinuity = bool(previous_sample and (sample.get("manual_placements") != previous_sample.get("manual_placements")
+            or (home.get("map") or {}).get("map_id") != (previous_home.get("map") or {}).get("map_id")
+            or (home.get("localization") or {}).get("status") != (previous_home.get("localization") or {}).get("status")
+            or home.get("map_from_odometry_m_rad") != previous_home.get("map_from_odometry_m_rad")))
+        if discontinuity:
+            segment += 1
+        gap = sample["wall_s"] - previous_sample["wall_s"] if previous_sample else 0.
+        contact_started = bool(sample.get("collisions")) and not bool((previous_sample or {}).get("collisions"))
+        names = replay_media_names(sample)
+        def media_url(name):
+            return prefix + name.removeprefix("media/") if name in names and re.fullmatch(r"media/[a-z]+-[0-9]+(?:-depth)?\.(?:png|json)", name) else None
+        key = (camera.get("path"), home.get("telemetry_path"))
+        frame = {"wall_s": sample["wall_s"], "simulated_s": number(sample.get("simulated_s")),
+            "index": count, "segment": segment, "activity": text(sample.get("activity")), "status": text(sample.get("physics_status")),
+            "odometry_m_rad": scene_vector(sample["odometry_m_rad"], 3) if sample.get("odometry_m_rad") else None,
+            "camera_url": media_url(camera.get("path")), "camera_simulated_s": number(camera.get("simulated_s")),
+            "depth_url": media_url(spatial.get("depth")), "depth_simulated_s": number(spatial.get("simulated_s")),
+            "map_url": media_url((home.get("map") or {}).get("path")),
+            "telemetry_url": media_url(home.get("telemetry_path")), "home": home or None,
+            "assisted": bool(sample.get("operator_assisted") or sample.get("manual_placements")),
+            "contact": bool(sample.get("collisions"))}
+        if key != last_key or sample["wall_s"] - last_time >= .5 or sample.get("home_events") or contact_started or discontinuity:
+            if len(frames) >= 6000:
+                raise ValueError("Replay exceeds 6000 keyframes")
+            frames.append(frame)
+            last_time, last_key = sample["wall_s"], key
+        for event in sample.get("home_events", []):
+            if len(events) < 2000:
+                events.append({**{key: event.get(key) for key in ("stage", "localization", "task_id", "status", "segments", "retries", "stop_revision")},
+                    "id": len(events) + 1,
+                    "reason": text(event.get("reason")), "wall_s": sample["wall_s"]})
+        for reason in (["Contact detected"] if contact_started else []) + (["Pose continuity changed"] if discontinuity else []) + ([f"Recording gap: {gap:.2f} s"] if gap > 1. else []):
+            if len(events) < 2000:
+                events.append({"id": len(events) + 1, "wall_s": sample["wall_s"], "stage": "recording", "status": "diagnostic", "reason": reason})
+        previous_sample = sample
+    if not count:
+        raise ValueError("Empty replay")
+    if frames[-1]["wall_s"] != frame["wall_s"]:
+        frames.append(frame)
+    return {"schema_version": 1, "frames": frames, "events": events, "sample_count": count,
+        "evidence": trial["evidence"], "recording_complete": trial["recording_complete"],
+        "spatial_progress": trial["spatial_progress"], "evaluation_only": True,
+        "clock": "recording_monotonic_wall_seconds", "image_policy": "latest recorded past image; no future interpolation"}
+
+
+def recorded_replay_media(batch_id, trial_index, name, root=None):
+    import base64
+    import zlib
+    root = root or RESULTS_ROOT
+    if not re.fullmatch(r"[a-z]+-[0-9]+(?:-depth)?\.(?:png|json)", name):
+        raise ValueError("Invalid replay media name")
+    directory, trajectory, _ = replay_directory(batch_id, trial_index, root)
+    relative = "media/" + name
+    if not any(relative in replay_media_names(sample) for sample in replay_samples(trajectory)):
+        raise ValueError("Media is not referenced by the recording")
+    path = directory / relative
+    if not local_file(path, root) or path.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("Recorded media unavailable")
+    if name.endswith(".png"):
+        image = path.read_bytes()
+        if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Invalid camera PNG")
+        return image, "image/png"
+    data = read_json(path, root)
+    if name.startswith("home-"):
+        if data.get("encoding") != "int8_cells_then_packbits_visited_zlib_base64" or data.get("width") != 400 or data.get("height") != 400:
+            raise ValueError("Unsupported recorded map")
+        decoder = zlib.decompressobj()
+        try:
+            raw = decoder.decompress(base64.b64decode(data["data"], validate=True), 180001)
+        except zlib.error as error:
+            raise ValueError("Corrupt recorded map compression") from error
+        if len(raw) != 180000 or not decoder.eof or decoder.unused_data or hashlib.sha256(raw).hexdigest() != data["sha256"]:
+            raise ValueError("Corrupt recorded map")
+        if not set(raw[:160000]).issubset({0, 100, 255}):
+            raise ValueError("Invalid occupancy cells")
+        data = {**{key: data[key] for key in ("map_id", "revision", "name", "frame", "width", "height", "resolution_m", "origin_m", "places", "edges", "sha256")},
+            "cells": [value if value < 128 else value - 256 for value in raw[:160000]],
+            "visited_indices": [index for index in range(160000) if raw[160000 + index // 8] & (1 << (7 - index % 8))]}
+    elif not name.startswith("telemetry-"):
+        raise ValueError("Unsupported replay data")
+    return data, "application/json"

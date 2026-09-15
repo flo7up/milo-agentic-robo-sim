@@ -91,6 +91,7 @@ export type AgentState = {
   configuration: { provider: string; endpoint: string; ollama_endpoint: string; default_model_id: string; models: ModelProfile[] };
 };
 export type LiveState = {
+  map_setup?: { reuse_saved_map: boolean; map_id: string | null; name: string | null; revision: number | null; localization: string };
   rendering?: 'tiny' | 'enhanced';
   continuous_navigation?: {status: string; reason: string; remaining_m: number; updates: number; buffer_stops: number} | null;
   local_navigation_model?: {

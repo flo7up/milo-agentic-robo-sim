@@ -1,10 +1,14 @@
 from collections import Counter, deque
+from copy import deepcopy
+import base64
+import hashlib
 import json
 import math
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Lock
 import time
+import zlib
 
 
 recording_json_lock = Lock()
@@ -106,7 +110,100 @@ class RunRecorder:
         self.last_media_at = -math.inf
         self.scene = None
         self.scene_written = False
+        self.home_media = []
+        self.home_key = None
+        self.home_snapshot_key = None
+        self.home_snapshot = None
+        self.home_snapshot_count = 0
+        self.home_snapshot_limit = 2048
+        self.home_snapshots_omitted = 0
+        self.home_sampled_at = -math.inf
+        self.home_telemetry = None
+        self.home_telemetry_media = []
+        self.home_telemetry_count = 0
+        self.home_transition = None
+        self.home_event_count = 0
+        self.home_events_omitted = 0
+        self.home_telemetry_limit = 2000
+        self.home_capture_max_s = 0.
         self.stream = (self.directory / "trajectory.jsonl").open("w", encoding="utf-8")
+
+    def capture_home(self, worker, now):
+        mission = getattr(worker, "home_mission", None)
+        if mission is None:
+            return None, []
+        home = mission.home
+        task = mission.task or {}
+        workflow = getattr(mission, "workflow", None) or {}
+        transition = (home.identity if home else None, mission.stage, mission.localization["status"],
+            task.get("task_id"), task.get("status"), task.get("reason"), task.get("segments"), task.get("retries"),
+            worker.stop_revision, mission.error, workflow.get("status"), workflow.get("room_evidence_id"))
+        events = []
+        changed = transition != self.home_transition
+        if changed:
+            if self.home_event_count < 2000:
+                self.home_event_count += 1
+                events.append({"id": self.home_event_count, "stage": mission.stage,
+                    "localization": mission.localization["status"], "task_id": task.get("task_id"),
+                    "status": task.get("status"), "reason": task.get("reason") or mission.error or mission.stage,
+                    "segments": task.get("segments", 0), "retries": task.get("retries", 0),
+                    "room_workflow_status": workflow.get("status"), "room_evidence_id": workflow.get("room_evidence_id"),
+                    "stop_revision": worker.stop_revision})
+            else:
+                self.home_events_omitted += 1
+            self.home_transition = transition
+        if changed or now - self.home_sampled_at >= .5:
+            self.home_sampled_at = now
+            key = (home.identity, home.revision, home.scan_count, len(home.places), len(home.edges),
+                tuple((place.get("identity_status"), place.get("evidence_id")) for place in home.places)) if home else None
+            if key != self.home_key:
+                self.home_key = key
+                if home is None:
+                    self.home_snapshot, self.home_media = None, []
+                elif self.home_snapshot_count < self.home_snapshot_limit:
+                    import numpy as np
+                    self.home_snapshot_count += 1
+                    filename = f"media/home-{self.home_snapshot_count}.json"
+                    metadata = {"schema_version": 1, "map_id": home.identity, "revision": home.revision,
+                        "environment_id": home.environment_id, "name": home.name, "frame": "map", "units": "m_rad",
+                        "width": home.size, "height": home.size, "resolution_m": home.resolution_m,
+                        "origin_m": home.origin.tolist(), "scan_count": home.scan_count,
+                        "places": deepcopy(home.places), "edges": deepcopy(home.edges),
+                        "cells": home.cells.tobytes(), "visited": np.packbits(home.visits.ravel() > 0).tobytes()}
+                    self.home_media = [(filename, metadata)]
+                    self.home_snapshot = {"path": filename, "wall_s": now - self.started,
+                        "map_id": home.identity, "revision": home.revision, "sequence": self.home_snapshot_count}
+                    self.home_snapshot_key = key
+                else:
+                    self.home_snapshots_omitted += 1
+            coverage = None
+            if home:
+                import numpy as np
+                coverage = {"known_cells": int(np.count_nonzero(home.evidence)),
+                    "free_m2": float(np.count_nonzero(home.evidence < 0) * home.resolution_m ** 2),
+                    "visited_cells": int(np.count_nonzero(home.visits)), "scan_count": home.scan_count}
+            if self.home_telemetry_count >= self.home_telemetry_limit:
+                self.home_snapshots_omitted += 1
+                return self.home_telemetry, events
+            self.home_telemetry = {"map": deepcopy(self.home_snapshot), "coverage": coverage,
+                "map_snapshot_current": self.home_snapshot_key == key,
+                "pose_m_rad": list(mission.pose) if mission.pose is not None else None,
+                "map_from_odometry_m_rad": list(mission.transform) if mission.transform is not None else None,
+                "localization": deepcopy(mission.localization), "lidar_age_s": max(0., time.monotonic() - mission.sampled_at) if mission.sampled_at else None,
+                "depth_age_s": max(0., time.monotonic() - worker.spatial_map.captured_at)
+                    if worker.spatial_map and worker.spatial_map.captured_at is not None else None,
+                "live_obstacles_m": mission.obstacles()[:1440] if home else [],
+                "route_m": deepcopy(mission.route[:1000]), "task": deepcopy(task), "stage": mission.stage,
+                "room_workflow": {key: value for key, value in workflow.items() if key != "deadline"},
+                "error": mission.error, "sampled_wall_s": now - self.started}
+            self.home_telemetry_count += 1
+            telemetry_path = f"media/telemetry-{self.home_telemetry_count}.json"
+            self.home_telemetry_media = [(telemetry_path, self.home_telemetry)]
+            self.home_telemetry = {**{key: value for key, value in self.home_telemetry.items()
+                if key not in {"live_obstacles_m", "route_m", "task"}},
+                "task": {key: value for key, value in task.items() if key in {"task_id", "kind", "status", "reason", "place_id", "segments", "retries", "completion_verified"}},
+                "telemetry_path": telemetry_path}
+        return self.home_telemetry, events
 
     def capture(self, worker):
         import pybullet as bullet
@@ -141,6 +238,9 @@ class RunRecorder:
         else:
             activity = "preparing" if worker.latest.get("busy") else phase
         now = self.clock()
+        home_started = time.perf_counter()
+        home, events = self.capture_home(worker, now)
+        self.home_capture_max_s = max(self.home_capture_max_s, time.perf_counter() - home_started)
         self.sample_sequence += 1
         sample = {"index": self.sample_sequence, "wall_s": now - self.started, "simulated_s": sim.ticks / 240,
             "run_id": sim.run_id, "episode_epoch": sim.epoch, "position_m": list(position),
@@ -169,10 +269,11 @@ class RunRecorder:
                 self.spatial_media = [(prefix + ".png", rgb), (prefix + "-depth.png", depth),
                     (prefix + ".json", sensor.model_dump_json().encode("utf-8"))]
             self.last_media_at = now
-        sample.update(camera=self.last_camera, spatial=self.last_spatial)
+        sample.update(camera=self.last_camera, spatial=self.last_spatial, home=home, home_events=events,
+            operator_assisted=bool(worker.latest.get("assisted")))
         if len(self.pending) == self.pending.maxlen:
             self.dropped += 1
-        self.pending.append((sample, self.camera_media + self.spatial_media))
+        self.pending.append((sample, self.camera_media + self.spatial_media + self.home_media + self.home_telemetry_media))
 
     def flush(self):
         if self.scene is not None and not self.scene_written:
@@ -183,6 +284,14 @@ class RunRecorder:
             for filename, content in media:
                 path = self.directory / filename
                 if not path.exists():
+                    if isinstance(content, dict):
+                        if "cells" in content:
+                            raw = content["cells"] + content["visited"]
+                            content = {**{key: value for key, value in content.items() if key not in {"cells", "visited"}},
+                                "encoding": "int8_cells_then_packbits_visited_zlib_base64",
+                                "sha256": hashlib.sha256(raw).hexdigest(),
+                                "data": base64.b64encode(zlib.compress(raw)).decode("ascii")}
+                        content = json.dumps(content, allow_nan=False).encode("utf-8")
                     path.write_bytes(content)
             self.stream.write(json.dumps(sample, separators=(",", ":"), allow_nan=False) + "\n")
         self.stream.flush()
@@ -193,7 +302,16 @@ class RunRecorder:
         with (self.directory / "trajectory.jsonl").open(encoding="utf-8") as source:
             samples = [json.loads(line) for line in source]
         score = score_samples(samples, dropped=self.dropped)
-        score["operator_assisted"] = any(sample["manual_placements"] for sample in samples)
+        score["operator_assisted"] = any(sample["manual_placements"] or sample.get("operator_assisted") for sample in samples)
+        homes = [sample["home"] for sample in samples if sample.get("home") and sample["home"].get("coverage")]
+        score["spatial_recording"] = {"snapshots": self.home_snapshot_count, "snapshots_omitted": self.home_snapshots_omitted,
+            "capture_max_s": self.home_capture_max_s,
+            "events": sum(len(sample.get("home_events", [])) for sample in samples), "events_omitted": self.home_events_omitted,
+            "initial": homes[0]["coverage"] if homes else None, "final": homes[-1]["coverage"] if homes else None,
+            "final_task": homes[-1].get("task") if homes else None,
+            "complete": bool(homes) and not (self.dropped or self.home_snapshots_omitted or self.home_events_omitted)}
+        score["spatial_recording"]["map_id"] = (homes[-1].get("map") or {}).get("map_id") if homes else None
+        score["spatial_recording"]["map_revision"] = (homes[-1].get("map") or {}).get("revision") if homes else None
         score["autonomous_success"] = score["final_physics_success"] and not score["operator_assisted"] and not self.dropped and metadata.get("real_model", False)
         manifest = {"schema_version": 1, "evaluation_only": True,
             "privacy": "Contains privileged physics measurements. Never send this recording or replay to the robot policy; curate sensor/action training data separately.",

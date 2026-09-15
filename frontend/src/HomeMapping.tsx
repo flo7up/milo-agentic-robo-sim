@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, CircleStop, Crosshair, FolderOpen, Map, MapPin, Navigation, Plus, RotateCcw, RotateCw, Save, Scan, Search } from 'lucide-react';
+import { Check, CircleStop, Crosshair, FolderOpen, Map, MapPin, Navigation, Plus, RotateCcw, RotateCw, Save, Scan, Search } from 'lucide-react';
 
-type Place = { place_id: string; name: string; kind: string; pose_m_rad: number[]; reachable: boolean };
+type Place = { place_id: string; name: string; kind: string; pose_m_rad: number[]; reachable: boolean; identity_status?: string };
 export type HomeState = {
   environment_id: string; stage: string; map_id: string | null; name: string | null; revision: number; dirty?: boolean;
   localization: { status: string; age_s: number; pose_m_rad: number[] | null; quality: { mean_residual_m?: number } | null };
@@ -13,6 +13,11 @@ export type HomeState = {
   error: string | null;
   objects?: { observation_id: string; label: string; position_m: number[]; confidence: number;
     observed_unix_s: number; currently_observed: boolean; supporting_images: string[] }[];
+  expansion_allowed?: boolean;
+  room_verification?: { status: string; identity_verified: boolean };
+  room_workflow?: { status: string; reason: string } | null;
+  room_observations?: { observation_id: string; place_id: string; label: string; evidence: string;
+    confidence: number; review_status: string; room_matches: boolean | null; observed_unix_s: number; image_url: string }[];
 };
 
 export function HomeMapping({ runId, epoch, connected, busy, stopped, request }: {
@@ -37,6 +42,7 @@ export function HomeMapping({ runId, epoch, connected, busy, stopped, request }:
   const [heading, setHeading] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [objectLimit, setObjectLimit] = useState(3);
+  const [roomLimit, setRoomLimit] = useState(3);
   const canvas = useRef<HTMLCanvasElement>(null);
   const projection = useRef({ left: -5, bottom: -5, width: 10, height: 7.5 });
   const running = state?.task?.status === 'running';
@@ -88,8 +94,9 @@ export function HomeMapping({ runId, epoch, connected, busy, stopped, request }:
     try {
       const current = await request('state') as { run_id: string; episode_epoch: number; observation: { seq: number } };
       if (current.run_id !== runId || current.episode_epoch !== epoch) throw new Error('Scenario changed');
-      await request('command', { run_id: runId, episode_epoch: epoch, observation_seq: current.observation.seq,
-        action_id: crypto.randomUUID(), tool: 'drive_base', arguments: { linear_mps: linear, angular_radps: angular, duration_s: 1 } });
+      const result = await request('command', { run_id: runId, episode_epoch: epoch, observation_seq: current.observation.seq,
+        action_id: crypto.randomUUID(), tool: 'drive_base', arguments: { linear_mps: linear, angular_radps: angular, duration_s: 1 } }) as { status: string; message?: string; error?: string };
+      if (result.status !== 'ok') throw new Error(result.message || result.error || 'Guided rotation was blocked');
     } catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
     finally { setPending(false); }
   }
@@ -175,8 +182,7 @@ export function HomeMapping({ runId, epoch, connected, busy, stopped, request }:
     </div>
     {state?.stage === 'mapping' && <div className="home-map-toolbar" role="group" aria-label="Guided mapping controls">
       <button title="Map: rotate left" aria-label="Map: rotate left" disabled={disabled} onClick={() => void drive(0, .4)}><RotateCcw size={18} /></button>
-      <button title="Map: drive forward" aria-label="Map: drive forward" disabled={disabled} onClick={() => void drive(.15, 0)}><ArrowUp size={18} /></button>
-      <button title="Map: drive backward" aria-label="Map: drive backward" disabled={disabled} onClick={() => void drive(-.15, 0)}><ArrowDown size={18} /></button>
+      <button disabled={disabled || !localized || !point || state.expansion_allowed === false} onClick={() => void act('guided_to', { pose_m_rad: point ? [...point, 0] : null, time_budget: budget })}><Navigation size={18} />Survey to selected point</button>
       <button title="Map: rotate right" aria-label="Map: rotate right" disabled={disabled} onClick={() => void drive(0, -.4)}><RotateCw size={18} /></button>
       <button disabled={disabled} onClick={() => void act('review')}><MapPin size={16} />Review map</button>
     </div>}
@@ -206,16 +212,28 @@ export function HomeMapping({ runId, epoch, connected, busy, stopped, request }:
             {point && <button title="Use current robot position" aria-label="Use current robot position" onClick={() => setPoint(null)}><Crosshair size={16} /></button>}</div>
         </div>
       </div>
-      {state.places.length > 0 && <ol className="home-place-list">{state.places.map(place => <li key={place.place_id}><span>{place.name}</span><small>{place.kind} / {place.reachable ? 'reachable' : 'not currently reachable'}</small></li>)}</ol>}
+      {state.places.length > 0 && <ol className="home-place-list">{state.places.map(place => <li key={place.place_id}><span>{place.name}</span><small>{place.kind} / {place.reachable ? 'reachable' : 'not currently reachable'} / {(place.identity_status ?? 'operator_named_unreviewed').replaceAll('_', ' ')}</small></li>)}</ol>}
       <div className="home-map-toolbar"><label>Map name<input aria-label="Map name" value={mapName} maxLength={80} onChange={event => setMapName(event.target.value)} /></label><button disabled={disabled || !mapName.trim()} onClick={() => void act('save_map', { name: mapName })}><Save size={16} />Save map</button></div>
       {state.revision > 0 && <div className="home-task-fields">
+        {state.stage !== 'mapping' && <button disabled={disabled || !localized || state.expansion_allowed === false} onClick={() => void act('continue_mapping')}><Scan size={16} />Continue mapping</button>}
         <label>Destination<select aria-label="Mapped destination" value={destination} onChange={event => setDestination(event.target.value)}><option value="">Select a destination</option>{state.places.map(place => <option key={place.place_id} value={place.place_id} disabled={!place.reachable}>{place.name}{place.reachable ? '' : ' (unreachable)'}</option>)}</select></label>
         <button disabled={disabled || !localized || !destination || !state.places.find(place => place.place_id === destination)?.reachable} onClick={() => void act('navigate_to', { place_id: destination, time_budget: budget })}><Navigation size={16} />Navigate</button>
         <label>Exploration region<select aria-label="Exploration region" value={region} onChange={event => setRegion(event.target.value)}><option value="">All connected space</option>{state.places.filter(place => place.kind === 'room').map(place => <option key={place.place_id} value={place.place_id}>{place.name}</option>)}</select></label>
         <label>Task budget (s)<input aria-label="Map task budget" type="number" min={1} max={300} value={budget} onChange={event => setBudget(Number(event.target.value))} /></label>
-        <button disabled={disabled || !localized || budget < 1 || budget > 300} onClick={() => void act('explore', { region_id: region || null, time_budget: budget })}><Search size={16} />Expand map</button>
+        <button disabled={disabled || !localized || state.expansion_allowed === false || budget < 1 || budget > 300} onClick={() => void act('explore', { region_id: region || null, time_budget: budget })}><Search size={16} />Expand map</button>
       </div>}
       {state.task && <div className="home-task-status" role="status"><strong>{state.task.status}</strong><span>{state.task.reason}</span><small>{state.task.segments} route segments / {state.task.retries} retries / {state.task.visited_frontiers} frontiers visited</small></div>}
+      {state.room_workflow && <div className="home-task-status" role="status" aria-label="Room round trip"><strong>{state.room_workflow.status.replaceAll('_', ' ')}</strong><span>{state.room_workflow.reason}</span></div>}
+      {state.room_verification && <output aria-label="Current room report">{state.room_verification.status.replaceAll('_', ' ')} / independent identity verification unavailable</output>}
+      {!!state.room_observations?.length && <details className="home-object-memory"><summary>Room observations ({state.room_observations.length})</summary>
+        <ul>{state.room_observations.slice(0, roomLimit).map(observation => <li key={observation.observation_id}>
+          <a href={observation.image_url} target="_blank" rel="noreferrer"><img src={observation.image_url} loading="lazy" alt={`Room evidence for ${observation.label}`} /></a>
+          <div><strong>{observation.label}</strong><span>{observation.review_status.replaceAll('_', ' ')} / {new Date(observation.observed_unix_s * 1000).toLocaleString()}</span>
+            <span>{observation.evidence}</span><small>{(observation.confidence * 100).toFixed(0)}% reported confidence{observation.room_matches === false ? ' / visual mismatch' : observation.room_matches === true ? ' / visual match reported' : ''}</small>
+            <button disabled={disabled || observation.review_status === 'operator_confirmed' || observation.room_matches === false} onClick={() => void act('review_room', { evidence_id: observation.observation_id })}><Check size={16} />Confirm {observation.label}</button></div>
+        </li>)}</ul>
+        {state.room_observations.length > roomLimit && <div className="home-map-toolbar"><button onClick={() => setRoomLimit(value => value + 5)}>Show more</button><button onClick={() => setRoomLimit(state.room_observations!.length)}>View all</button></div>}
+      </details>}
       {!!state.objects?.length && <details className="home-object-memory"><summary>Object observations ({state.objects.length})</summary>
         <ul>{state.objects.slice(0, objectLimit).map(observation => <li key={observation.observation_id}>
           <a href={observation.supporting_images[0]} target="_blank" rel="noreferrer"><img src={observation.supporting_images[0]} loading="lazy" alt={`Evidence for ${observation.label}`} /></a>

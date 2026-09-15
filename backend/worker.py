@@ -128,6 +128,13 @@ class SimulationWorker:
         self.spatial_processor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spatial-processing")
         self.spatial_pending = None
         self.spatial_pending_map = None
+        self.spatial_pending_stop_revision = None
+        self.spatial_capture_executor = None
+        self.spatial_capture_pending = None
+        self.spatial_capture_stop_revision = None
+        self.spatial_capture_generation = 0
+        self.spatial_generation = 0
+        self.mapped_depth_sensor = None
         self.spatial_processing_max_s = 0.
         self.spatial_submitted_at = 0.
         self.spatial_timing = {"capture_max_s": 0., "post_capture_max_s": 0.,
@@ -370,6 +377,8 @@ class SimulationWorker:
                 self.renderer.close()
             if self.preview_renderer:
                 self.preview_renderer.close()
+            if self.spatial_capture_executor:
+                self.spatial_capture_executor.shutdown(wait=True, cancel_futures=True)
             if self.spatial_pending:
                 try:
                     self.spatial_pending.result(timeout=5)
@@ -396,6 +405,8 @@ class SimulationWorker:
             mapped, observation, image, depth = pending.result(timeout=1.)
             if source is not self.spatial_map or not self.spatial_enabled:
                 return
+            if self.spatial_pending_stop_revision is not None and self.spatial_pending_stop_revision != self.stop_revision:
+                return
             received_at = time.monotonic()
             age = received_at - observation.captured_at
             self.spatial_processing_max_s = max(self.spatial_processing_max_s, age)
@@ -410,6 +421,8 @@ class SimulationWorker:
             while len(self.spatial_frames) > 8:
                 self.spatial_frames.popitem(last=False)
             self._camera_history().record(observation, image)
+            if self.sim.rendering == "enhanced" and self.home_mission and self.home_mission.home:
+                self._publish_camera(image, observation.simulated_time_s)
             self.spatial_error = None
         except TimeoutError:
             self.spatial_pending, self.spatial_pending_map = pending, source
@@ -418,15 +431,74 @@ class SimulationWorker:
         except Exception as error:
             self.spatial_error = str(error)
 
+    def _receive_mapped_capture(self, wait=False):
+        from backend.camera import process_spatial
+        pending = self.spatial_capture_pending
+        if pending is None or (not wait and not pending.done()):
+            return
+        try:
+            observation, image = pending.result(timeout=1.)
+        except TimeoutError:
+            return
+        except Exception as error:
+            self.spatial_capture_pending = None
+            self.spatial_error = f"RENDERER_FAILED: {error}"
+            self._camera_failed(error)
+            return
+        self.spatial_capture_pending = None
+        if (not self.spatial_enabled or self.spatial_capture_generation != self.spatial_generation
+                or self.spatial_capture_stop_revision != self.stop_revision
+                or observation.run_id != self.sim.run_id or observation.episode_epoch != self.sim.epoch):
+            return
+        age = time.monotonic() - observation.captured_at
+        if not 0 <= age <= 1.:
+            self.spatial_error = "Spatial capture expired"
+            self.spatial_timing["expired_results"] += 1
+            return
+        self.mapped_depth_sensor = observation
+        self._publish_camera(image, observation.simulated_time_s)
+        if self.home_mission:
+            self.home_mission.observe_depth(observation)
+        if self.spatial_pending is not None:
+            return
+        self.spatial_pending_map = self.spatial_map
+        self.spatial_pending_stop_revision = self.stop_revision
+        self.spatial_submitted_at = time.monotonic()
+        self.spatial_pending = self.spatial_processor.submit(process_spatial, self.spatial_map, observation, image)
+
     def _sample_spatial(self, force=False):
         from backend.camera import process_spatial
         self._receive_spatial(wait=force)
-        if not self.spatial_enabled or self.renderer or self.spatial_pending is not None:
+        self._receive_mapped_capture(wait=force)
+        if force:
+            self._receive_spatial(wait=True)
+        mapped_capture = not force and self.sim.rendering == "enhanced" and self.home_mission and self.home_mission.home
+        if not self.spatial_enabled or self.renderer or self.spatial_capture_pending is not None or (self.spatial_pending is not None and not mapped_capture):
             return
         if not force and time.monotonic() - self.spatial_sampled_at < .2:
             return
         self.spatial_sampled_at = time.monotonic()
         self.spatial_sequence += 1
+        if mapped_capture:
+            import pybullet as bullet
+            from backend.camera import capture_spatial_snapshot, scene_snapshot
+            from backend.spatial import calibration
+            if self.spatial_capture_executor is None:
+                self.spatial_capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mapped-rgbd")
+            intrinsics = calibration(160, 120)
+            metadata = {"run_id": self.sim.run_id, "episode_epoch": self.sim.epoch, "sequence": self.spatial_sequence,
+                "captured_at": self.spatial_sampled_at, "simulated_time_s": self.sim.ticks * TIMESTEP,
+                "calibration": intrinsics.model_dump(), "odometry_m_rad": self.sim.odometry.tolist(),
+                "head_rad": [bullet.getJointState(self.sim.robot, self.sim.joints[name], physicsClientId=self.sim.client)[0]
+                    for name in ("head_yaw", "head_pitch")]}
+            packet = scene_snapshot(self.sim, intrinsics.width, intrinsics.height)
+            self.spatial_capture_stop_revision = self.stop_revision
+            self.spatial_capture_generation = self.spatial_generation
+            self.spatial_submitted_at = time.monotonic()
+            self.spatial_capture_pending = self.spatial_capture_executor.submit(capture_spatial_snapshot,
+                self.sim.camera_renderer, packet, metadata)
+            return
+        self.spatial_pending_stop_revision = None
         try:
             observation, image = self.sim.capture_spatial(self.spatial_sequence)
         except Exception as error:
@@ -440,6 +512,9 @@ class SimulationWorker:
             self.spatial_submitted_at - observation.captured_at)
         if self.sim.rendering == "enhanced":
             self._publish_camera(image, observation.simulated_time_s)
+            if self.home_mission and self.home_mission.home:
+                self.mapped_depth_sensor = observation
+                self.home_mission.observe_depth(observation)
         self.spatial_pending_map = self.spatial_map
         self.spatial_pending = self.spatial_processor.submit(process_spatial, self.spatial_map, observation, image)
         if force:
@@ -1246,7 +1321,7 @@ class SimulationWorker:
         self._sample_spatial()
         if getattr(self.continuous, "home_owned", False):
             self.home_mission.sample()
-            self.continuous.update(self.sim, self.navigation, self.spatial_map, self.home_mission.path_valid)
+            self.continuous.update(self.sim, self.navigation, self.home_mission, self.home_mission.path_valid)
             if self.continuous.active:
                 self.navigation.expires_at = min(self.navigation.expires_at, time.monotonic() + .5)
             return
@@ -1280,6 +1355,8 @@ class SimulationWorker:
             if self.spatial_enabled == settings.enabled:
                 return self.spatial_state()
             self.spatial_enabled = settings.enabled
+            self.spatial_generation += 1
+            self.mapped_depth_sensor = None
             self.spatial_map = ObservedMap(sim.run_id, sim.epoch) if settings.enabled else None
             self.spatial_frames.clear()
             self.camera_history = None
@@ -1296,14 +1373,14 @@ class SimulationWorker:
         self.queue.put((future, operation))
         return await asyncio.wrap_future(future)
 
-    async def home_command(self, request, expected_stop_revision=None, expected_task_revision=None, selected_evidence=None):
+    async def home_command(self, request, expected_stop_revision=None, expected_task_revision=None, selected_evidence=None, operator_review=False):
         from backend.home_mission import HomeMission
         stop_revision = self.stop_revision if expected_stop_revision is None else expected_stop_revision
         task_revision = self.task_revision if expected_task_revision is None else expected_task_revision
         def operation(sim):
             if self.home_mission is None:
                 self.home_mission = HomeMission(self)
-            return self.home_mission.command(request, stop_revision, task_revision, selected_evidence)
+            return self.home_mission.command(request, stop_revision, task_revision, selected_evidence, operator_review)
         return await self.call(operation)
 
     async def home_state(self, compact=False):
@@ -1439,7 +1516,12 @@ class SimulationWorker:
                     self._publish_navigation()
             self.latest = {**self.latest, "busy": True, "assisted": self.latest["assisted"] or assisted}
             try:
-                result = sim.execute(command)
+                if self.home_mission and self.home_mission.stage == "mapping" and command.tool == "drive_base":
+                    self._sample_spatial(force=True)
+                    self.home_mission.sample(force=True)
+                    result = sim.execute(command, drive_guard=self.home_mission.guard_guided_drive)
+                else:
+                    result = sim.execute(command)
                 self.latest = {**self.latest, "busy": False, "observation": result.observation.model_dump(), "result": result.model_dump(),
                                "snapshot": sim.snapshot(), "stopped": sim.cancel.is_set(), "challenge": sim.challenge_status(),
                                "proximity": result.observation.proximity.model_dump()}
@@ -1661,6 +1743,8 @@ class SimulationWorker:
             if self.navigation and self.navigation.status in {"running", "awaiting_feedback"}:
                 raise MotionError("CONTROL_CONFLICT", "Cancel navigation before placement.")
             observation = sim.reposition(placement)
+            self.spatial_generation += 1
+            self.mapped_depth_sensor = None
             if self.home_mission:
                 self.home_mission.invalidate("LOCALIZATION_LOST: manual relocation requires scan matching")
             self.map_history = None
@@ -1700,6 +1784,9 @@ class SimulationWorker:
                 return False
             if self.home_mission:
                 self.home_mission.fail("Manual control resumed", "cancelled")
+                self.home_mission.room_verification = None
+                self.home_mission.room_evidence_after = time.monotonic()
+                self.home_mission.workflow = None
             if sim.rendering == "enhanced" and sim.camera_renderer and (
                     sim.camera_renderer.closed or sim.camera_renderer.process.poll() is not None):
                 raise MotionError("RENDERER_FAILED", "Reset the episode before resuming after a camera failure")

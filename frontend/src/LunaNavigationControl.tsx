@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Bot, Check, Hand, Play, Power, Settings2, Timer, Send, MessageSquare, History, Radio } from 'lucide-react';
+import { Bot, Check, CircleStop, Compass, Hand, Play, Power, Settings2, Timer, Send, MessageSquare, History, Radio } from 'lucide-react';
 import { ExchangeFeed } from './ExchangeFeed';
 import { LocalModelProgress } from './LocalModelProgress';
 import type { LiveState, Reasoning } from './types';
@@ -19,6 +19,27 @@ export function LunaNavigationControl({ state, connected, request }: {
   const [deployment, setDeployment] = useState(luna?.deployment ?? '');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
+  const [controlMode, setControlMode] = useState<'task' | 'exploration'>('task');
+  const [explorationBudget, setExplorationBudget] = useState(180);
+  const [home, setHome] = useState<{map_id: string | null; name: string | null; revision: number;
+    localization: {status: string}; expansion_allowed?: boolean; coverage: {free_m2: number} | null;
+    task: {status: string; reason: string; local_exploration?: boolean; continuations?: number; visited_frontiers: number} | null} | null>(null);
+  useEffect(() => {
+    if (controlMode !== 'exploration' || !connected || pending) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    async function refresh() {
+      try {
+        const response = await fetch('/api/home?compact=true', {signal:controller.signal});
+        if (!response.ok) throw new Error('Local exploration state unavailable');
+        const value = await response.json();
+        if (!controller.signal.aborted) setHome(value);
+      } catch (failure) { if (!controller.signal.aborted) setError(String(failure)); }
+      finally { if (!controller.signal.aborted) timer = setTimeout(refresh, 1000); }
+    }
+    void refresh();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [controlMode, connected, pending, state.run_id]);
   const [instruction, setInstruction] = useState('');
   const [sending, setSending] = useState(false);
   const [instructionError, setInstructionError] = useState('');
@@ -86,7 +107,34 @@ export function LunaNavigationControl({ state, connected, request }: {
   }
   const residentLabels = { unloaded: continuous ? 'Model not loaded / SmolVLA inactive' : 'Model not loaded / loads on first Start', loading: 'Loading model into GPU memory',
     ready: 'Model ready / kept in GPU memory', inferencing: 'Model loaded / processing a request', error: 'Model worker unavailable / reloads on Start' };
+  const exploring = home?.task?.status === 'running';
+  const modeSelector = <div className="control-mode-selector" role="group" aria-label="Robot control mode">
+    <button type="button" aria-pressed={controlMode === 'task'} disabled={pending || agent.active || state.busy || exploring} onClick={() => setControlMode('task')}><Bot size={16}/>Task / Luna</button>
+    <button type="button" aria-pressed={controlMode === 'exploration'} disabled={pending || agent.active || state.busy} onClick={() => setControlMode('exploration')}><Compass size={16}/>Explore / local</button>
+  </div>;
+  if (controlMode === 'exploration') return <section className="agent-section local-exploration" aria-label="Local exploration">
+    {modeSelector}
+    <div className="panel-header"><h3><Compass size={17}/>Explore locally</h3><span className="tag">No model inference</span></div>
+    <dl className="results-facts"><div><dt>Map</dt><dd>{home?.name ?? 'New unsaved sensor map'}</dd></div><div><dt>Localization</dt><dd>{home?.map_id ? home.localization.status : 'Starts at current robot pose'}</dd></div><div><dt>Observed free</dt><dd>{home?.coverage ? `${home.coverage.free_m2.toFixed(1)} m2` : 'Not measured'}</dd></div><div><dt>Model calls</dt><dd>0</dd></div></dl>
+    <form onSubmit={event => { event.preventDefault(); setPending(true); setError(''); void (async () => {
+      try {
+        await request('continuous/scan', {run_id:state.run_id,episode_epoch:state.episode_epoch,compact_arms:true});
+        const result = await request('home', {run_id:state.run_id,episode_epoch:state.episode_epoch,action:'start_exploration',time_budget:explorationBudget});
+        setHome(result as NonNullable<typeof home>);
+      } catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
+      finally { setPending(false); }
+    })(); }}>
+      <label>Exploration budget (s)<input aria-label="Local exploration budget" type="number" min={1} max={300} value={explorationBudget} disabled={pending || exploring} onChange={event => setExplorationBudget(Number(event.target.value))}/></label>
+      <div className="agent-actions"><button className="primary" type="submit" disabled={!connected || !home || pending || state.busy || state.stopped || agent.active || exploring || home.expansion_allowed === false || (home.map_id !== null && home.localization.status !== 'localized') || explorationBudget < 1 || explorationBudget > 300}><Play size={16}/>Start exploration</button>
+        <button type="button" className="stop-button" disabled={!connected} onClick={() => void request('home', {run_id:state.run_id,episode_epoch:state.episode_epoch,action:'cancel_task'}).catch(failure => setError(String(failure)))}><CircleStop size={16}/>Stop exploration</button></div>
+    </form>
+    {state.stopped && <p role="status">Stopped / manual resume required</p>}
+    {home?.map_id && home.localization.status !== 'localized' && <p role="status">Saved map loaded / localization required in Home map</p>}
+    {home?.task?.local_exploration && <div className="home-task-status" role="status"><strong>{home.task.status}</strong><span>{home.task.reason}</span><small>{home.task.visited_frontiers} frontiers / {home.task.continuations ?? 0} rolling continuations</small></div>}
+    {error && <p className="error" role="alert">{error}</p>}
+  </section>;
   return <section className="agent-section" aria-label="LLM control">
+    {modeSelector}
     <div className="panel-header"><h3><Bot size={17} /> Luna</h3>
       <span className="tag">{agent.active ? 'Supervisor active' : luna?.configured ? 'Ready for a goal' : 'Connection required'}</span></div>
     <details className="agent-connection setup-connection" hidden={agent.active} open={connectionOpen}

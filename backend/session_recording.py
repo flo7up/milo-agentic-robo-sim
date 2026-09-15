@@ -14,6 +14,134 @@ ROOT = Path(__file__).resolve().parents[1]
 SESSION_RESULTS_ROOT = ROOT / ".runtime/performance"
 
 
+class HomeSessionRecording:
+    def __init__(self, worker, request, evidence="operator_session", directory=None):
+        self.worker = worker
+        self.request = request
+        self.directory = Path(directory) if directory else SESSION_RESULTS_ROOT / f"home-session-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+        self.case_id = worker.challenge.id if worker.challenge else "bench"
+        self.recorder = RunRecorder(self.directory / self.case_id / "recording")
+        self.done = asyncio.Event()
+        self.finalize_lock = asyncio.Lock()
+        self.finished = False
+        self.executing = True
+        self.writer = None
+        self.error = None
+        self.request_error = None
+        self.reason = None
+        self.source = {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted((ROOT / "backend").glob("*.py"))}
+        challenge = worker.challenge
+        self.manifest = {"schema_version": 2, "experiment_id": str(uuid4()), "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None, "mode": "home_mapping", "stage": "spatial_workflow", "evidence": evidence,
+            "supervisor_deployment": "None", "cases": [{"case_id": self.case_id, "challenge": self.case_id,
+                "environment": challenge.environment if challenge else "standalone",
+                "challenge_sha256": hashlib.sha256(json.dumps(challenge.model_dump() if challenge else {}, sort_keys=True).encode()).hexdigest()}],
+            "design": {"label": "spatial-replay-v1", "code_sha256": self.source,
+                "source_sha256": hashlib.sha256(json.dumps(self.source, sort_keys=True).encode()).hexdigest()},
+            "request": request.model_dump(), "goal": request.action, "session_timeout_s": 1800,
+            "note": "Operator spatial workflow; controller arrival is not independently scored scenario success. Preparation before the first home request is outside this recording."}
+
+    async def start(self):
+        def attach(sim):
+            if self.worker.recorder is not None:
+                raise ValueError("Another recording already owns this worker")
+            self.worker.recorder = self.recorder
+            self.recorder.capture(self.worker)
+        try:
+            await asyncio.to_thread(write_recording_json, self.directory / "experiment.json", self.manifest)
+            await self.worker.call(attach)
+            await asyncio.to_thread(self.publish)
+        except BaseException:
+            await self.worker.call(lambda sim: setattr(self.worker, "recorder", None) if self.worker.recorder is self.recorder else None)
+            self.recorder.stream.close()
+            raise
+        self.writer = asyncio.create_task(self.watch())
+
+    def publish(self, score=None):
+        home = self.recorder.home_telemetry or {}
+        task = home.get("task") or {}
+        report = {"case_id": self.case_id, "challenge": self.case_id, "evidence": self.manifest["evidence"],
+            "environment": self.manifest["cases"][0]["environment"], "physics_success": False,
+            "verification_eligible": False, "initial_goal": self.request.action, "final_goal": self.request.action,
+            "run_status": "finished" if score is not None else "running", "updated_at": time.time(),
+            "termination_reason": self.reason or task.get("status") or "running", "phase": self.reason or task.get("status") or "mapping",
+            "rendering": self.worker.rendering, "recording_error": self.error,
+            "request_error": self.request_error,
+            "evaluation_elapsed_s": self.recorder.clock() - self.recorder.started,
+            "home_map": home.get("map"), "input_tokens": 0, "output_tokens": 0,
+            "recording_scorecard": score or {"complete_recording": False, "samples": self.recorder.sample_sequence,
+                "dropped_records": self.recorder.dropped, "spatial_recording": {"initial": None, "final": home.get("coverage"),
+                    "final_task": task, "snapshots": self.recorder.home_snapshot_count, "complete": False}}}
+        write_recording_json(self.directory / self.case_id / "report.json", report)
+
+    async def watch(self):
+        try:
+            while not self.done.is_set():
+                try:
+                    await asyncio.wait_for(self.done.wait(), .5)
+                except TimeoutError:
+                    pass
+                if self.done.is_set():
+                    break
+                await self.worker.call(lambda sim: self.recorder.capture(self.worker))
+                await asyncio.to_thread(self.recorder.flush)
+                await asyncio.to_thread(self.publish)
+                mission = self.worker.home_mission
+                awaiting_room = mission and mission.workflow and mission.workflow["status"] == "awaiting_room_report"
+                terminal = self.request.action in {"navigate_to", "explore", "explore_frontier", "start_exploration"} and mission and not mission.active and not awaiting_room
+                if not self.executing and (self.worker.sim.cancel.is_set() or terminal or self.recorder.clock() - self.recorder.started >= 1800):
+                    await self.finish("interrupted" if self.worker.sim.cancel.is_set() else "recording_limit" if not terminal else None)
+                    break
+        except (OSError, RuntimeError, ValueError) as error:
+            self.error = str(error)
+            self.worker.stop()
+            self.worker.latest = {**self.worker.latest, "recording_error": self.error}
+            await self.finish("recording_error")
+
+    async def finish(self, reason=None):
+        self.done.set()
+        if self.writer and self.writer is not asyncio.current_task():
+            await self.writer
+        async with self.finalize_lock:
+            if self.finished:
+                return
+            self.reason = reason
+            def detach(sim):
+                if self.worker.recorder is self.recorder:
+                    self.recorder.capture(self.worker)
+                    self.worker.recorder = None
+                return self.worker.camera_frames.get((self.worker.latest.get("camera") or {}).get("frame_ref"))
+            image = await self.worker.call(detach)
+            def finalize():
+                try:
+                    score = self.recorder.finish({"evidence": self.manifest["evidence"], "real_model": False, "recording_error": self.error})
+                    if self.error:
+                        score["complete_recording"] = False
+                        score["spatial_recording"]["complete"] = False
+                    self.publish(score)
+                    write_recording_json(self.directory / self.case_id / "recording" / "scorecard.json", score)
+                    if image:
+                        (self.directory / self.case_id / "terminal.png").write_bytes(image)
+                    self.manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+                    self.manifest["source_changed_during_run"] = any(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest for name, digest in self.source.items())
+                    write_recording_json(self.directory / "experiment.json", self.manifest)
+                finally:
+                    self.recorder.stream.close()
+            try:
+                await asyncio.to_thread(finalize)
+            except OSError as error:
+                self.error = str(error)
+                self.worker.stop()
+                self.worker.latest = {**self.worker.latest, "recording_error": self.error}
+                score = {"complete_recording": False, "dropped_records": self.recorder.dropped,
+                    "samples": self.recorder.sample_sequence, "spatial_recording": {"complete": False}}
+                self.reason = "recording_error"
+                await asyncio.to_thread(self.publish, score)
+            finally:
+                self.finished = True
+
+
 def create_session(controller, worker, settings, profile):
     from backend.agent import ConfiguredModel
     evidence = controller.recording_evidence

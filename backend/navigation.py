@@ -222,6 +222,11 @@ class NavigationRuntime:
         self.expires_at = self.clock() + sum(segment.duration_s for segment in arguments.segments) + .5
         self.sensed_at = self.clock()
 
+    @staticmethod
+    def bounds_overlap(robot_lower, robot_upper, obstacle_lower, obstacle_upper, margin):
+        return all(robot_lower[axis] <= obstacle_upper[axis] + margin
+            and robot_upper[axis] >= obstacle_lower[axis] - margin for axis in range(3))
+
     def check_clearance(self, sim, linear, angular):
         sensors = sim.proximity_sensors()
         if sensors.collisions:
@@ -265,18 +270,22 @@ class NavigationRuntime:
             finally:
                 bullet.resetBasePositionAndOrientation(item["id"], obstacle_position, obstacle_rotation, physicsClientId=sim.planner)
         lookahead_s = max(.4, abs(linear) / (2 * LINEAR_ACCELERATION_MPS2) + .05)
+        obstacle_bounds = [(item, bullet.getAABB(item["id"], physicsClientId=sim.planner))
+            for item in sim.objects if item["name"] != "floor" and not item.get("marker")]
         for horizon in np.linspace(0, lookahead_s, math.ceil(lookahead_s / .1) + 1):
             heading = yaw + angular * horizon
             destination = [position[0] + linear * horizon * math.cos(yaw + angular * horizon / 2),
                            position[1] + linear * horizon * math.sin(yaw + angular * horizon / 2), position[2]]
             bullet.resetBasePositionAndOrientation(sim.shadow, destination,
                 bullet.getQuaternionFromEuler([roll, pitch, heading]), physicsClientId=sim.planner)
+            robot_lower, robot_upper = np.full(3, np.inf), np.full(3, -np.inf)
             for index in [-1, *sim.joints.values()]:
                 lower, upper = bullet.getAABB(sim.shadow, index, physicsClientId=sim.planner)
+                robot_lower, robot_upper = np.minimum(robot_lower, lower), np.maximum(robot_upper, upper)
                 if any(lower[axis] < floor_lower[axis] or upper[axis] > floor_upper[axis] for axis in (0, 1)):
                     raise MotionError("CLEARANCE_STOP", "Buffered motion would leave the floor.")
-            for item in sim.objects:
-                if item["name"] == "floor" or item.get("marker"):
+            for item, (lower, upper) in obstacle_bounds:
+                if not self.bounds_overlap(robot_lower, robot_upper, lower, upper, .015):
                     continue
                 if bullet.getClosestPoints(sim.shadow, item["id"], .015, physicsClientId=sim.planner):
                     raise MotionError("CLEARANCE_STOP", "Buffered motion lacks whole-robot clearance.")

@@ -207,9 +207,90 @@ async def record_scenario(identifier, directory):
             recorder.finish({"challenge": identifier, "real_model": False, "harness_error": True})
 
 
+async def record_spatial_replay(directory, map_id, home_place_id):
+    import sqlite3
+    from backend.challenges import shared_apartment
+    from backend.contracts import Command
+    from backend.continuous_navigation import ContinuousScan
+    from backend.home_mapping import MapStore
+    from backend.home_mission import DEFAULT_MAP_PATH, HomeMission, HomeRequest
+    from backend.session_recording import HomeSessionRecording
+    from backend.saved_results import recorded_replay, saved_results
+    if not map_id or not home_place_id:
+        raise ValueError("Spatial replay requires a saved map ID and operator-selected Home place ID")
+    directory.mkdir(parents=True, exist_ok=False)
+    source = sqlite3.connect(f"file:{DEFAULT_MAP_PATH.as_posix()}?mode=ro", uri=True)
+    copied = sqlite3.connect(directory / "maps.sqlite3")
+    try:
+        source.backup(copied)
+        original = source.execute("SELECT document FROM maps WHERE map_id=?", (map_id,)).fetchone()
+        if original is None:
+            raise ValueError("Saved map unavailable")
+    finally:
+        source.close()
+        copied.close()
+    worker = SimulationWorker(challenge=shared_apartment("flat_kitchen"), pace=True, rendering="enhanced")
+    session = None
+    try:
+        await asyncio.wrap_future(worker.ready)
+        store = MapStore(directory / "maps.sqlite3")
+        await worker.call(lambda sim: setattr(worker, "home_mission", HomeMission(worker, store)))
+        identity = {"run_id": worker.latest["run_id"], "episode_epoch": worker.epoch}
+        request = HomeRequest(**identity, action="load_map", map_id=map_id)
+        session = HomeSessionRecording(worker, request, evidence="scripted_test", directory=directory)
+        session.manifest["note"] = "Scripted recorder/replay integration using real sensors and wheel motion; isolated copy of saved home. Not Luna or a capability benchmark."
+        await session.start()
+        await worker.home_command(request)
+        await worker.scan_continuous(ContinuousScan(**identity, compact_arms=True))
+        await worker.home_command(HomeRequest(**identity, action="localize", place_id=home_place_id))
+        for _ in range(2):
+            observation, _ = await worker.feedback()
+            result = await worker.execute(Command(**identity, observation_seq=observation.seq, action_id=str(uuid4()),
+                tool="drive_base", arguments={"linear_mps": .15, "angular_radps": 0., "duration_s": 1.}), assisted=True)
+            if result.status != "ok":
+                raise ValueError(result.message)
+        await worker.home_command(HomeRequest(**identity, action="navigate_to", place_id=home_place_id, time_budget=30.))
+        async with asyncio.timeout(35):
+            while worker.home_mission.active:
+                await asyncio.sleep(.1)
+        await worker.call(lambda sim: session.recorder.capture(worker))
+        navigation_outcome = dict(worker.home_mission.task)
+        if not worker.sim.cancel.is_set():
+            try:
+                await worker.home_command(HomeRequest(**identity, action="explore", time_budget=8.))
+                async with asyncio.timeout(15):
+                    while worker.home_mission.active:
+                        await asyncio.sleep(.1)
+            except (ValueError, TimeoutError) as error:
+                session.request_error = str(error)
+        worker.stop()
+        await worker.hold_stopped()
+        await session.finish("scripted_probe_finished")
+        with sqlite3.connect(f"file:{DEFAULT_MAP_PATH.as_posix()}?mode=ro", uri=True) as connection:
+            assert connection.execute("SELECT document FROM maps WHERE map_id=?", (map_id,)).fetchone() == original
+        root = Path(__file__).resolve().parents[1] / ".runtime"
+        batch = next(batch for batch in saved_results(root)["batches"] if root / batch["name"] == directory.resolve())
+        replay = recorded_replay(batch["id"], 0, root)
+        result = {"batch_id": batch["id"], "replay_url": batch["trials"][0]["replay_url"], "frames": len(replay["frames"]),
+            "events": len(replay["events"]), "navigation_outcome": navigation_outcome,
+            "original_map_unchanged": True, "evidence": "scripted_test", "spatial_progress": replay["spatial_progress"]}
+        (directory / "replay-check.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        return result
+    finally:
+        worker.stop()
+        if session and not session.finished:
+            await session.finish("scripted_probe_interrupted")
+        await worker.close()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Record isolated scripted physics tests; no model inference or live-session control")
-    parser.add_argument("--scenario", choices=["bench", "pedestrian_crossing"], required=True)
+    parser.add_argument("--scenario", choices=["bench", "pedestrian_crossing", "home_replay"], required=True)
+    parser.add_argument("--map-id")
+    parser.add_argument("--home-place-id")
     parser.add_argument("--output", type=Path, required=True)
     options = parser.parse_args()
-    print(asyncio.run(record_scenario(options.scenario, options.output)))
+    if options.scenario == "home_replay":
+        print(json.dumps(asyncio.run(record_spatial_replay(options.output, options.map_id, options.home_place_id)), indent=2))
+    else:
+        print(asyncio.run(record_scenario(options.scenario, options.output)))

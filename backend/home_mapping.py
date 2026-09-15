@@ -67,7 +67,8 @@ class HomeMap:
         return np.where(self.evidence > 0, 100, np.where(self.evidence < 0, 0, -1)).astype(np.int8)
 
     def indices(self, points):
-        return np.floor((np.asarray(points) - self.origin) / self.resolution_m).astype(int)
+        scaled = (np.asarray(points) - self.origin) / self.resolution_m
+        return np.floor(np.nextafter(scaled, np.inf)).astype(int)
 
     def inside(self, indices):
         indices = np.asarray(indices)
@@ -84,9 +85,11 @@ class HomeMap:
             samples = np.linspace(origin, endpoint, max(2, math.ceil(np.linalg.norm(endpoint - origin) / .04) + 1))[:-1]
             free_indices.append(self.indices(samples))
         if free_indices:
-            free = np.unique(np.concatenate(free_indices), axis=0)
+            free = np.concatenate(free_indices)
             free = free[self.inside(free)]
-            self.evidence[free[:, 1], free[:, 0]] = np.maximum(-20, self.evidence[free[:, 1], free[:, 0]] - 1)
+            codes = np.unique(free[:, 1] * self.size + free[:, 0])
+            rows, columns = np.divmod(codes, self.size)
+            self.evidence[rows, columns] = np.maximum(-20, self.evidence[rows, columns] - 1)
         occupied = np.unique(self.indices(endpoints[hits]), axis=0)
         occupied = occupied[self.inside(occupied)]
         self.evidence[occupied[:, 1], occupied[:, 0]] = np.minimum(20, self.evidence[occupied[:, 1], occupied[:, 0]] + 4)
@@ -149,21 +152,40 @@ class HomeMap:
         if len(self.places) >= 100 or any(place["name"].casefold() == name.strip().casefold() for place in self.places):
             raise ValueError("Place name already exists or the map has 100 places")
         self.route(pose[:2], pose[:2], radius_m)
-        neighbours = []
+        connections = []
         for identity in connects:
             neighbour = next((place for place in self.places if place["place_id"] == identity), None)
             if neighbour is None:
                 raise ValueError("UNKNOWN_PLACE: graph connection does not exist")
-            self.route(pose[:2], neighbour["pose_m_rad"][:2], radius_m)
-            neighbours.append(identity)
+            path = self.route(pose[:2], neighbour["pose_m_rad"][:2], radius_m)
+            connections.append({"to": identity, "path_m": path})
         place = {"place_id": str(uuid4()), "name": name.strip(), "kind": kind,
             "pose_m_rad": list(pose), "frame": "map", "map_id": self.identity,
             "created_unix_s": time.time(), "source": "operator_annotation"}
         self.places.append(place)
         self.annotations_dirty = True
-        self.edges.extend({"from": place["place_id"], "to": identity, "source": "operator_connected_observed_route"}
-            for identity in neighbours)
+        self.edges.extend({"from": place["place_id"], **connection, "source": "operator_connected_observed_route"}
+            for connection in connections)
         return place
+
+    def graph_summary(self, allowed, limit=64):
+        places = {place["place_id"]: place for place in self.places}
+        connections = []
+        for edge in self.edges[:limit]:
+            if edge["from"] not in places or edge["to"] not in places:
+                continue
+            path = edge.get("path_m")
+            status = "unknown"
+            if allowed is not None and path:
+                points = np.concatenate([np.linspace(start, end, max(2, math.ceil(math.dist(start, end) / .025) + 1))
+                    for start, end in zip(path, path[1:])]) if len(path) > 1 else np.asarray(path)
+                indices = self.indices(points)
+                clear = self.inside(indices).all() and allowed[indices[:, 1], indices[:, 0]].all()
+                status = "reachable" if clear else "blocked"
+            connections.append({"from": edge["from"], "to": edge["to"], "status": status,
+                "basis": "recorded_observed_connection_path" if path else "legacy_link_without_recorded_path"})
+        return {"connections": connections, "truncated": len(self.edges) > limit,
+            "claim": "Path clearance only; room identity and doorway opening are separate observations"}
 
     def frontiers(self, pose, radius_m, obstacles=(), region_id=None):
         allowed = self.allowed(radius_m, obstacles)
@@ -292,6 +314,7 @@ class MapStore:
         with self.connect() as connection:
             connection.execute("CREATE TABLE IF NOT EXISTS maps (map_id TEXT PRIMARY KEY, environment_id TEXT UNIQUE, revision INTEGER, document TEXT)")
             connection.execute("CREATE TABLE IF NOT EXISTS object_observations (observation_id TEXT PRIMARY KEY, map_id TEXT, timestamp REAL, document TEXT, image BLOB)")
+            connection.execute("CREATE TABLE IF NOT EXISTS room_observations (observation_id TEXT PRIMARY KEY, map_id TEXT, place_id TEXT, timestamp REAL, document TEXT, image BLOB)")
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=5.)
@@ -349,4 +372,39 @@ class MapStore:
             row = connection.execute("SELECT image FROM object_observations WHERE map_id=? AND observation_id=?", (map_id, observation_id)).fetchone()
         if row is None:
             raise ValueError("Object image not found")
+        return row[0]
+
+    def remember_room(self, observation, image):
+        if len(image) > 1024 * 1024 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Room evidence requires a bounded PNG image")
+        with self.connect() as connection:
+            if connection.execute("SELECT 1 FROM maps WHERE map_id=?", (observation["map_id"],)).fetchone() is None:
+                raise ValueError("SAVE_REQUIRED: room observations require a saved map")
+            connection.execute("INSERT INTO room_observations VALUES (?, ?, ?, ?, ?, ?)",
+                (observation["observation_id"], observation["map_id"], observation["place_id"], observation["observed_unix_s"],
+                    json.dumps(observation, allow_nan=False), image))
+            connection.execute("DELETE FROM room_observations WHERE map_id=? AND observation_id NOT IN (SELECT observation_id FROM room_observations WHERE map_id=? ORDER BY timestamp DESC LIMIT 1000)",
+                (observation["map_id"], observation["map_id"]))
+
+    def room_observations(self, map_id):
+        with self.connect() as connection:
+            return [json.loads(row[0]) for row in connection.execute(
+                "SELECT document FROM room_observations WHERE map_id=? ORDER BY timestamp DESC LIMIT 100", (map_id,))]
+
+    def review_room(self, map_id, observation_id):
+        with self.connect() as connection:
+            row = connection.execute("SELECT document FROM room_observations WHERE map_id=? AND observation_id=?", (map_id, observation_id)).fetchone()
+            if row is None:
+                raise ValueError("UNKNOWN_EVIDENCE: select recorded room evidence")
+            record = json.loads(row[0])
+            record.update(review_status="operator_confirmed", reviewed_unix_s=time.time())
+            connection.execute("UPDATE room_observations SET document=? WHERE observation_id=? AND map_id=?",
+                (json.dumps(record, allow_nan=False), observation_id, map_id))
+        return record
+
+    def room_image(self, map_id, observation_id):
+        with self.connect() as connection:
+            row = connection.execute("SELECT image FROM room_observations WHERE map_id=? AND observation_id=?", (map_id, observation_id)).fetchone()
+        if row is None:
+            raise ValueError("Room image not found")
         return row[0]

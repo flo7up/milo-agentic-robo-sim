@@ -23,6 +23,30 @@ def test_sensor_rays_preserve_occlusion_and_unknown():
     assert cell([-3., 0.]) == 0
 
 
+def test_flat_laser_cell_dedup_preserves_exact_ray_evidence():
+    from backend.home_mapping import laser_points
+    home = HomeMap("laser-equivalence")
+    home.evidence[195:205, 195:205] = -20
+    home.evidence[190, 207] = 20
+    generator = np.random.default_rng(714)
+    laser = {"origin_m": [.15, 0., .3], "angle_min": -math.pi, "angle_increment": 2 * math.pi / 720,
+        "range_min": .03, "range_max": 8., "ranges_m": generator.uniform(.2, 9., 720).tolist()}
+    laser["ranges_m"][7] = None
+    pose = [18., -.1, .2]
+    expected = home.evidence.copy()
+    origin, endpoints, hits = laser_points(laser, pose)
+    samples = [home.indices(np.linspace(origin, endpoint, max(2, math.ceil(np.linalg.norm(endpoint - origin) / .04) + 1))[:-1])
+        for endpoint in endpoints]
+    free = np.unique(np.concatenate(samples), axis=0)
+    free = free[home.inside(free)]
+    expected[free[:, 1], free[:, 0]] = np.maximum(-20, expected[free[:, 1], free[:, 0]] - 1)
+    occupied = np.unique(home.indices(endpoints[hits]), axis=0)
+    occupied = occupied[home.inside(occupied)]
+    expected[occupied[:, 1], occupied[:, 0]] = np.minimum(20, expected[occupied[:, 1], occupied[:, 0]] + 4)
+    home.observe(laser, pose, 100.)
+    np.testing.assert_array_equal(home.evidence, expected)
+
+
 def test_save_once_reload_for_scenarios_and_revision_conflict(tmp_path):
     store = MapStore(tmp_path / "maps.sqlite3")
     home = HomeMap("shared_apartment_v1")
@@ -64,6 +88,387 @@ def test_route_uses_footprint_unknown_and_live_obstacles():
 def test_map_odometry_transform_round_trip():
     pose, transform = [1., 2., .4], [3., -2., 1.2]
     np.testing.assert_allclose(transform_pose(transform_pose(pose, transform), inverse_pose(transform)), pose)
+
+
+def test_room_v2_preserves_source_database_and_keeps_semantics_separate(tmp_path):
+    from scripts.benchmark_rooms import copy_store, definition, planned_cases, score_room
+    store = MapStore(tmp_path / "original.sqlite3")
+    home = HomeMap("shared_apartment_v1")
+    home.scan_count = 1
+    store.save(home, "Original")
+    original = store.path.read_bytes()
+    copy_store(store.path, tmp_path / "working.sqlite3")
+    assert store.path.read_bytes() == original
+    working = MapStore(tmp_path / "working.sqlite3")
+    restored = working.load(home.identity, home.environment_id)
+    working.save(restored, "Working")
+    assert store.path.read_bytes() == original
+    with pytest.raises(ValueError, match="new separate"):
+        copy_store(store.path, working.path)
+    assert definition()["suite_id"] == "household-room-v2"
+    assert [case["task_id"] for case in planned_cases(definition()["tasks"])] == ["room_return", "blocked_doorway", "unknown_room"]
+    metrics = {"recording_complete": True, "source_unchanged": True, "original_map_unchanged": True,
+        "contacts": 0, "manual_placements": 0, "buffers_empty": True, "elapsed_s": 20., "budget_s": 180.,
+        "arrivals": [{"status": "completed", "error_m": .03, "dwell_s": .5}] * 2}
+    assert not score_room("room_return", metrics)["passed"]
+    assert score_room("room_return", {**metrics, "post_arrival_report": True})["passed"]
+    assert not score_room("room_return", {**metrics, "post_arrival_report": True, "contacts": 1})["passed"]
+    assert score_room("room_return", {"blocked_prerequisite": "No camera-backed Kitchen"})["status"] == "blocked"
+
+
+def test_room_graph_reports_current_connection_clearance_without_identity_claims():
+    home = HomeMap("room-graph")
+    home.evidence[170:230, 170:230] = -2
+    living = home.add_place("Living room", "room", [0., 0., 0.], .3)
+    kitchen = home.add_place("Kitchen", "room", [1., 0., 0.], .3, [living["place_id"]])
+    before = home.document()
+    graph = home.graph_summary(home.allowed(.3))
+    assert graph["connections"][0]["from"] == kitchen["place_id"]
+    assert graph["connections"][0]["status"] == "reachable"
+    obstacles = [[.5, lateral] for lateral in np.arange(-.5, .6, .1)]
+    assert home.graph_summary(home.allowed(.3, obstacles))["connections"][0]["status"] == "blocked"
+    assert home.graph_summary(None)["connections"][0]["status"] == "unknown"
+    assert "path_m" not in graph["connections"][0]
+    assert home.document() == before
+
+
+async def test_room_observations_require_post_arrival_camera_and_operator_review(tmp_path):
+    from backend.home_mission import HomeMission, HomeRequest
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "rooms.sqlite3"))
+        identity = {"run_id": worker.latest["run_id"], "episode_epoch": 0}
+        await worker.home_command(HomeRequest(**identity, action="start_mapping"))
+        await worker.home_command(HomeRequest(**identity, action="save_map", name="Room test"))
+        def current(sim):
+            worker._sample_spatial(force=True)
+            return worker.spatial_frames[worker.spatial_map.sequence][:2]
+        paired = await worker.call(current)
+        state = await worker.home_command(HomeRequest(**identity, action="observe_room", name="Test room",
+            evidence_text="Visible walls and floor in the current camera", confidence=.6, spatial_sequence=paired[0].sequence), selected_evidence=paired)
+        place = state["places"][0]
+        record = state["room_observations"][0]
+        assert place["identity_status"] == "tentative" and not record["identity_verified"]
+        review = HomeRequest(**identity, action="review_room", evidence_id=record["observation_id"])
+        with pytest.raises(ValueError, match="OPERATOR_REVIEW_REQUIRED"):
+            await worker.home_command(review)
+        state = await worker.home_command(review, operator_review=True)
+        assert state["places"][0]["identity_status"] == "operator_confirmed"
+        await worker.home_command(HomeRequest(**identity, action="save_map", name="Room test"))
+        await worker.home_command(HomeRequest(**identity, action="navigate_to", place_id=place["place_id"], time_budget=10))
+        async with asyncio.timeout(15):
+            while worker.home_mission.active:
+                await asyncio.sleep(.02)
+        assert worker.home_mission.task["status"] == "completed"
+        with pytest.raises(ValueError, match="ARRIVAL_REQUIRED"):
+            await worker.home_command(HomeRequest(**identity, action="observe_room", place_id=place["place_id"], room_matches=True,
+                evidence_text="Old image cannot verify arrival", spatial_sequence=paired[0].sequence), selected_evidence=paired)
+        paired = await worker.call(current)
+        state = await worker.home_command(HomeRequest(**identity, action="observe_room", place_id=place["place_id"], room_matches=False,
+            evidence_text="The fresh image does not support the requested room", spatial_sequence=paired[0].sequence), selected_evidence=paired)
+        assert state["room_verification"]["status"] == "visual_mismatch_reported"
+        assert not state["room_verification"]["identity_verified"]
+        assert worker.home_mission.store.room_image(state["map_id"], state["room_observations"][0]["observation_id"]) == paired[1]
+        compact = await worker.home_state(compact=True)
+        assert "room_graph" in compact and "frontiers" in compact and "map" not in compact
+        def changed_view(sim):
+            import pybullet as bullet
+            bullet.resetJointState(sim.robot, sim.joints["head_yaw"], .3, physicsClientId=sim.client)
+            state = worker.home_mission.state(compact=True)
+            assert state["room_verification"]["status"] == "not_currently_verified"
+            bullet.resetJointState(sim.robot, sim.joints["head_yaw"], paired[0].head_rad[0], physicsClientId=sim.client)
+            assert worker.home_mission.state(compact=True)["room_verification"]["status"] == "not_currently_verified"
+        await worker.call(changed_view)
+        restored = worker.home_mission.store.load(state["map_id"], worker.home_mission.environment_id)
+        assert restored.places[0]["identity_status"] == "operator_confirmed"
+        await worker.home_command(HomeRequest(**identity, action="localize", place_id=place["place_id"]))
+        with pytest.raises(ValueError, match="STALE_OBSERVATION"):
+            await worker.home_command(HomeRequest(**identity, action="observe_room", place_id=place["place_id"],
+                evidence_text="Image predates relocalization", spatial_sequence=paired[0].sequence), selected_evidence=paired)
+        worker.stop()
+        await worker.hold_stopped()
+        with pytest.raises(Exception, match="invalidated"):
+            await worker.home_command(HomeRequest(**identity, action="observe_room", place_id=place["place_id"], evidence_text="late"), 0, 0)
+    finally:
+        await worker.close()
+
+
+@pytest.mark.parametrize("report", [True, False, "timeout", "stop"])
+async def test_room_round_trip_requires_visual_report_and_preserves_deadline(tmp_path, report):
+    from types import SimpleNamespace
+    from backend.continuous_supervisor import GuideContinuous, execute_home_capability
+    from backend.home_mission import HomeMission, HomeRequest
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "roundtrip.sqlite3"))
+        identity = {"run_id": worker.latest["run_id"], "episode_epoch": 0}
+        async def command(action, **values):
+            return await worker.home_command(HomeRequest(**identity, action=action, **values))
+        await command("start_mapping")
+        await command("add_place", name="Home")
+        state = await command("add_place", name="Scripted room", kind="room")
+        home, room = state["places"]
+        await command("save_map")
+        import time
+        await execute_home_capability(SimpleNamespace(_check_live=lambda *args: None), worker, SimpleNamespace(**identity),
+            GuideContinuous(action="navigate_place", place_id=room["place_id"], return_place_id=home["place_id"], time_budget=15.),
+            SimpleNamespace(captured_at=time.monotonic()), worker.stop_revision, worker.task_revision)
+        async with asyncio.timeout(20):
+            while worker.home_mission.active:
+                await asyncio.sleep(.02)
+        assert (await worker.home_state(compact=True))["room_workflow"]["status"] == "awaiting_room_report"
+        deadline = worker.home_mission.workflow["deadline"]
+        if report == "timeout":
+            await worker.call(lambda sim: worker.home_mission.workflow.update(deadline=0.))
+            await worker.call(lambda sim: worker.home_mission.tick())
+        elif report == "stop":
+            worker.stop()
+            await worker.hold_stopped()
+            await worker.call(lambda sim: worker.home_mission.tick())
+        else:
+            def observe(sim):
+                worker._sample_spatial(force=True)
+                sensor, image = worker.spatial_frames[worker.spatial_map.sequence][:2]
+                return worker.home_mission.command(HomeRequest(**identity, action="observe_room", place_id=room["place_id"],
+                    room_matches=report, spatial_sequence=sensor.sequence, evidence_text="Scripted current-view contract fixture"),
+                    worker.stop_revision, worker.task_revision, (sensor, image))
+            await worker.call(observe)
+            async with asyncio.timeout(20):
+                while worker.home_mission.active:
+                    await asyncio.sleep(.02)
+            assert worker.home_mission.workflow["deadline"] == deadline
+        state = await worker.home_state(compact=True)
+        assert state["room_workflow"]["status"] == ("completed" if report is True else "failed" if report is False else "limited" if report == "timeout" else "cancelled")
+        assert state["room_workflow"]["identity_verified"] is False
+        if report is True:
+            assert state["task"]["place_id"] == home["place_id"]
+            assert state["room_workflow"]["room_evidence_id"]
+        assert worker.navigation is None or not worker.navigation.buffer
+    finally:
+        await worker.close()
+
+
+def test_grid_boundary_rounding_preserves_real_left_side_and_unknown_space():
+    home = HomeMap("boundary-test")
+    np.testing.assert_array_equal(home.indices([[-.1, 0.], [-.1 - 1e-10, 0.], [-.1 + 1e-10, 0.]]),
+        [[199, 200], [198, 200], [199, 200]])
+    home.evidence[180:220, 195:230] = -2
+    before = home.evidence.copy()
+    assert home.route([-.1, 0.], [.7, 0.], .397)[0] == [-.1, 0.]
+    with pytest.raises(ValueError, match="UNREACHABLE"):
+        home.route([-.1 - 1e-10, 0.], [.7, 0.], .397)
+    np.testing.assert_array_equal(home.evidence, before)
+
+
+@pytest.mark.parametrize("mapping", [True, False])
+def test_batched_home_depth_preserves_obstacles_and_grid_evidence(tmp_path, monkeypatch, mapping):
+    import time
+    from types import SimpleNamespace
+    from backend.home_mission import HomeMission
+    from backend import spatial
+    worker = SimpleNamespace(challenge=None, stop_revision=0, task_revision=0)
+    mission = HomeMission(worker, MapStore(tmp_path / "batch.sqlite3"))
+    mission.home = HomeMap("test")
+    mission.home.evidence[190:220, 190:220] = -5
+    mission.home.evidence[201, 202] = 17
+    mission.transform = [.7, -.2, .45]
+    mission.stage = "mapping" if mapping else "loaded"
+    generator = np.random.default_rng(713)
+    points = generator.uniform([-25, -25, -.1], [25, 25, 1.5], (4000, 3))
+    points = np.concatenate((points, points[:1000], [[.1, .2, .04], [.1, .2, 1.3]]))
+    monkeypatch.setattr(spatial, "point_cloud", lambda sensor, stride: (None, points))
+    expected = mission.home.evidence.copy()
+    keys = set()
+    for point in points:
+        if not .04 < point[2] < 1.3:
+            continue
+        column, row = mission.home.indices(transform_pose([*point[:2], 0.], mission.transform)[:2])
+        keys.add((int(column), int(row)))
+        if mapping and mission.home.inside([column, row]):
+            expected[row, column] = max(4, expected[row, column])
+    mission.observe_depth(SimpleNamespace(sequence=1, captured_at=time.monotonic()))
+    assert set(mission.live) == keys
+    np.testing.assert_array_equal(mission.home.evidence, expected)
+    assert mission.last_depth_sequence == 1
+
+
+async def test_mapped_rgbd_capture_does_not_block_worker_and_stop_discards_frame(tmp_path):
+    from io import BytesIO
+    import threading
+    import time
+    from types import SimpleNamespace
+    from PIL import Image
+    from backend.contracts import SpatialSettings
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    release, entered = threading.Event(), threading.Event()
+    finished = None
+    try:
+        await asyncio.wrap_future(worker.ready)
+        await worker.configure_spatial(SpatialSettings(run_id=worker.latest["run_id"], episode_epoch=0, enabled=True))
+        image = BytesIO()
+        Image.new("RGB", (160, 120)).save(image, format="PNG")
+        def capture(packet, depth):
+            entered.set()
+            assert release.wait(5.)
+            return image.getvalue(), np.ones((120, 160))
+        def install(sim):
+            worker.home_mission = HomeMission(worker, MapStore(tmp_path / "async.sqlite3"))
+            worker.home_mission.home = HomeMap(worker.home_mission.environment_id)
+            sim.rendering = "enhanced"
+            sim.camera_renderer = SimpleNamespace(capture=capture)
+            sim.owns_camera_renderer = False
+            worker.spatial_sampled_at = 0.
+            before = worker.spatial_map.sequence
+            began = time.monotonic()
+            worker._sample_spatial()
+            return before, time.monotonic() - began, worker.spatial_capture_pending
+        before, duration, finished = await worker.call(install)
+        assert duration < .3
+        assert await asyncio.to_thread(entered.wait, 2.)
+        assert await asyncio.wait_for(worker.call(lambda sim: sim.run_id), .5) == worker.latest["run_id"]
+        worker.stop()
+        release.set()
+        await asyncio.wrap_future(finished)
+        await worker.call(lambda sim: worker._receive_mapped_capture())
+        assert worker.spatial_map.sequence == before
+        assert worker.mapped_depth_sensor is None
+        assert worker.sim.cancel.is_set()
+    finally:
+        release.set()
+        await worker.call(lambda sim: (setattr(sim, "rendering", "tiny"), setattr(sim, "camera_renderer", None)))
+        await worker.close()
+
+
+@pytest.mark.parametrize("fault", [None, "stale", "future", "episode", "generation", "stop"])
+async def test_mapped_capture_validation_is_independent_of_pending_map_processing(monkeypatch, fault):
+    from concurrent.futures import Future
+    import time
+    from backend.contracts import SpatialSettings
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    pending_map = Future()
+    try:
+        await asyncio.wrap_future(worker.ready)
+        await worker.configure_spatial(SpatialSettings(run_id=worker.latest["run_id"], episode_epoch=0, enabled=True))
+        def check(sim):
+            observation, image = sim.capture_spatial(worker.spatial_sequence + 1)
+            if fault == "stale":
+                observation = observation.model_copy(update={"captured_at": time.monotonic() - 2.})
+            elif fault == "future":
+                observation = observation.model_copy(update={"captured_at": time.monotonic() + 2.})
+            elif fault == "episode":
+                observation = observation.model_copy(update={"episode_epoch": 99})
+            worker.spatial_capture_pending = Future()
+            worker.spatial_capture_pending.set_result((observation, image))
+            worker.spatial_capture_stop_revision = worker.stop_revision - (fault == "stop")
+            worker.spatial_capture_generation = worker.spatial_generation - (fault == "generation")
+            previous = worker.spatial_map
+            monkeypatch.setattr(worker.spatial_processor, "submit", lambda *args: pending_map)
+            worker._receive_mapped_capture()
+            assert worker.spatial_map is previous
+            if fault is None:
+                assert worker.mapped_depth_sensor is observation
+                assert worker.spatial_pending is pending_map and not pending_map.done()
+            else:
+                assert worker.mapped_depth_sensor is None
+            worker.spatial_enabled = False
+        await worker.call(check)
+    finally:
+        pending_map.cancel()
+        await worker.close()
+
+
+@pytest.mark.parametrize("fault", ["unknown", "stale", "shield"])
+async def test_guided_mapping_drive_checks_observed_path_and_whole_robot_before_motion(tmp_path, monkeypatch, fault):
+    from backend.contracts import Command
+    from backend.home_mission import HomeMission, HomeRequest
+    from backend.navigation import NavigationRuntime
+    from backend.simulation import MotionError
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "guided.sqlite3"))
+        identity = {"run_id": worker.latest["run_id"], "episode_epoch": 0}
+        await worker.home_command(HomeRequest(**identity, action="start_mapping"))
+        def inject(sim):
+            worker.home_mission.home.evidence[:] = -2
+            worker.home_mission.allowed_cache = None
+            if fault == "unknown":
+                worker.home_mission.home.evidence[195:205, 201:203] = 0
+            elif fault == "stale":
+                worker.spatial_map.captured_at -= 5.
+            return sim.ticks, sim.odometry.copy(), sim.seq
+        if fault == "shield":
+            def blocked(*args):
+                raise MotionError("CLEARANCE_STOP", "Injected whole-robot obstruction")
+            monkeypatch.setattr(NavigationRuntime, "check_clearance", blocked)
+        if fault == "stale":
+            monkeypatch.setattr(worker, "_sample_spatial", lambda **kwargs: None)
+        if fault == "unknown":
+            monkeypatch.setattr(worker.home_mission, "sample", lambda **kwargs: None)
+        ticks, before, sequence = await worker.call(inject)
+        result = await worker.execute(Command(**identity, observation_seq=sequence, action_id=str(uuid4()), tool="drive_base",
+            arguments={"linear_mps": .15, "angular_radps": 0., "duration_s": 1.}))
+        assert result.status == "error" and result.error in {"GUIDED_MAP_BLOCKED", "CLEARANCE_STOP"}
+        assert worker.sim.ticks == ticks
+        np.testing.assert_array_equal(worker.sim.odometry, before)
+    finally:
+        await worker.close()
+
+
+async def test_mapped_capture_continues_while_map_job_is_delayed(tmp_path):
+    from concurrent.futures import Future
+    import time
+    from types import SimpleNamespace
+    from backend.contracts import SpatialSettings
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    pending_map, capture = Future(), Future()
+    submissions = []
+    try:
+        await asyncio.wrap_future(worker.ready)
+        await worker.configure_spatial(SpatialSettings(run_id=worker.latest["run_id"], episode_epoch=0, enabled=True))
+        def check(sim):
+            sensor, image = sim.capture_spatial(worker.spatial_sequence + 1)
+            worker.home_mission = HomeMission(worker, MapStore(tmp_path / "delayed-map.sqlite3"))
+            worker.home_mission.home = HomeMap(worker.home_mission.environment_id)
+            worker.spatial_pending = pending_map
+            worker.spatial_pending_map = worker.spatial_map
+            worker.spatial_capture_executor = SimpleNamespace(submit=lambda *args: submissions.append(args) or capture,
+                shutdown=lambda **kwargs: None)
+            sim.rendering = "enhanced"
+            worker.spatial_sampled_at = time.monotonic() - 1.
+            worker._sample_spatial()
+            assert len(submissions) == 1 and worker.spatial_capture_pending is capture
+            worker._sample_spatial()
+            assert len(submissions) == 1
+            capture.set_result((sensor, image))
+            worker._receive_mapped_capture()
+            assert worker.mapped_depth_sensor is sensor
+            assert worker.spatial_pending is pending_map and not pending_map.done()
+            assert worker.spatial_capture_pending is None
+            worker.stop()
+            revoked = Future()
+            revoked.set_result((sensor.model_copy(update={"sequence": sensor.sequence + 1}), image))
+            worker.spatial_capture_pending = revoked
+            worker._receive_mapped_capture()
+            assert worker.mapped_depth_sensor is sensor
+            worker.spatial_enabled = False
+            sim.rendering = "tiny"
+            worker.spatial_pending = None
+        await worker.call(check)
+    finally:
+        pending_map.cancel()
+        await worker.call(lambda sim: (setattr(sim, "rendering", "tiny"), setattr(worker, "spatial_pending", None)))
+        await worker.close()
 
 
 def test_object_memory_is_separate_persistent_and_image_supported(tmp_path):
@@ -160,14 +565,16 @@ async def test_guided_map_save_reload_localize_and_navigate_real_physics(tmp_pat
         assert mapped["coverage"]["scan_count"] == 1
         await worker.home_command(request("add_place", name="Home"))
         home_place = worker.home_mission.home.places[0]["place_id"]
-        for _ in range(2):
-            observation, _ = await worker.feedback()
-            result = await worker.execute(Command(run_id=observation.run_id, episode_epoch=0,
-                observation_seq=observation.seq, action_id=str(uuid4()), tool="drive_base",
-                arguments={"linear_mps": .15, "angular_radps": 0., "duration_s": 1.25}))
-            assert result.status == "ok", result
-            await worker.call(lambda sim: worker.home_mission.sample(force=True))
+        with pytest.raises(ValueError, match="UNREACHABLE"):
+            await worker.home_command(request("guided_to", pose_m_rad=[19., 19., 0.]))
+        await worker.home_command(request("guided_to", pose_m_rad=[.35, 0., 0.], time_budget=45.))
+        async with asyncio.timeout(50):
+            while worker.home_mission.active:
+                await asyncio.sleep(.05)
         state = await worker.home_state()
+        assert state["task"]["status"] == "completed", state["task"]
+        assert state["task"]["guided_mapping"] and state["stage"] == "mapping"
+        assert state["design"] == "guided-waypoints-v1" and state["version"] == "0.4.0"
         assert state["localization"]["status"] == "localized", state["error"]
         assert state["localization"]["pose_m_rad"][0] > .2
         await worker.home_command(request("add_place", name="Kitchen entrance", kind="doorway", connects=[home_place]))
@@ -198,7 +605,9 @@ async def test_guided_map_save_reload_localize_and_navigate_real_physics(tmp_pat
         state = await worker.home_state()
         assert state["task"]["status"] == "completed", state["task"]
         assert state["task"]["completion_verified"]
-        assert state["localization"]["pose_m_rad"][0] > .2
+        destination = worker.home_mission.place(target)["pose_m_rad"]
+        assert math.dist(state["localization"]["pose_m_rad"][:2], destination[:2]) <= .15
+        assert math.hypot(*state["localization"]["pose_m_rad"][:2]) > .15
         np.testing.assert_array_equal(worker.home_mission.home.evidence, geometry)
         assert not worker.sim.proximity_sensors().collisions
         await worker.home_command(request("navigate_to", place_id=home_place, time_budget=45.))
@@ -228,6 +637,8 @@ def test_home_api_reuses_one_saved_map_across_shared_scenarios(tmp_path, monkeyp
     from fastapi.testclient import TestClient
     from backend.app import app, lab
     from backend import home_mission
+    from backend import session_recording
+    monkeypatch.setattr(session_recording, "SESSION_RESULTS_ROOT", tmp_path / "performance")
     monkeypatch.setenv("MILO_RENDERER", "tiny")
     monkeypatch.setattr(import_module("backend.app"), "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(home_mission, "DEFAULT_MAP_PATH", tmp_path / "api-home.sqlite3")
@@ -251,6 +662,17 @@ def test_home_api_reuses_one_saved_map_across_shared_scenarios(tmp_path, monkeyp
             assert loaded.json()["map_id"] == identity and loaded.json()["revision"] == 1
             assert loaded.json()["localization"]["status"] == "unlocalized"
             np.testing.assert_array_equal(lab.worker.home_mission.home.evidence, original)
+            skipped = client.post("/api/challenges/load", json={"challenge_id": "flat_kitchen", "environment": "shared_apartment_v1", "reuse_saved_map": False})
+            assert skipped.status_code == 200
+            assert skipped.json()["map_setup"]["reuse_saved_map"] is False
+            assert skipped.json()["map_setup"]["map_id"] is None
+            assert client.get("/api/home").json()["maps"][0]["map_id"] == identity
+            reset = client.post("/api/reset").json()
+            assert reset["map_setup"]["map_id"] is None and reset["map_setup"]["reuse_saved_map"] is False
+            second = client.post("/api/challenges/load", json={"challenge_id": "flat_kitchen", "environment": "shared_apartment_v1", "reuse_saved_map": True}).json()
+            assert second["map_setup"]["map_id"] == identity and second["map_setup"]["revision"] == 1
+            assert second["map_setup"]["localization"] == "unlocalized"
+            np.testing.assert_array_equal(lab.worker.home_mission.home.evidence, original)
             assert client.post("/api/home", json={**body, "action": "localize"}).status_code == 409
             body = {"run_id": second["run_id"], "episode_epoch": second["episode_epoch"]}
             assert client.post("/api/home", json={**body, "action": "navigate_to", "place_id": "invented"}).status_code == 409
@@ -258,6 +680,70 @@ def test_home_api_reuses_one_saved_map_across_shared_scenarios(tmp_path, monkeyp
             assert client.get("/api/state").json()["stopped"]
             assert client.post("/api/home", json={**body, "action": "localize", "pose_m_rad": [0., 0., 0.]}).status_code == 409
             assert client.post("/api/home", json={**body, "action": "save_map", "name": "bad"}, headers={"origin": "https://untrusted.invalid"}).status_code == 403
+
+
+@pytest.mark.parametrize("blocked", [None, "stop", "stale", "unknown"])
+def test_local_exploration_continuation_preserves_velocity_deadline_and_safety(tmp_path, blocked):
+    import threading
+    import time
+    from types import SimpleNamespace
+    from backend.continuous_navigation import ContinuousNavigation
+    from backend.home_mission import HomeMission
+    now = time.monotonic()
+    sim = SimpleNamespace(odometry=np.array([.2, 0., 0.]), held={}, cancel=threading.Event(), robot_footprint=lambda: {"radius_m": .3})
+    control = ContinuousNavigation([[0., 0.], [.6, 0.]])
+    control.home_owned, control.radius = True, .3
+    runtime = SimpleNamespace(status="running", buffer=[True], expires_at=now + 10., skill_deadline=now + 20., travel=.2, velocity=np.array([.2,0.]))
+    worker = SimpleNamespace(sim=sim, challenge=None, continuous=control, navigation=runtime, stop_revision=0, task_revision=0,
+        spatial_map=SimpleNamespace(captured_at=now))
+    mission = HomeMission(worker, MapStore(tmp_path / "continue.sqlite3"))
+    mission.home = HomeMap("test")
+    mission.home.evidence[170:230, 170:230] = -2
+    mission.pose, mission.transform = [.2,0.,0.], [0.,0.,0.]
+    mission.localization["status"] = "localized"
+    mission.sampled_at = mission.validated_at = now
+    mission.route = [[0.,0.],[.6,0.],[1.,0.],[1.2,0.]]
+    mission.task = {"status":"running", "local_exploration":True, "route_index":1, "deadline":now + 30.}
+    if blocked == "stop": sim.cancel.set()
+    if blocked == "stale": worker.spatial_map.captured_at = now - 2.
+    if blocked == "unknown": mission.home.evidence[:,207:210] = 0
+    mission.continue_local_exploration()
+    assert control.handoffs == (0 if blocked else 1)
+    assert runtime.expires_at == now + 10. and runtime.skill_deadline == now + 20.
+    np.testing.assert_array_equal(runtime.velocity, [.2,0.])
+    if not blocked:
+        assert mission.task["continuations"] == 1
+        assert np.linalg.norm(control.path[-1] - control.path[0]) <= 1.
+
+
+async def test_explicit_local_exploration_builds_draft_without_model_or_saved_map_mutation(tmp_path):
+    from backend.home_mission import HomeMission, HomeRequest
+    from backend.worker import SimulationWorker
+    store = MapStore(tmp_path / "local-explore.sqlite3")
+    original = HomeMap("standalone:bench")
+    original.scan_count = 1
+    store.save(original, "Preserved map")
+    before = original.document()
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, store)
+        request = HomeRequest(run_id=worker.latest["run_id"], episode_epoch=0, action="start_exploration", time_budget=1.)
+        state = await worker.home_command(request)
+        assert state["task"]["local_exploration"] and state["task"]["model_calls"] == 0
+        assert state["map_id"] != original.identity and state["revision"] == 0
+        worker.stop()
+        await worker.hold_stopped()
+        state = await worker.home_state()
+        assert state["task"]["status"] == "cancelled"
+        assert store.load(original.identity, original.environment_id).document() == before
+        await worker.resume_manual()
+        assert not worker.home_mission.active
+        worker.home_mission.allow_expansion = False
+        with pytest.raises(ValueError, match="MAP_READ_ONLY"):
+            await worker.home_command(request)
+    finally:
+        await worker.close()
 
 
 async def test_luna_home_dispatch_is_grounded_bounded_and_compact(tmp_path):
@@ -290,7 +776,7 @@ async def test_luna_home_dispatch_is_grounded_bounded_and_compact(tmp_path):
         await worker.close()
 
 
-@pytest.mark.parametrize("fault", ["timeout", "sensor", "task_revision", "stop"])
+@pytest.mark.parametrize("fault", ["timeout", "sensor", "task_revision", "stop", "selected_blocked", "selected_arrived"])
 def test_frontier_executive_is_bounded_and_fails_closed(tmp_path, fault):
     import threading
     import time
@@ -312,7 +798,16 @@ def test_frontier_executive_is_bounded_and_fails_closed(tmp_path, fault):
     mission.sampled_at = mission.validated_at = time.monotonic()
     mission.localization["status"] = "localized"
     mission.sample = lambda **kwargs: None
-    mission.command(HomeRequest(run_id="run", episode_epoch=0, action="explore", time_budget=10), 0, 0)
+    if fault.startswith("selected"):
+        with pytest.raises(ValueError, match="UNKNOWN_FRONTIER"):
+            mission.command(HomeRequest(run_id="run", episode_epoch=0, action="explore_frontier", frontier_id="invented"), 0, 0)
+        frontier = mission.state(compact=True)["frontiers"][0]
+        mission.command(HomeRequest(run_id="run", episode_epoch=0, action="explore_frontier", frontier_id=frontier["frontier_id"], time_budget=10), 0, 0)
+        assert mission.stage == "expansion" and mission.task["single_frontier"]
+    else:
+        mission.command(HomeRequest(run_id="run", episode_epoch=0, action="explore", time_budget=10), 0, 0)
+    assert mission.state(compact=True)["frontiers"] == []
+    assert mission.state(compact=True)["frontier_selection_available"] is False
     mission.tick()
     assert len(paths) == 1 and mission.task["segments"] == 1
     assert np.linalg.norm(paths[0][-1] - paths[0][0]) <= 1.01
@@ -322,11 +817,18 @@ def test_frontier_executive_is_bounded_and_fails_closed(tmp_path, fault):
         mission.sampled_at -= 2.
     elif fault == "task_revision":
         worker.task_revision += 1
+    elif fault == "selected_blocked":
+        column, row = mission.home.indices(mission.task["target_m"])
+        mission.home.evidence[row, column] = 4
+        mission.recheck_at = 0.
+    elif fault == "selected_arrived":
+        mission.pose = [*mission.task["target_m"], 0.]
+        mission.recheck_at = 0.
     else:
         sim.cancel.set()
     mission.tick()
     assert not mission.active and holds
-    assert mission.task["status"] == ("limited" if fault == "timeout" else "failed" if fault == "sensor" else "cancelled")
+    assert mission.task["status"] == ("limited" if fault == "timeout" else "failed" if fault in {"sensor", "selected_blocked"} else "completed" if fault == "selected_arrived" else "cancelled")
     mission.tick()
     assert len(paths) == 1
 
@@ -417,3 +919,39 @@ async def test_shared_home_frontier_expansion_real_sensors_is_bounded(tmp_path, 
         np.testing.assert_array_equal(store.load(saved["map_id"], "shared_apartment_v1").evidence, original)
     finally:
         await worker.close()
+
+
+@pytest.mark.parametrize("position,linear,angular", [([-6.8, 1.8], .35, 0.), ([-6.8, 1.8], 0., .5),
+    ([-.9, 2.], .15, 0.), ([-7.4, 1.8], -.15, 0.)])
+def test_clearance_broadphase_matches_all_object_checks(monkeypatch, position, linear, angular):
+    import pybullet as bullet
+    from backend.challenges import shared_apartment
+    from backend.navigation import NavigationRuntime
+    from backend.simulation import BulletSimulation, MotionError
+    challenge = shared_apartment("flat_kitchen")
+    challenge.initial_xy = position
+    sim = BulletSimulation(challenge=challenge, rendering="tiny", width=160, height=120)
+    runtime = NavigationRuntime()
+    original = bullet.getClosestPoints
+    counts = [0]
+    def count(*args, **kwargs):
+        counts[0] += 1
+        return original(*args, **kwargs)
+    def outcome():
+        try:
+            runtime.check_clearance(sim, linear, angular)
+            return "clear"
+        except MotionError as error:
+            return error.code
+    try:
+        monkeypatch.setattr(bullet, "getClosestPoints", count)
+        filtered = outcome()
+        filtered_count = counts[0]
+        counts[0] = 0
+        monkeypatch.setattr(runtime, "bounds_overlap", lambda *args: True)
+        reference = outcome()
+        assert filtered == reference
+        if filtered == "clear":
+            assert filtered_count < counts[0] / 2
+    finally:
+        sim.close()

@@ -46,6 +46,7 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
   const [orbitTarget, setOrbitTarget] = useState(state.challenge?.orbit?.target ?? 'table');
   const [orbitDirection, setOrbitDirection] = useState(state.challenge?.orbit?.direction ?? 'clockwise');
   const [loading, setLoading] = useState(false);
+  const [reuseMap, setReuseMap] = useState(state.map_setup?.reuse_saved_map ?? true);
   const [error, setError] = useState('');
   useEffect(() => {
     const controller = new AbortController();
@@ -65,6 +66,7 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
     setEnvironment(state.challenge?.environment ?? 'standalone');
     setOrbitTarget(state.challenge?.orbit?.target ?? 'table');
     setOrbitDirection(state.challenge?.orbit?.direction ?? 'clockwise');
+    setReuseMap(state.map_setup?.reuse_saved_map ?? true);
   }, [state.run_id]);
 
   const preset = presets.find(entry => entry.id === selected);
@@ -83,7 +85,7 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
     setLoading(true);
     onLoadingChange?.(true);
     setError('');
-    try { await request('challenges/load', { challenge_id: selected, environment,
+    try { await request('challenges/load', { challenge_id: selected, environment, reuse_saved_map: reuseMap,
       ...(selected === 'furniture_circuit' ? {orbit_target: orbitTarget, orbit_direction: orbitDirection} : {}) });
       dialog.current?.close(); }
     catch (failure) { setError(String(failure)); }
@@ -120,6 +122,8 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
             <option value={entry.id} key={entry.id}>{entry.title}</option>)}
         </optgroup>)}
       </select></label>
+      <label>Map source<select aria-label="Map source" value={reuseMap ? 'saved' : 'none'} disabled={!connected || loading}
+        onChange={event => setReuseMap(event.target.value === 'saved')}><option value="saved">Reuse saved environment map</option><option value="none">Start without saved map</option></select></label>
       {selected === 'furniture_circuit' && <>
         <label>Object<select aria-label="Object to circle" value={orbitTarget} disabled={!connected || loading}
           onChange={event => setOrbitTarget(event.target.value as typeof orbitTarget)}>
@@ -145,6 +149,9 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
           : notes.completion}</p>
       </div>
     </div>
+    {state.map_setup && <output className="scenario-map-status" aria-label="Loaded map source">{state.map_setup.map_id
+      ? `${state.map_setup.name} / v${state.map_setup.revision} / ${state.map_setup.localization}`
+      : state.map_setup.reuse_saved_map ? 'No saved map loaded for the current environment' : 'Current run: no saved map'}</output>}
     <details className="challenge-details">
     <summary>Goal & objectives</summary>
     <p className="challenge-goal">{selected === 'furniture_circuit' && (orbitTarget !== preset?.orbit?.target || orbitDirection !== preset?.orbit?.direction)

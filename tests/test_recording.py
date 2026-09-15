@@ -154,6 +154,87 @@ def test_scorecard_keeps_failures_and_deliberate_stops_separate():
     assert score_samples(rows, dropped=1)["completion_time_s"] is None
 
 
+async def test_home_recording_retains_immutable_snapshots_and_transition_evidence(tmp_path):
+    import base64
+    import zlib
+    import numpy as np
+    from types import SimpleNamespace
+    from backend.home_mapping import HomeMap
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    recorder = RunRecorder(tmp_path / "batch" / "case" / "recording", max_pending=2)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        def capture(sim):
+            original = sim.seq, sim.ticks
+            home = HomeMap("test")
+            mission = SimpleNamespace(home=home, task=None, stage="mapping", localization={"status": "localized"},
+                error=None, pose=[0., 0., 0.], transform=[0., 0., 0.], sampled_at=0., route=[], obstacles=lambda: [])
+            worker.home_mission = mission
+            home.evidence[200, 200] = -1
+            home.visits[200, 200] = 1
+            home.scan_count = 1
+            recorder.capture(worker)
+            first = recorder.home_media[0][1]["cells"]
+            home.evidence[200, 201] = 4
+            home.scan_count = 2
+            mission.stage = "loaded"
+            recorder.capture(worker)
+            assert first != recorder.home_media[0][1]["cells"]
+            mission.task = {"task_id": "trial", "status": "failed", "reason": "LOCALIZATION_LOST", "segments": 1}
+            recorder.capture(worker)
+            assert (sim.seq, sim.ticks) == original
+            worker.home_mission = None
+        await worker.call(capture)
+        score = recorder.finish({"evidence": "scripted_test", "real_model": False})
+        rows = [json.loads(line) for line in (recorder.directory / "trajectory.jsonl").read_text().splitlines()]
+        assert recorder.dropped == 1 and not score["spatial_recording"]["complete"]
+        assert rows[-1]["home_events"][0]["reason"] == "LOCALIZATION_LOST"
+        for row in rows:
+            document = json.loads((recorder.directory / row["home"]["map"]["path"]).read_text())
+            raw = zlib.decompress(base64.b64decode(document["data"]))
+            cells = np.frombuffer(raw[:160000], dtype=np.int8).reshape(400, 400)
+            assert cells[200, 200] == 0 and cells[200, 201] == 100
+        assert "home" not in worker.latest["observation"]
+        from backend.saved_results import saved_results, recorded_replay, recorded_replay_media
+        batch_directory = recorder.directory.parent.parent
+        (batch_directory / "experiment.json").write_text(json.dumps({"mode": "home_mapping", "evidence": "scripted_test",
+            "cases": [{"case_id": "case", "challenge": "bench"}]}))
+        (recorder.directory.parent / "report.json").write_text(json.dumps({"evidence": "scripted_test", "recording_scorecard": score}))
+        batch = saved_results(tmp_path)["batches"][0]
+        replay = recorded_replay(batch["id"], 0, tmp_path)
+        assert replay["evaluation_only"] and not replay["recording_complete"]
+        assert replay["events"][-1]["reason"] == "LOCALIZATION_LOST"
+        filename = replay["frames"][-1]["map_url"].rsplit("/", 1)[1]
+        mapped, content_type = recorded_replay_media(batch["id"], 0, filename, tmp_path)
+        assert content_type == "application/json" and mapped["cells"][200 * 400 + 201] == 100
+        assert mapped["visited_indices"] == [200 * 400 + 200]
+        for name in ("../scorecard.json", "camera-999.png", "home-999.json"):
+            with pytest.raises(ValueError):
+                recorded_replay_media(batch["id"], 0, name, tmp_path)
+        document_path = recorder.directory / "media" / filename
+        document = json.loads(document_path.read_text())
+        document["sha256"] = "corrupt"
+        document_path.write_text(json.dumps(document))
+        with pytest.raises(ValueError, match="Corrupt"):
+            recorded_replay_media(batch["id"], 0, filename, tmp_path)
+        rows[-1]["manual_placements"] = 1
+        rows[-1]["collisions"] = ["contact"]
+        rows[-1]["wall_s"] = rows[0]["wall_s"] + 2.
+        (recorder.directory / "trajectory.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
+        replay = recorded_replay(batch["id"], 0, tmp_path)
+        assert replay["frames"][-1]["segment"] > replay["frames"][0]["segment"]
+        assert {"Contact detected", "Pose continuity changed", "Recording gap: 2.00 s"}.issubset({event["reason"] for event in replay["events"]})
+        from unittest.mock import patch
+        with patch("backend.saved_results.saved_results", side_effect=AssertionError("Replay must not scan all report contents")):
+            assert recorded_replay(batch["id"], 0, tmp_path)["sample_count"] == 2
+        with patch("backend.saved_results.result_directories", side_effect=AssertionError("Known replay must reuse its validated batch location")):
+            assert recorded_replay(batch["id"], 0, tmp_path)["sample_count"] == 2
+    finally:
+        worker.home_mission = None
+        await worker.close()
+
+
 async def test_worker_recording_is_observational_and_bounded(tmp_path):
     from backend.worker import SimulationWorker
     from backend.challenges import get_challenge
@@ -343,3 +424,93 @@ async def test_dropped_recording_retains_referenced_media_and_is_not_scored_comp
         assert "<script>unsafe text</script>" not in replay and "__RECORDING_DATA__" not in replay
     finally:
         await worker.close()
+
+
+@pytest.mark.parametrize("ending", ["save_map", "stop", "reset", "disconnect", "reject", "agent/takeover"])
+def test_operator_home_sessions_record_all_endings(tmp_path, monkeypatch, ending):
+    from importlib import import_module
+    from fastapi.testclient import TestClient
+    from backend.app import app, lab
+    from backend import session_recording, saved_results, home_mission
+    monkeypatch.setenv("MILO_RENDERER", "tiny")
+    monkeypatch.setattr(import_module("backend.app"), "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(session_recording, "SESSION_RESULTS_ROOT", tmp_path / "performance")
+    monkeypatch.setattr(saved_results, "RESULTS_ROOT", tmp_path)
+    monkeypatch.setattr(home_mission, "DEFAULT_MAP_PATH", tmp_path / "maps.sqlite3")
+    with TestClient(app) as client:
+        state = client.get("/api/state").json()
+        identity = {"run_id": state["run_id"], "episode_epoch": state["episode_epoch"]}
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            response = client.post("/api/home", json={**identity, "action": "navigate_to" if ending == "reject" else "start_mapping", "place_id": "unknown"})
+            assert response.status_code == (409 if ending == "reject" else 200), response.text
+            if ending == "save_map":
+                assert client.post("/api/home", json={**identity, "action": "save_map", "name": "Recorded map"}).status_code == 200
+            elif ending in {"stop", "reset", "agent/takeover"}:
+                assert client.post("/api/" + ending).status_code == 200
+        assert lab.worker.recorder is None
+        batches = client.get("/api/test-results").json()["batches"]
+        assert len(batches) == 1 and batches[0]["evidence"] == "operator_session"
+        trial = batches[0]["trials"][0]
+        assert not trial["verified_success"]
+        assert trial["recording_complete"]
+        replay = client.get(trial["replay_url"])
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["sample_count"] > 0
+        if ending != "reject":
+            assert any(frame["map_url"] for frame in replay.json()["frames"])
+            filename = next(frame["map_url"] for frame in replay.json()["frames"] if frame["map_url"])
+            assert client.get(filename).status_code == 200
+        assert client.get(trial["replay_url"] + "/media/home-9999.json").status_code == 404
+
+
+async def test_operator_recording_writer_failure_stops_and_retains_error(tmp_path, monkeypatch):
+    from backend import session_recording
+    from backend.home_mission import HomeRequest
+    from backend.worker import SimulationWorker
+    monkeypatch.setattr(session_recording, "SESSION_RESULTS_ROOT", tmp_path / "performance")
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    session = None
+    try:
+        await asyncio.wrap_future(worker.ready)
+        session = session_recording.HomeSessionRecording(worker, HomeRequest(run_id=worker.sim.run_id, episode_epoch=0, action="start_mapping"))
+        await session.start()
+        session.executing = False
+        def fail_flush():
+            raise OSError("Injected persistent recording failure")
+        monkeypatch.setattr(session.recorder, "flush", fail_flush)
+        await asyncio.wait_for(session.writer, 5)
+        assert session.finished and worker.sim.cancel.is_set() and worker.recorder is None
+        report = json.loads((session.directory / "bench" / "report.json").read_text())
+        assert "Injected persistent" in report["recording_error"]
+        assert not report["recording_scorecard"]["complete_recording"]
+        assert report["termination_reason"] == "recording_error"
+    finally:
+        if session and not session.finished:
+            await session.finish("test_cleanup")
+        await worker.close()
+
+
+def test_stop_during_recording_start_cannot_authorize_mapping_after_resume(tmp_path, monkeypatch):
+    from importlib import import_module
+    from fastapi.testclient import TestClient
+    from backend.app import app, lab
+    from backend import session_recording, home_mission
+    monkeypatch.setenv("MILO_RENDERER", "tiny")
+    monkeypatch.setattr(import_module("backend.app"), "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(home_mission, "DEFAULT_MAP_PATH", tmp_path / "maps.sqlite3")
+    monkeypatch.setattr(session_recording, "SESSION_RESULTS_ROOT", tmp_path / "performance")
+    original = session_recording.HomeSessionRecording.start
+    async def interrupted_start(self):
+        await original(self)
+        self.worker.stop()
+        await self.worker.resume_manual()
+    monkeypatch.setattr(session_recording.HomeSessionRecording, "start", interrupted_start)
+    with TestClient(app) as client:
+        state = client.get("/api/state").json()
+        with client.websocket_connect("/api/live") as socket:
+            socket.receive_json()
+            response = client.post("/api/home", json={"action": "start_mapping", "run_id": state["run_id"], "episode_epoch": state["episode_epoch"]})
+            assert response.status_code == 409 and "invalidated" in response.text
+            assert lab.worker.home_mission.home is None
+            assert lab.worker.recorder is None

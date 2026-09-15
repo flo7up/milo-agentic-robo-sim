@@ -42,14 +42,29 @@ class Lab:
         self.orbit_target = "table"
         self.orbit_direction = "clockwise"
         self.interaction_mode = "chat"
+        self.home_recording = None
+        self.reuse_saved_map = True
+
+    async def finish_home_recording(self, reason=None):
+        recording = self.home_recording
+        if recording:
+            await asyncio.shield(recording.finish(reason))
+            if self.home_recording is recording:
+                self.home_recording = None
 
     def state(self):
+        mission = self.worker.home_mission
+        home = mission.home if mission else None
         return {**self.worker.latest, "agent": self.agent.public(), "realtime": self.realtime_config.public(),
+            "map_setup": {"reuse_saved_map": self.reuse_saved_map, "map_id": home.identity if home else None,
+                "name": home.name if home else None, "revision": home.revision if home else None,
+                "localization": mission.localization["status"] if mission else "unlocalized"},
             "interaction_mode": self.interaction_mode, "local_navigation_model": self.local_navigation.public()}
 
-    async def reset(self, challenge_id=None, orbit_target=None, orbit_direction=None, environment=None):
+    async def reset(self, challenge_id=None, orbit_target=None, orbit_direction=None, environment=None, reuse_saved_map=None):
         async with self.lock:
             await self.agent.halt("Episode reset")
+            await self.finish_home_recording("episode_reset")
             spatial_enabled = bool(self.worker and not self.worker.closed and self.worker.spatial_enabled)
             if self.worker:
                 await self.worker.close()
@@ -58,6 +73,7 @@ class Lab:
             target = self.orbit_target if challenge_id is None else orbit_target or "table"
             direction = self.orbit_direction if challenge_id is None else orbit_direction or "clockwise"
             layout = self.environment if challenge_id is None else environment or "standalone"
+            reuse_map = self.reuse_saved_map if reuse_saved_map is None else reuse_saved_map
             rendering = os.environ.get("MILO_RENDERER", "enhanced")
             if rendering == "enhanced":
                 from backend.camera import EnhancedResources
@@ -73,7 +89,7 @@ class Lab:
             await asyncio.wrap_future(replacement.ready)
             home_state = await replacement.home_state()
             saved_home = next((item for item in home_state["maps"] if item["environment_id"] == home_state["environment_id"]), None)
-            if saved_home:
+            if saved_home and reuse_map:
                 await replacement.home_command(HomeRequest(run_id=replacement.latest["run_id"], episode_epoch=self.epoch,
                     action="load_map", map_id=saved_home["map_id"]))
             if spatial_enabled:
@@ -82,6 +98,7 @@ class Lab:
             self.worker = replacement
             self.challenge_id = selected
             self.environment = layout
+            self.reuse_saved_map = reuse_map
             self.orbit_target, self.orbit_direction = target, direction
             recording_evidence = self.agent.recording_evidence
             self.agent = AgentController(self.agent.config, self.agent.model_factory, policy_factory=self.agent.policy_factory,
@@ -108,7 +125,7 @@ async def lifespan(app):
     except ValueError:
         lab.agent = AgentController(local_navigation_factory=lab.local_navigation)
         configuration_error = "Invalid Foundry configuration. Check the endpoint and model profiles."
-    await lab.reset("bench")
+    await lab.reset("bench", reuse_saved_map=True)
     try:
         lab.realtime_config = RealtimeConfig.from_environment()
     except ValueError:
@@ -120,6 +137,7 @@ async def lifespan(app):
     finally:
         try:
             await lab.agent.halt("Server shutdown")
+            await lab.finish_home_recording("server_shutdown")
         finally:
             try:
                 await lab.local_navigation.close()
@@ -199,6 +217,27 @@ async def test_result_trajectory(batch_id: str, trial_index: int):
     return JSONResponse(route, headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
+@app.get("/api/test-results/{batch_id}/replay/{trial_index}")
+async def test_result_replay(batch_id: str, trial_index: int):
+    from backend.saved_results import recorded_replay
+    try:
+        result = await asyncio.to_thread(recorded_replay, batch_id, trial_index)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        raise HTTPException(404, "Recorded replay unavailable")
+
+
+@app.get("/api/test-results/{batch_id}/replay/{trial_index}/media/{name}")
+async def test_result_replay_media(batch_id: str, trial_index: int, name: str):
+    from backend.saved_results import recorded_replay_media
+    try:
+        data, content_type = await asyncio.to_thread(recorded_replay_media, batch_id, trial_index, name)
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        return Response(data, media_type=content_type, headers=headers) if isinstance(data, bytes) else JSONResponse(data, headers=headers)
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        raise HTTPException(404, "Recorded media unavailable")
+
+
 @app.get("/api/spatial")
 async def spatial_state(response: Response):
     response.headers["Cache-Control"] = "no-store"
@@ -212,9 +251,9 @@ async def spatial_state(response: Response):
 
 
 @app.get("/api/home")
-async def home_state():
+async def home_state(compact: bool = False):
     try:
-        return JSONResponse(await lab.worker.home_state(), headers={"Cache-Control": "no-store"})
+        return JSONResponse(await lab.worker.home_state(compact=compact), headers={"Cache-Control": "no-store"})
     except RuntimeError as error:
         raise HTTPException(409, "Home map episode changed") from error
 
@@ -227,14 +266,57 @@ async def home_operation(request: HomeRequest):
     if request.action == "cancel_task":
         worker.stop()
         await lab.agent.halt("Home task cancelled")
-        return await worker.home_command(request)
+        result = await worker.home_command(request)
+        await lab.finish_home_recording("cancelled")
+        return result
     if lab.lock.locked() or lab.agent.active or worker.latest.get("busy") or not lab.connections:
         raise HTTPException(409, "Keep the operator connected and take manual control before changing the map")
     async with lab.lock:
+        from backend.session_recording import HomeSessionRecording
+        stop_revision, task_revision = worker.stop_revision, worker.task_revision
+        starts = request.action in {"start_mapping", "start_exploration", "continue_mapping", "guided_to", "load_map", "localize", "navigate_to", "explore", "explore_frontier"}
+        if starts and lab.home_recording and (lab.home_recording.done.is_set() or request.action != "start_mapping"):
+            await lab.finish_home_recording("workflow_transition")
+        if lab.home_recording and lab.home_recording.finished:
+            lab.home_recording = None
+        if starts and lab.home_recording is None:
+            evidence = "scripted_test" if lab.agent.recording_evidence == "scripted_test" else "operator_session"
+            lab.home_recording = HomeSessionRecording(worker, request, evidence)
+            try:
+                await lab.home_recording.start()
+            except (OSError, ValueError, RuntimeError) as error:
+                lab.home_recording = None
+                raise HTTPException(503, "Spatial recording could not start; no map command executed") from error
+        recording = lab.home_recording
+        if recording:
+            recording.executing = True
         try:
-            return await worker.home_command(request)
+            result = await worker.home_command(request, stop_revision, task_revision, operator_review=request.action == "review_room")
+            if recording:
+                await worker.call(lambda sim: recording.recorder.capture(worker))
+                if request.action in {"save_map", "localize", "load_map"}:
+                    await lab.finish_home_recording(request.action)
+            return result
         except (ValueError, MotionError, RuntimeError) as error:
+            if recording:
+                recording.request_error = str(error)
+                await lab.finish_home_recording("rejected")
             raise HTTPException(409, str(error)) from error
+        finally:
+            if recording:
+                recording.executing = False
+
+
+@app.get("/api/home/{map_id}/rooms/{observation_id}/image.png")
+async def home_room_image(map_id: str, observation_id: str):
+    mission = lab.worker.home_mission
+    if mission is None or mission.home is None or mission.home.identity != map_id:
+        raise HTTPException(404, "Load the matching map to view room evidence")
+    try:
+        image = await asyncio.to_thread(mission.store.room_image, map_id, observation_id)
+        return Response(image, media_type="image/png", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
 
 
 @app.get("/api/home/{map_id}/objects/{observation_id}/image.png")
@@ -447,6 +529,7 @@ async def place_robot(placement: ManualPlacement):
 async def stop():
     lab.worker.stop()
     await lab.agent.halt()
+    await lab.finish_home_recording("stopped")
     return {"stopped": True}
 
 
@@ -455,6 +538,7 @@ async def stop():
 async def resume():
     lab.worker.stop()
     await lab.agent.halt("Manual takeover")
+    await lab.finish_home_recording("takeover")
     async with lab.lock:
         await lab.worker.resume_manual()
     return lab.state()
@@ -478,7 +562,7 @@ async def challenges(environment: Literal["standalone", "shared_apartment_v1"] =
 async def load_challenge(selection: ChallengeLoad):
     lab.worker.stop()
     await lab.agent.halt("Challenge changed")
-    return await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction, selection.environment)
+    return await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction, selection.environment, selection.reuse_saved_map)
 
 
 @app.get("/api/agent")
@@ -568,6 +652,7 @@ async def start_agent(settings: AgentStart):
             if worker is not lab.worker or worker.stop_revision != stop_revision or not lab.connections:
                 raise HTTPException(409, "Policy start invalidated by Stop or episode/operator change")
         try:
+            await lab.finish_home_recording("luna_handoff")
             lab.agent.start(lab.worker, settings)
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
@@ -671,6 +756,7 @@ async def live(socket: WebSocket):
             lab.worker.stop()
             with CancelScope(shield=True):
                 await lab.agent.halt("Operator disconnected")
+                await lab.finish_home_recording("disconnected")
 
 
 dist = Path(__file__).resolve().parents[1] / "frontend" / "dist"
