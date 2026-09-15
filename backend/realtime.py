@@ -12,7 +12,7 @@ from pydantic import Field, field_validator
 from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.client import connect
 
-from backend.agent import AgentController, AgentStart, FeedbackRate, FoundryConfig, INSTRUCTIONS, ModelProfile, feedback_message, robot_tools
+from backend.agent import AgentController, AgentStart, FeedbackRate, FoundryConfig, INSTRUCTIONS, InferenceLimit, ModelProfile, feedback_message, robot_tools
 from backend.contracts import Command, StrictModel, TOOL_MODELS
 from backend.feedback import compact_numbers, feedback_json, model_tool_result, observation_collision
 
@@ -109,6 +109,8 @@ class VoiceStart(FeedbackRate):
     run_id: str = Field(min_length=1, max_length=80)
     episode_epoch: int = Field(ge=0)
     max_turns: int = Field(default=30, ge=1, le=200)
+    max_model_requests: int = Field(default=30, ge=1, le=200)
+    max_model_tokens: int = Field(default=100000, ge=1, le=2000000)
 
 
 class VoiceController(AgentController):
@@ -140,11 +142,14 @@ class VoiceController(AgentController):
         self.task = asyncio.create_task(self._run_voice(worker, browser))
 
     def _check_voice_live(self, worker):
-        if (self.cancelled or worker.closed or worker.latest["run_id"] != self.settings.run_id or
+        if (self.cancelled or worker.closed or not worker.powered or worker.latest["run_id"] != self.settings.run_id or
                 worker.latest["episode_epoch"] != self.settings.episode_epoch):
             raise asyncio.CancelledError
 
     async def _respond(self, worker, connection, allow_tools=True, call_id=None):
+        budget = self.state["inference_budget"]
+        if budget["requests"] >= budget["max_requests"] or budget["tokens"] >= budget["max_tokens"]:
+            raise InferenceLimit("Voice task budget reached; robot returned to idle")
         if self.state["turns"] >= self.settings.max_turns:
             raise ValueError("Voice session turn limit reached")
         await self._wait_for_feedback(self.last_feedback)
@@ -168,6 +173,7 @@ class VoiceController(AgentController):
         self.responding = True
         self.allow_tools = allow_tools
         self.response_id = None
+        budget["requests"] += 1
         await connection.send({"type": "response.create", "response": {"tool_choice": "auto" if allow_tools else "none"}})
 
     async def _browser_input(self, worker, browser, connection):
@@ -195,6 +201,7 @@ class VoiceController(AgentController):
                 self.state["outcome"] = None
                 self.state.update(idle_since=None, idle_reason=None, wake_reason="Voice interaction", camera_unchanged_s=0)
                 self.recording, self.audio_bytes, self.actions = True, 0, 0
+                worker.inference_owner = self
                 await worker.resume_manual()
                 self._check_voice_live(worker)
                 await connection.send({"type": "input_audio_buffer.clear"})
@@ -204,6 +211,7 @@ class VoiceController(AgentController):
                 if self.audio_bytes < 4800:
                     await connection.send({"type": "input_audio_buffer.clear"})
                     self.state["phase"] = "voice_ready"
+                    worker.inference_owner = None
                     await browser.send_json({"type": "notice", "message": "Recording too short. Try again."})
                     await browser.send_json({"type": "ready"})
                     continue
@@ -249,6 +257,13 @@ class VoiceController(AgentController):
         usage = response.get("usage") or {}
         self.state["input_tokens"] += usage.get("input_tokens", 0)
         self.state["output_tokens"] += usage.get("output_tokens", 0)
+        budget = self.state["inference_budget"]
+        budget["tokens"] += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        if not usage:
+            budget["usage_unknown"] = True
+            raise InferenceLimit("Voice usage unavailable; no further inference or motion authorized")
+        if budget["tokens"] >= budget["max_tokens"]:
+            raise InferenceLimit("Voice token threshold reached; robot returned to idle")
         latency = time.monotonic() - self.response_started
         self.state.update(message=text[:2000], inference_latency_s=latency)
         self._trace("response", "Spoken LLM response", {
@@ -263,19 +278,11 @@ class VoiceController(AgentController):
             raise ValueError("Incomplete or multiple-action voice response; robot stopped")
         if not calls:
             self.state["phase"] = "voice_ready"
+            worker.inference_owner = None
             if self.state["outcome"] is None:
                 self._set_outcome("ended", text or "Voice reply finished", "agent")
             await browser.send_json({"type": "ready"})
-            async def wake():
-                self._check_voice_live(worker)
-                if self.recording or self.responding:
-                    return
-                await browser.send_json({"type": "waking"})
-                self.state["outcome"] = None
-                await connection.send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
-                    "content": [{"type": "input_text", "text": "The head-camera scene changed while idle. Briefly assess the new view without moving; wait for a new spoken command."}]}})
-                await self._respond(worker, connection, allow_tools=False)
-            self._arm_idle(worker, self.idle_outcome or "Reply finished", wake, worker.stop_revision)
+            self._cancel_idle()
             return
         call = calls[0]
         call_id, name = call["call_id"], call["name"]
@@ -330,6 +337,7 @@ class VoiceController(AgentController):
                                 raise ValueError("Foundry Realtime session configuration failed")
                     self._check_voice_live(worker)
                     self.state["phase"] = "voice_ready"
+                    worker.inference_owner = None
                     await browser.send_json({"type": "ready", "session_id": self.state["session_id"]})
                     tasks = [asyncio.create_task(self._browser_input(worker, browser, connection)),
                              asyncio.create_task(self._receive_model(worker, browser, connection))]
@@ -347,6 +355,9 @@ class VoiceController(AgentController):
             self.state.update(phase="stopped", message="Voice control ended")
         except TimeoutError:
             self.state.update(phase="error", error="Voice session timed out; robot stopped")
+        except InferenceLimit as error:
+            self.state.update(phase="completed", error=None, message=str(error))
+            self._set_outcome("limited", str(error))
         except ValueError as error:
             self.state.update(phase="error", error=str(error))
         except Exception:
@@ -375,6 +386,8 @@ class VoiceController(AgentController):
                     await model.close()
             finally:
                 self.active = False
+                if worker.inference_owner is self:
+                    worker.inference_owner = None
                 if self.state["phase"] not in ("error", "stopped"):
                     self.state.update(phase="stopped", message="Voice control ended")
                 self.state["next_feedback_at"] = None

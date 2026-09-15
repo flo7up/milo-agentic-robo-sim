@@ -109,7 +109,7 @@ def test_archive_comparison_requires_complete_matching_frozen_inputs():
         "fixture_sha256": "b" * 64, "design": {"source_sha256": "c" * 64, "runtime": {"renderer": "enhanced"}},
         "finished_at": "2026-09-15", "source_changed_during_run": False, "original_map_unchanged": True,
         "evidence": "scripted_test", "cases": planned_cases(suite)}
-    trials = [{"benchmark": {"suite_id": suite["suite_id"], "status": "passed", "provenance_valid": True}} for case in manifest["cases"]]
+    trials = [{"benchmark": {"suite_id": suite["suite_id"], "task_id": case["task_id"], "status": "passed", "provenance_valid": True}} for case in manifest["cases"]]
     baseline = benchmark_comparability(manifest, trials)
     assert baseline["eligible"]
     candidate = copy.deepcopy(manifest)
@@ -124,10 +124,24 @@ def test_archive_comparison_requires_complete_matching_frozen_inputs():
     missing = copy.deepcopy(trials)
     missing[0]["benchmark"] = None
     assert not benchmark_comparability(manifest, missing)["eligible"]
-    missing[0]["benchmark"] = {"suite_id": suite["suite_id"], "status": "failed", "provenance_valid": False}
+    missing[0]["benchmark"] = {"suite_id": suite["suite_id"], "task_id": "localize", "status": "failed", "provenance_valid": False}
     assert not benchmark_comparability(manifest, missing)["eligible"]
-    missing[0]["benchmark"] = {"suite_id": suite["suite_id"], "status": "blocked", "provenance_valid": False}
+    missing[0]["benchmark"] = {"suite_id": suite["suite_id"], "task_id": "localize", "status": "blocked", "provenance_valid": False}
     assert benchmark_comparability(manifest, missing)["eligible"]
+    missing[0]["benchmark"]["task_id"] = "different"
+    assert not benchmark_comparability(manifest, missing)["eligible"]
+
+
+def test_benchmark_run_requires_explicit_baseline_or_new_series(tmp_path):
+    from scripts.benchmark_household import argument_parser, validate_baseline
+    options = argument_parser().parse_args(["--stage", "run", "--output", str(tmp_path / "new")])
+    with pytest.raises(ValueError, match="Choose --baseline"):
+        validate_baseline(options, suite_definition(), {}, [])
+    options.establish_baseline = True
+    assert validate_baseline(options, suite_definition(), {}, []) is None
+    options.baseline = tmp_path
+    with pytest.raises(ValueError, match="Choose --baseline"):
+        validate_baseline(options, suite_definition(), {}, [])
 
 
 def test_archive_keeps_benchmark_outcomes_separate_from_scenario_success(tmp_path):

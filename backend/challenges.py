@@ -510,7 +510,7 @@ PRESETS["inspection"] = Challenge(
               "position": [center_x, -3.35, 1.14], "color": [.81, .25, .23, 1]}
              for index, center_x in enumerate((1.5, 2.5, 3.4))],
           {"name": "maintenance_counter", "size": [1.3, .45, .65], "position": [2.6, 3.52, .325], "material": "wood", "color": [.52, .58, .46, 1]},
-          {"name": "tool_case", "size": [.4, .28, .18], "position": [2.55, 3.50, .75], "color": [.89, .59, .14, 1]},
+          {"name": "tool_case", "size": [.4, .28, .18], "position": [2.55, 3.50, .75], "color": [.12, .36, .65, 1]},
           *[{"name": f"inspection_pedestal_{index}", "size": [.36, .36, .34], "position": [center_x, center_y, .17],
               "color": [.38, .42, .44, 1]} for index, (center_x, center_y) in enumerate(((2.8, -2.3), (2.8, 2.6)))],
           {"name": "inspection_target", "size": [.18, .18, .18], "position": [2.8, -2.3, .43], "color": [.98, .78, .05, 1]},

@@ -55,7 +55,7 @@ export type ExchangeEntry = {
   id: number; title: string; timestamp: number; turn: number; image_url: string | null; image_urls?: string[];
 } & (
   { kind: 'session'; payload: { model?: string; deployment?: string; reasoning?: string; goal?: string; instructions?: string; tools?: unknown[]; feedback_interval_s?: number; max_turns?: number; status?: string; message?: string; reason?: string } } |
-  { kind: 'feedback'; payload: { observation: Observation; image_detail: string; history_turns: number[]; input_items: number; images_in_request: number; tool_result_call_ids: string[]; context_mode?: string; memory_frame_seq?: number | null; recent_actions?: Partial<AgentAction>[]; collision_feedback?: CollisionFeedback | null; images_per_request?: number; context_tokens?: number; retained_context_tokens_estimate?: number; context_estimator?: string; camera_frames?: { seq: number; frame_ref: string; simulated_time_s: number; wall_timestamp: number; current: boolean }[]; camera_history?: { frames: { frame_id: string; simulated_time_s: number }[] }; historical_original?: { frame_id: string; simulated_time_s: number } | null } } |
+  { kind: 'feedback'; payload: { observation: Observation; image_roles?: string[]; image_detail: string; history_turns: number[]; input_items: number; images_in_request: number; tool_result_call_ids: string[]; context_mode?: string; memory_frame_seq?: number | null; recent_actions?: Partial<AgentAction>[]; collision_feedback?: CollisionFeedback | null; images_per_request?: number; context_tokens?: number; retained_context_tokens_estimate?: number; context_estimator?: string; camera_frames?: { seq: number; frame_ref: string; simulated_time_s: number; wall_timestamp: number; current: boolean }[]; camera_history?: { frames: { frame_id: string; simulated_time_s: number }[] }; historical_original?: { frame_id: string; simulated_time_s: number } | null } } |
   { kind: 'response'; payload: { text: string; text_truncated: boolean; status: string; latency_s: number; input_tokens: number | null; output_tokens: number | null; calls: { call_id: string; name: string; arguments: string }[]; calls_truncated: boolean; refusals: string[] } } |
   { kind: 'tool'; payload: { tool: string; arguments: unknown; call_id: string } } |
   { kind: 'policy'; payload: Record<string, unknown> } |
@@ -63,6 +63,10 @@ export type ExchangeEntry = {
 );
 export type ExchangeFeed = { session_id: string | null; revision: number; first_id: number; capacity: number; events: ExchangeEntry[] };
 export type AgentState = {
+  inference_budget?: {requests: number; tokens: number; max_requests: number; max_tokens: number; usage_unknown: boolean};
+  unified_mission?: boolean;
+  mission?: {mission_id: string; phase: string; remaining_s: number; reason: string;
+    plan: {kind: string; target: string; return_home: boolean} | null; receipts: Record<string, unknown>} | null;
   execution_mode: ExecutionMode;
   navigation_backend?: 'builtin' | 'nav2';
   run_messages?: {id:string;role:'user'|'assistant';text:string;status:string;source?:string}[];
@@ -91,6 +95,8 @@ export type AgentState = {
   configuration: { provider: string; endpoint: string; ollama_endpoint: string; default_model_id: string; models: ModelProfile[] };
 };
 export type LiveState = {
+  power?: {on: boolean; mode: 'off' | 'idle' | 'working'; revision: number; idle_sensor_interval_s: number};
+  preference_error?: string | null;
   map_setup?: { reuse_saved_map: boolean; map_id: string | null; name: string | null; revision: number | null; localization: string };
   rendering?: 'tiny' | 'enhanced';
   continuous_navigation?: {status: string; reason: string; remaining_m: number; updates: number; buffer_stops: number} | null;

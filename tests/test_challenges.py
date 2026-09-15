@@ -97,6 +97,28 @@ def test_shared_apartment_api_selection_and_reset_are_isolated():
         assert state["challenge"]["orbit"] == {"target": "table", "direction": "clockwise"}
 
 
+def test_inspection_shelf_case_is_distinct_from_yellow_target_without_geometry_changes():
+    from backend.materials import scene_material
+    challenge = get_challenge("inspection")
+    objects = {item["name"]: item for item in challenge.objects}
+    case = objects["tool_case"]
+    target = objects[challenge.search_target]
+    assert case["position"] == [2.55, 3.50, .75] and case["size"] == [.4, .28, .18]
+    assert case["color"] == [.12, .36, .65, 1] and scene_material(case) is None
+    assert target["name"] == "inspection_target" and target["color"] == [.98, .78, .05, 1]
+    assert target["position"] == [2.8, -2.3, .43] and target["size"] == [.18, .18, .18]
+    assert objects["inspection_decoy"]["color"] == [.85, .12, .18, 1]
+    assert challenge.objectives[0].center == [2.8, -2.3, 0]
+    sim = BulletSimulation(challenge=challenge, width=160, height=120)
+    try:
+        body = next(item["id"] for item in sim.objects if item["name"] == "tool_case")
+        visual = bullet.getVisualShapeData(body, physicsClientId=sim.client)[0]
+        assert visual[7] == pytest.approx(case["color"])
+        assert "tool_case" not in sim.observe().model_dump_json()
+    finally:
+        sim.close()
+
+
 def test_presets_have_distinct_goals_and_private_geometry():
     assert set(PRESETS) == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit"}
     for preset in PRESETS.values():

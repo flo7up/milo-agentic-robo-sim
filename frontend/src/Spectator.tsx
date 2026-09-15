@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { LiveState, ManualPlacement } from './types';
 import { enhancedLighting, visualGeometry, visualMaterial, type GraphicsQuality } from './sceneGraphics';
+import { usePreference } from './Preferences';
 
 export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState; axes: boolean; enabled: boolean; onPlace: (placement: ManualPlacement) => Promise<void> }) {
   const host = useRef<HTMLDivElement>(null);
@@ -15,8 +16,13 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
   const [preview, setPreview] = useState<[number, number] | null>(null);
   const [placing, setPlacing] = useState(false);
   const [error, setError] = useState('');
-  const [preferredQuality, setQuality] = useState<GraphicsQuality>(() =>
-    new URLSearchParams(location.search).get('graphics') === 'enhanced' || localStorage.getItem('milo-spectator-graphics') === 'enhanced' ? 'enhanced' : 'standard');
+  const [savedQuality, saveQuality] = usePreference('graphics', 'standard');
+  const [qualityOverride, setQualityOverride] = useState<GraphicsQuality | null>(() => {
+    const option = new URLSearchParams(location.search).get('graphics');
+    return option === 'standard' || option === 'enhanced' ? option : null;
+  });
+  const preferredQuality = qualityOverride ?? savedQuality;
+  function setQuality(mode: GraphicsQuality) { setQualityOverride(null); saveQuality(mode); }
   const quality = state.rendering === 'enhanced' ? 'enhanced' : preferredQuality;
   const savedView = useRef<{ run: string; position: THREE.Vector3; target: THREE.Vector3 } | null>(null);
   current.current = state;
@@ -319,7 +325,7 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     {state.rendering !== 'enhanced' && <div className="graphics-quality" role="group" aria-label="Spectator graphics">
       {(['standard', 'enhanced'] as const).map(mode => <button key={mode} type="button" aria-pressed={quality === mode}
         title={`${mode === 'standard' ? 'Standard' : 'Enhanced'} spectator graphics; robot camera unchanged`}
-        onClick={() => { localStorage.setItem('milo-spectator-graphics', mode); setQuality(mode); }}>
+        onClick={() => setQuality(mode)}>
         {mode === 'standard' ? 'Standard' : 'Enhanced'}</button>)}
     </div>}
     {error && <div className="placement-error" role="alert">{error}</div>}

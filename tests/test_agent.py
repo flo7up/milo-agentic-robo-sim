@@ -655,7 +655,7 @@ async def test_stalled_drive_history_is_explicit_and_repeated_pushes_stop():
         await worker.close()
 
 
-async def test_finished_task_idles_after_five_seconds_and_camera_change_wakes_once():
+async def test_finished_task_remains_idle_without_camera_triggered_inference():
     import pybullet as bullet
     worker = SimulationWorker(pace=False)
     model = ScriptedModel([text_response(), "wait"])
@@ -664,21 +664,141 @@ async def test_finished_task_idles_after_five_seconds_and_camera_change_wakes_on
         await asyncio.wrap_future(worker.ready)
         controller.start(worker, start_settings(worker, feedback_interval_s=.25))
         await controller.task
-        assert controller.idle_delay_s == 5 and controller.state["auto_wake"]
-        started = time.monotonic()
-        await wait_for_phase(controller, "sleeping")
-        assert time.monotonic() - started >= 4.9
+        assert not controller.state["auto_wake"] and controller.idle_task is None
         assert not controller.active and len(model.inputs) == 1 and worker.sim.ticks == 0
         sequence = worker.sim.seq
         await asyncio.sleep(.6)
         assert len(model.inputs) == 1 and worker.sim.seq == sequence
         await worker.call(lambda sim: bullet.resetJointState(sim.robot, sim.joints["head_pitch"], .8, physicsClientId=sim.client))
-        await wait_for_phase(controller, "thinking")
-        assert len(model.inputs) == 2 and controller.active
-        assert "scene changed while idle" in json.dumps(model.inputs[-1])
-        assert controller.state["turns"] == 2 and controller.state["input_tokens"] == 10
+        await asyncio.sleep(.15)
+        assert len(model.inputs) == 1 and not controller.active
+        assert worker.latest["stopped"] and controller.state["turns"] == 1
         await controller.halt()
         assert not controller.state["auto_wake"] and controller.idle_task is None
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+async def test_power_off_cancels_pending_inference_and_on_never_restarts_it():
+    worker = SimulationWorker(pace=False)
+    model = ScriptedModel(["wait"])
+    controller = controller_for(model)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        controller.start(worker, start_settings(worker))
+        await model.entered.wait()
+        assert worker.power_state()["mode"] == "working"
+        await worker.set_power(False)
+        await controller.halt("Robot powered off")
+        assert worker.power_state()["mode"] == "off"
+        assert not await worker.resume_manual()
+        with pytest.raises(Exception, match="Turn the robot on"):
+            controller.start(worker, start_settings(worker))
+        await worker.set_power(True)
+        model.release.set()
+        await asyncio.sleep(.1)
+        assert worker.power_state()["mode"] == "idle"
+        assert not controller.active and len(model.inputs) == 1
+        assert worker.sim.ticks == 0
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+@pytest.mark.parametrize("limits", [{"max_model_requests": 1}, {"max_model_tokens": 1}])
+async def test_task_inference_budget_blocks_further_requests_and_motion(limits):
+    worker = SimulationWorker(pace=False)
+    model = ScriptedModel([model_response("observe", "{}"), model_response()])
+    controller = controller_for(model)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        controller.start(worker, start_settings(worker, feedback_interval_s=.25, **limits))
+        await controller.task
+        assert controller.state["outcome"]["kind"] == "limited"
+        assert controller.state["inference_budget"]["requests"] == 1
+        assert controller.state["inference_budget"]["tokens"] > 0
+        assert len(model.inputs) == 1 and worker.sim.ticks == 0
+        assert worker.latest["stopped"] and not controller.active
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+async def test_idle_sensing_is_throttled_and_off_does_not_capture():
+    from backend.contracts import SpatialSettings
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    try:
+        await asyncio.wrap_future(worker.ready)
+        await worker.configure_spatial(SpatialSettings(run_id=worker.sim.run_id, episode_epoch=worker.epoch, enabled=True))
+        def probe(sim):
+            worker._receive_spatial(wait=True)
+            sequence = worker.spatial_sequence
+            worker.spatial_sampled_at = time.monotonic() - .3
+            worker._sample_spatial()
+            idle = worker.spatial_sequence - sequence
+            worker.inference_owner = object()
+            worker._sample_spatial()
+            active = worker.spatial_sequence - sequence
+            worker.inference_owner = None
+            return idle, active
+        assert await worker.call(probe) == (0, 1)
+        await worker.set_power(False)
+        before = worker.spatial_sequence, worker.camera_seq, worker.sim.ticks
+        await worker.call(lambda sim: worker._sample_spatial(force=True))
+        assert (worker.spatial_sequence, worker.camera_seq, worker.sim.ticks) == before
+        assert worker.spatial_pending is None and worker.spatial_capture_pending is None
+    finally:
+        await worker.close()
+
+
+async def test_stop_during_power_on_prevents_pending_resume(monkeypatch):
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        await asyncio.wrap_future(worker.ready)
+        await worker.set_power(False)
+        resume = worker.resume_manual
+        async def delayed_resume(expected_stop_revision=None):
+            entered.set()
+            await release.wait()
+            return await resume(expected_stop_revision)
+        monkeypatch.setattr(worker, "resume_manual", delayed_resume)
+        pending = asyncio.create_task(worker.set_power(True))
+        await entered.wait()
+        worker.stop()
+        release.set()
+        await pending
+        assert worker.powered and worker.latest["stopped"] and worker.sim.cancel.is_set()
+        assert worker.sim.ticks == 0
+    finally:
+        release.set()
+        await worker.close()
+
+
+async def test_redirect_retains_model_cost_budget(monkeypatch):
+    from backend import mission_supervisor
+    from backend.agent import RunInstruction
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    model = ScriptedModel(["wait", text_response()])
+    controller = controller_for(model)
+    async def run(controller, worker, settings, model, profile, stop_revision):
+        await worker.resume_manual(expected_stop_revision=stop_revision)
+        controller.state["turns"] = 1
+        await model.respond(profile, settings.reasoning, settings.goal, [])
+    monkeypatch.setattr(mission_supervisor, "run", run)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        controller.start(worker, start_settings(worker, unified_mission=True, execution_mode="luna_continuous",
+            map_context=False, max_model_requests=2))
+        await model.entered.wait()
+        budget = controller.state["inference_budget"]
+        await controller.redirect(worker, RunInstruction(run_id=worker.sim.run_id, episode_epoch=worker.epoch,
+            session_id=controller.state["session_id"], message="New target"))
+        await controller.task
+        assert controller.state["inference_budget"] is budget
+        assert budget["requests"] == budget["max_requests"] == len(model.inputs) == 2
+        assert not controller.active and worker.latest["stopped"]
     finally:
         await controller.halt()
         await worker.close()
@@ -693,8 +813,7 @@ async def test_unachievable_idle_is_cancelled_by_stop_and_chat_can_start_again()
         await asyncio.wrap_future(worker.ready)
         controller.start(worker, start_settings(worker))
         await controller.task
-        await wait_for_phase(controller, "sleeping")
-        assert controller.state["idle_reason"] == "Task unachievable"
+        assert not controller.state["auto_wake"] and controller.idle_task is None
         await controller.halt()
         assert controller.state["phase"] == "stopped" and not controller.state["auto_wake"]
         controller.start(worker, ChatStart(**start_settings(worker).model_dump(), message="What changed?"))
@@ -724,7 +843,6 @@ async def test_static_camera_does_not_idle_pending_inference_and_limits_prevent_
         controller.start(worker, start_settings(worker, max_turns=1))
         assert controller.public()["context_usage"] is None
         await controller.task
-        await wait_for_phase(controller, "sleeping")
         assert not controller.state["auto_wake"] and controller.idle_task is None
         await worker.call(lambda sim: bullet.resetJointState(sim.robot, sim.joints["head_pitch"], .8, physicsClientId=sim.client))
         await asyncio.sleep(.15)
@@ -770,8 +888,7 @@ async def test_completed_challenge_stops_goal_loop_without_extra_model_request()
         await controller.task
         assert worker.latest["challenge"]["status"] == "completed"
         assert len(model.inputs) == 2
-        await wait_for_phase(controller, "sleeping")
-        assert controller.state["idle_reason"] == "Task completed"
+        assert not controller.state["auto_wake"] and controller.idle_task is None
         assert controller.state["outcome"]["source"] == "physics"
         assert "completed_objectives" not in json.dumps(model.inputs)
     finally:
@@ -1147,13 +1264,27 @@ async def test_trace_never_exposes_encrypted_reasoning_or_credentials(monkeypatc
 
 
 if __name__ == "__main__":
-    from contextlib import asynccontextmanager
+    from contextlib import asynccontextmanager, closing
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
     import os
     os.environ.setdefault("MILO_RENDERER", "tiny")
     import uvicorn
     from backend.app import app, lab, lifespan
     from backend.realtime import RealtimeConfig
     from tests.test_realtime import RealtimeModel, tool_call
+
+    @app.post("/api/test/preferences/reset")
+    async def reset_browser_preferences():
+        import sqlite3
+        from backend.preferences import PreferenceStore
+        path = PreferenceStore().path
+        if path.exists():
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("DELETE FROM preferences")
+        return {"reset": True}
+
+    app.router.routes.insert(0, app.router.routes.pop())
 
     class BrowserLocalNavigation:
         def __init__(self):
@@ -1182,6 +1313,13 @@ if __name__ == "__main__":
 
     class BrowserModel(ScriptedModel):
         async def respond(self, profile, reasoning, goal, inputs):
+            if getattr(self, "unified_mission", False):
+                self.inputs.append(inputs)
+                if len(self.inputs) == 1:
+                    return model_response("guide_mission", json.dumps({"action": "plan", "plan": {"kind": "explore"},
+                        "reason": "Scripted unified mission fixture"}), call_id="mission-plan")
+                await self.release.wait()
+                return model_response("guide_mission", json.dumps({"action": "explore"}), call_id="mission-explore")
             if getattr(self, "execution_mode", "single_step") == "luna_continuous":
                 self.inputs.append(inputs)
                 if goal == "Review motion camera history." and len(self.inputs) == 1:
@@ -1264,4 +1402,6 @@ if __name__ == "__main__":
             yield
 
     app.router.lifespan_context = browser_fixture
-    uvicorn.run(app, host="127.0.0.1", port=8001)
+    with TemporaryDirectory(prefix="milo-browser-preferences-") as preferences_directory:
+        os.environ["MILO_PREFERENCES_STORE"] = str(Path(preferences_directory) / "preferences.sqlite3")
+        uvicorn.run(app, host="127.0.0.1", port=8001)

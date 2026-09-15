@@ -164,7 +164,7 @@ async def start_voice(model, pace=False):
     return worker, browser, controller
 
 
-async def test_voice_idle_wakes_for_camera_or_new_utterance_without_recording_automatically():
+async def test_voice_idle_requires_new_utterance_and_never_wakes_from_camera():
     import pybullet as bullet
     from tests.test_agent import wait_for_phase
     model = RealtimeModel([[], [], []])
@@ -175,15 +175,12 @@ async def test_voice_idle_wakes_for_camera_or_new_utterance_without_recording_au
         await browser.send(b"\0\0" * 4800)
         await browser.send({"type": "commit"})
         await browser.wait("ready")
-        await wait_for_phase(controller, "sleeping")
+        await wait_for_phase(controller, "voice_ready")
         assert not controller.recording and model.connection.response_number == 1
         await worker.call(lambda sim: bullet.resetJointState(sim.robot, sim.joints["head_pitch"], .8, physicsClientId=sim.client))
-        await browser.wait("waking")
-        await browser.wait("ready")
-        await wait_for_phase(controller, "sleeping")
-        assert model.connection.response_number == 2 and not controller.recording
-        responses = [packet for packet in model.connection.sent if packet["type"] == "response.create"]
-        assert responses[-1]["response"]["tool_choice"] == "none"
+        await asyncio.sleep(.15)
+        assert model.connection.response_number == 1 and not controller.recording
+        assert worker.power_state()["mode"] == "idle" and controller.idle_task is None
         assert worker.sim.ticks == 0
         await browser.send({"type": "listen"})
         await wait_for_phase(controller, "listening")
@@ -191,9 +188,28 @@ async def test_voice_idle_wakes_for_camera_or_new_utterance_without_recording_au
         await browser.send(b"\0\0" * 4800)
         await browser.send({"type": "commit"})
         await browser.wait("ready")
-        assert model.connection.response_number == 3
+        assert model.connection.response_number == 2
         await controller.halt()
         assert controller.idle_task is None and not controller.state["auto_wake"]
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+@pytest.mark.parametrize("limit", ["max_requests", "max_tokens"])
+async def test_voice_cost_budget_ends_session_before_further_requests(limit):
+    model = RealtimeModel([tool_call(name="observe", arguments={}), []])
+    worker, browser, controller = await start_voice(model)
+    controller.state["inference_budget"][limit] = 1
+    try:
+        await browser.send({"type": "listen"})
+        await browser.send(b"\0\0" * 4800)
+        await browser.send({"type": "commit"})
+        await asyncio.wait_for(controller.task, 8.)
+        assert controller.state["outcome"]["kind"] == "limited"
+        assert model.connection.response_number == 1
+        assert worker.latest["stopped"] and worker.sim.ticks == 0
+        assert worker.power_state()["mode"] == "idle"
     finally:
         await controller.halt()
         await worker.close()

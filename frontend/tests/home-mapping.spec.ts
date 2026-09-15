@@ -2,6 +2,10 @@ import { test, expect } from '@playwright/test';
 import type { HomeState } from '../src/HomeMapping';
 import type { Batch } from '../src/TestResults';
 
+test.beforeEach(async ({request}) => {
+  expect((await request.post('/api/test/preferences/reset')).ok()).toBe(true);
+});
+
 test('baseline progress separates gains regressions gaps and incompatible runs', async ({page}) => {
   const titles = ['Navigate', 'Return Home', 'Room entry'];
   function batch(id: string, date: string, passed: number[], cohort = 'matched', eligible = true): Batch {
@@ -60,6 +64,31 @@ test('scenario map reuse is optional and survives reset without deleting saved m
   await dialog.getByRole('combobox',{name:'Map source',exact:true}).selectOption('saved');
   await dialog.getByRole('button',{name:'Load challenge',exact:true}).click();
   await expect.poll(async()=>(await(await request.get('/api/state')).json()).map_setup.reuse_saved_map).toBe(true);
+});
+
+test('local-only diagnostics use the unified mission endpoint and expose Stop', async ({page,request}) => {
+  await request.post('/api/challenges/load',{data:{challenge_id:'park',reuse_saved_map:false}});
+  await request.post('/api/resume');
+  const operations: string[]=[];
+  await page.route('**/api/mission/start',route=>{const body=route.request().postDataJSON();expect(body.mission_local_only).toBe(true);expect(body.unified_mission).toBe(true);operations.push('mission');return route.fulfill({status:409,json:{detail:'Scripted start capture; no motion'}});});
+  await page.route('**/api/stop',route=>{operations.push('stop');return route.fulfill({json:{stopped:true}});});
+  page.on('request',request=>{if(request.method()==='POST'&&request.url().includes('/api/agent/'))operations.push('agent-request');});
+  await page.goto('/');
+  await page.locator('.run-options > summary').click();
+  await page.locator('.mission-diagnostics > summary').click();
+  await page.getByRole('combobox',{name:'Diagnostic execution profile',exact:true}).selectOption('local');
+  const panel=page.getByRole('region',{name:'LLM control',exact:true});
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect(panel).toContainText('Scripted start capture');
+  for(const width of [1440,390,320]){
+    await page.setViewportSize({width,height:1000});
+    const layout=await panel.evaluate(element=>({width:element.clientWidth,scroll:element.scrollWidth,
+      outside:[...element.querySelectorAll('*')].filter(child=>child.getBoundingClientRect().right>element.getBoundingClientRect().right+1)
+        .map(child=>({tag:child.tagName,class:child.className,right:child.getBoundingClientRect().right,text:child.textContent?.slice(0,60)})).slice(0,8)}));
+    expect(layout.scroll,JSON.stringify(layout)).toBeLessThanOrEqual(layout.width);
+  }
+  await page.getByRole('button',{name:'Stop',exact:true}).click();
+  expect(operations).toEqual(['mission','stop']);
 });
 
 test('standardized benchmark shows task denominators blocked cases and criteria without scenario pass claims', async ({page}) => {
@@ -179,6 +208,10 @@ test('home mapping controls preserve map identity, show observed geometry and re
       room_observations: current.room_observations?.map(observation => ({ ...observation, review_status: 'operator_confirmed' })) };
     return route.fulfill({ json: current });
   });
+  await page.route('**/api/stop', route => {
+    current = {...current, task:current.task ? {...current.task,status:'cancelled',reason:'Cancelled by operator'} : null};
+    return route.fulfill({json:{stopped:true}});
+  });
   await page.goto('/');
   const panel = page.locator('.home-mapping');
   await panel.locator('summary').click();
@@ -241,7 +274,7 @@ test('home mapping controls preserve map identity, show observed geometry and re
     expect(colors).toBeGreaterThan(5);
     await panel.screenshot({ path: `.runtime/home-mapping-${width}.png` });
   }
-  await panel.getByRole('button', { name: 'Cancel home task', exact: true }).click();
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect(panel.locator('.home-task-status')).toContainText('cancelled');
   expect(operations.find(operation => operation.action === 'navigate_to')?.place_id).toBe('place-1');
   expect(operations.filter(operation => operation.action === 'start_mapping')).toHaveLength(1);

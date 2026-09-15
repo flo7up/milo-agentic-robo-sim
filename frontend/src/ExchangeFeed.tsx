@@ -8,7 +8,7 @@ const channels = {
   response: { icon: Bot, from: 'LLM', to: 'Controller' },
   tool: { icon: Wrench, from: 'Controller', to: 'Robot' },
   result: { icon: CheckCheck, from: 'Robot', to: 'Controller' },
-  policy: { icon: Bot, from: 'SmolVLA', to: 'Task manager' },
+  policy: { icon: Bot, from: 'Controller', to: 'Mission' },
 };
 const filters = ['All', 'Inputs', 'LLM', 'Tools', 'Policy', 'Session'] as const;
 
@@ -59,16 +59,17 @@ function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
           {Object.entries(observation.grippers).map(([side, sensor]) => <div key={side}><dt>{side} gripper</dt><dd>{(sensor.aperture_m * 1000).toFixed(0)} mm / {sensor.load_n.toFixed(2)} N</dd></div>)}
         </dl>
       </div>
-      {!!entry.image_urls && entry.image_urls.length > 1 && <div className="exchange-camera-batch" aria-label="Historical camera frames">
+      {!!entry.image_urls && entry.image_urls.length > 1 && <div className="exchange-camera-batch" aria-label="Additional model input images">
         {entry.image_urls.slice(1).map((url, index) => {
+          const map = entry.payload.image_roles?.[index + 1] === 'observed_map';
           const frame = entry.payload.camera_frames?.[index + 1];
           const historyCount = entry.payload.camera_history?.frames.length ?? 0;
           const sheet = historyCount > 0 && index === 0;
           const original = index === (historyCount > 0 ? 1 : 0) ? entry.payload.historical_original : null;
-          const label = sheet ? `Motion history / ${historyCount} views` : original ? `Historical original ${original.frame_id}` : `Historical input camera, frame ${frame?.seq ?? index + 1}`;
+          const label = map ? 'Observed map supplied to Luna' : sheet ? `Motion history / ${historyCount} views` : original ? `Historical original ${original.frame_id}` : `Historical input camera, frame ${frame?.seq ?? index + 1}`;
           return <figure key={url}><a href={url} target="_blank" rel="noreferrer" title={`Open ${label}`}>
-            <img src={url} alt={label} width={128} height={sheet ? 128 : 96} style={sheet ? {aspectRatio:'1'} : undefined} loading="lazy" />
-          </a><figcaption>{sheet ? label : original ? `Original / ${original.simulated_time_s.toFixed(2)} s` : `Frame ${frame?.seq ?? index + 1} / ${frame?.simulated_time_s.toFixed(2) ?? '-'} s`}</figcaption></figure>;
+            <img src={url} alt={label} width={map ? 256 : 128} height={map ? 276 : sheet ? 128 : 96} style={map ? {aspectRatio:'512/552'} : sheet ? {aspectRatio:'1'} : undefined} loading="lazy" />
+          </a><figcaption>{map || sheet ? label : original ? `Original / ${original.simulated_time_s.toFixed(2)} s` : `Frame ${frame?.seq ?? index + 1} / ${frame?.simulated_time_s.toFixed(2) ?? '-'} s`}</figcaption></figure>;
         })}
       </div>}
       <div className="exchange-meta"><span>{entry.payload.context_mode === 'realtime_conversation' ? 'Realtime conversation' : `Replayed turns: ${entry.payload.history_turns.join(', ') || 'None'}`}</span><span>{entry.payload.images_in_request} image(s) in request</span></div>

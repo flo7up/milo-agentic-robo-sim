@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, CircleStop, Crosshair, FolderOpen, Map, MapPin, Navigation, Plus, RotateCcw, RotateCw, Save, Scan, Search } from 'lucide-react';
+import { Check, Crosshair, FolderOpen, Map, MapPin, Navigation, Plus, RotateCcw, RotateCw, Save, Scan, Search } from 'lucide-react';
 
 type Place = { place_id: string; name: string; kind: string; pose_m_rad: number[]; reachable: boolean; identity_status?: string };
 export type HomeState = {
@@ -170,7 +170,6 @@ export function HomeMapping({ runId, epoch, connected, busy, stopped, request }:
     <div className="home-map-toolbar">
       <strong>{state?.name ?? 'No saved map loaded'}</strong>
       <span role="status">{pending ? 'Working...' : stopped ? 'Stopped' : state?.stage.replaceAll('_', ' ') ?? 'Loading'}</span>
-      <button className="danger" title="Cancel home task" aria-label="Cancel home task" disabled={!connected} onClick={() => void act('cancel_task')}><CircleStop size={16} /></button>
     </div>
     {error && <p role="alert">{error}</p>}
     {state?.error && <p role="alert">{state.error}</p>}

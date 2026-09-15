@@ -335,6 +335,7 @@ class ContinuousNavigation:
         self.maximum_update_gap_s = 0.
         self.started = clock()
         self.distance_m = float(np.linalg.norm(self.path[-1] - self.path[0]))
+        self.arrival_m = CONTINUOUS_ARRIVAL_M
         self.minimum_cruise_speed = CONTINUOUS_SPEED_MPS
         self.buffer_stops = 0
         self.replans = 0
@@ -428,7 +429,7 @@ class ContinuousNavigation:
             self.finish(sim, runtime, "blocked", "NO_PROGRESS: No clearance-valid motion toward this path; inspect another route")
             return
         self.distance_m = float(np.linalg.norm(self.path[-1] - pose[:2]))
-        if self.distance_m < CONTINUOUS_ARRIVAL_M and (not self.ai_route or self.index >= len(self.path) - 2):
+        if self.distance_m < self.arrival_m and (not self.ai_route or self.index >= len(self.path) - 2):
             self.finish(sim, runtime, "arrived", "Reached selected floor point")
             return
         while self.index < len(self.path) - 1:

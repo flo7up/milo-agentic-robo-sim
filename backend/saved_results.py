@@ -152,7 +152,7 @@ def benchmark_comparability(manifest, trials):
             reasons.append("Missing " + field.replace("_sha256", "").replace("_", " ") + " fingerprint")
     if manifest.get("suite_sha256") != fingerprint(suite):
         reasons.append("Suite fingerprint does not match its definition")
-    design = manifest.get("design") or {}
+    design = manifest.get("design") if isinstance(manifest.get("design"), dict) else {}
     if not design.get("source_sha256") or not design.get("runtime"):
         reasons.append("Source or runtime provenance missing")
     if not manifest.get("finished_at"):
@@ -166,13 +166,15 @@ def benchmark_comparability(manifest, trials):
     if manifest.get("evidence") not in {"scripted_test", "real_model", "scripted_reference"}:
         reasons.append("Evidence is not a controlled test series")
     cases = manifest.get("cases", [])
+    if not isinstance(cases, list) or not all(isinstance(case, dict) for case in cases) or not all(isinstance(task, dict) for task in suite["tasks"]):
+        return {"eligible": False, "reasons": ["Malformed benchmark definition"], "cohort_id": "", "experiment_id": "", "baseline_experiment_id": ""}
     task_ids = [task.get("id") for task in suite["tasks"]]
     repeats = len(suite.get("start_offsets_m", [])) or suite.get("repetitions", 0)
     if (not repeats or len(cases) != repeats * len(task_ids)
             or len({case.get("case_id") for case in cases}) != len(cases)
             or any(sum(case.get("task_id") == task_id for case in cases) != repeats for task_id in task_ids)):
         reasons.append("Planned cases do not match the full suite")
-    for trial in trials:
+    for index, trial in enumerate(trials):
         result = trial.get("benchmark") or {}
         if result.get("status") not in {"passed", "failed", "blocked"}:
             reasons.append("Missing, invalid or unfinished outcomes")
@@ -180,14 +182,17 @@ def benchmark_comparability(manifest, trials):
             reasons.append("Incomplete or assisted trial evidence")
         if result.get("suite_id") != suite.get("suite_id"):
             reasons.append("Trial belongs to a different suite")
+        if index >= len(cases) or result.get("task_id") != cases[index].get("task_id"):
+            reasons.append("Trial task does not match the planned case")
     settings = {field: manifest.get(field) for field in ("mode", "evidence", "reasoning", "supervisor_deployment",
         "images_per_request", "context_tokens", "feedback_interval_s", "session_timeout_s", "camera_history",
         "continuous_handoff", "skill_composer", "exploration")}
     if manifest.get("evidence") == "real_model" and not isinstance(manifest.get("model_variant"), dict):
         reasons.append("Model configuration provenance missing")
     inputs = {field: manifest.get(field) for field in ("suite_sha256", "derived_map_sha256", "fixture_sha256")}
+    model = manifest.get("model_variant") if isinstance(manifest.get("model_variant"), dict) else {}
     inputs.update(settings=settings, runtime=design.get("runtime"),
-        model_configuration=(manifest.get("model_variant") or {}).get("configuration"),
+        model_configuration=model.get("configuration"),
         cases=[{key: case.get(key) for key in ("case_id", "task_id", "challenge_sha256", "budget_s", "start_offset_m")} for case in cases])
     return {"eligible": not reasons, "reasons": list(dict.fromkeys(reasons)),
         "cohort_id": fingerprint(inputs), "experiment_id": text(manifest.get("experiment_id"), ""),
@@ -254,6 +259,8 @@ def saved_results(root=None):
                     "tasks": task_rows}
             batches.append({"id": identifier, "name": directory.relative_to(root).as_posix(),
                 "benchmark": benchmark_summary,
+                "home_map": {key: (manifest.get("home_map") or {}).get(key) for key in ("mode", "map_id", "name", "revision", "sha256", "localization")}
+                    if isinstance(manifest.get("home_map"), dict) else None,
                 "session_id": text(manifest.get("session_id"), ""), "running": any(trial["running"] for trial in trials),
                 **normalized_variant(manifest),
                 "date": text(manifest.get("started_at"), datetime.fromtimestamp(modified, timezone.utc).isoformat()),

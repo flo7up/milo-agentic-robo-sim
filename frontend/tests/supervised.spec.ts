@@ -19,7 +19,13 @@ async function pixels(page: Page) {
   });
 }
 
-test.beforeEach(async ({ request }) => {
+test.beforeEach(async ({ request, page }) => {
+  await page.addInitScript(() => {
+    const address = new URL(location.href);
+    address.searchParams.set('diagnostics', 'legacy');
+    history.replaceState(null, '', address);
+  });
+  expect((await request.post('/api/test/preferences/reset')).ok()).toBe(true);
   const state = await (await request.post('/api/challenges/load', { data: { challenge_id: 'bench' } })).json();
   const spatial = await request.post('/api/spatial', {data: {run_id: state.run_id, episode_epoch: state.episode_epoch, enabled: false}});
   expect(spatial.ok()).toBe(true);
@@ -27,6 +33,125 @@ test.beforeEach(async ({ request }) => {
     { id: 'luna', label: 'Luna', deployment: '', reasoning_efforts: ['low', 'medium', 'high'] },
   ] } });
   await request.post('/api/local-navigation/unload');
+});
+
+test('workspace preferences restore settings and challenge drafts without motion on reload', async ({page, request}) => {
+  await request.post('/api/agent/config', {data: {endpoint: 'https://test.openai.azure.com', models: [
+    {id: 'luna', label: 'Scripted Luna', deployment: 'test', reasoning_efforts: ['low', 'medium', 'high']}]}});
+  const initial: LiveState = await (await request.get('/api/state')).json();
+  const commands: string[] = [];
+  page.on('request', message => {if (message.method() === 'POST' && !message.url().endsWith('/api/preferences')) commands.push(message.url());});
+  await page.goto('/');
+  await page.locator('.run-options > summary').click();
+  await page.getByRole('combobox', {name: 'Supervisor reasoning', exact: true}).selectOption('medium');
+  await page.getByRole('spinbutton', {name: 'Supervisor turn limit', exact: true}).fill('17');
+  await page.getByRole('combobox', {name: 'Navigation controller', exact: true}).selectOption('luna_navigation');
+  await page.getByRole('spinbutton', {name: 'Feedback interval (s)', exact: true}).fill('1.25');
+  await page.getByRole('textbox', {name: 'Robot goal', exact: true}).fill('My saved bench goal.');
+  await page.getByRole('checkbox', {name: 'Axes', exact: true}).check();
+  await page.locator('.manual-disclosure > summary').click();
+  await page.getByRole('tab', {name: 'Head', exact: true}).click();
+  await page.getByRole('slider', {name: 'Head pitch', exact: true}).fill('0.44');
+  await openChallengeMenu(page);
+  await page.getByRole('combobox', {name: 'Predefined challenge', exact: true}).selectOption('furniture_circuit');
+  await page.getByRole('combobox', {name: 'Object to circle', exact: true}).selectOption('sofa');
+  await page.getByRole('combobox', {name: 'Circuit direction', exact: true}).selectOption('counterclockwise');
+  await page.getByRole('combobox', {name: 'Map source', exact: true}).selectOption('none');
+  await page.locator('.challenge-details > summary').click();
+  await page.getByRole('button', {name: 'Close challenge menu', exact: true}).click();
+  await expect.poll(async () => (await (await request.get('/api/preferences')).json()).preferences).toMatchObject({
+    turns: 17, reasoning: 'medium', navigation_mode: 'luna_navigation', interval: 1.25, run_settings_open: true,
+    manual_open: true, manual_tab: 'head', head_pitch: .44, axes: true, challenge_details_open: true,
+    goals: {'standalone:bench::': 'My saved bench goal.'},
+    challenge_selection: {challenge_id: 'furniture_circuit', orbit_target: 'sofa', orbit_direction: 'counterclockwise', reuse_saved_map: false}});
+  await page.reload();
+  await expect(page.locator('.run-options')).toHaveJSProperty('open', true);
+  await expect(page.getByRole('spinbutton', {name: 'Supervisor turn limit', exact: true})).toHaveValue('17');
+  await expect(page.getByRole('combobox', {name: 'Supervisor reasoning', exact: true})).toHaveValue('medium');
+  await expect(page.getByRole('spinbutton', {name: 'Feedback interval (s)', exact: true})).toHaveValue('1.25');
+  await expect(page.getByRole('textbox', {name: 'Robot goal', exact: true})).toHaveValue('My saved bench goal.');
+  await expect(page.getByRole('tab', {name: 'Head', exact: true})).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('slider', {name: 'Head pitch', exact: true})).toHaveValue('0.44');
+  await expect(page.getByRole('checkbox', {name: 'Axes', exact: true})).toBeChecked();
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({width, height: 1000});
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.locator('.run-options').screenshot({path: `../.runtime/preferences-v1-review/settings-${width}.png`});
+  }
+  await openChallengeMenu(page);
+  await expect(page.getByRole('combobox', {name: 'Object to circle', exact: true})).toHaveValue('sofa');
+  await expect(page.getByRole('combobox', {name: 'Circuit direction', exact: true})).toHaveValue('counterclockwise');
+  await expect(page.locator('.challenge-details')).toHaveJSProperty('open', true);
+  const after: LiveState = await (await request.get('/api/state')).json();
+  expect(after.run_id).toBe(initial.run_id);
+  expect(after.snapshot).toEqual(initial.snapshot);
+  expect(after.agent.active).toBe(false);
+  expect(commands).toEqual([]);
+});
+
+test('workspace preferences come from the server in a fresh browser context', async ({page, request, browser}) => {
+  await page.goto('/');
+  await page.getByRole('textbox', {name: 'Robot goal', exact: true}).fill('Remember the practice bench.');
+  await request.post('/api/preferences', {data:{exploration_budget:73}});
+  await expect.poll(async () => (await (await request.get('/api/preferences')).json()).preferences.exploration_budget).toBe(73);
+  const context = await browser.newContext();
+  try {
+    const fresh = await context.newPage();
+    const commands: string[] = [];
+    fresh.on('request', message => {if (message.method() === 'POST' && !message.url().endsWith('/api/preferences')) commands.push(message.url());});
+    await fresh.goto('http://127.0.0.1:8001/');
+    await fresh.locator('.run-options > summary').click();
+    await expect(fresh.getByRole('spinbutton', {name: 'Mission budget', exact: true})).toHaveValue('73');
+    await expect(fresh.getByRole('textbox', {name: 'Robot goal', exact: true})).toHaveValue('Remember the practice bench.');
+    expect(commands).toEqual([]);
+    expect((await (await request.get('/api/state')).json()).agent.active).toBe(false);
+  } finally { await context.close(); }
+});
+
+test('workspace preferences retain the selected inspector tab and never apply a saved connection', async ({page, request}) => {
+  await page.routeWebSocket('**/api/live', socket => {
+    const server = socket.connectToServer();
+    server.onMessage(message => {
+      const state: LiveState = JSON.parse(String(message));
+      state.agent.session_id = 'scripted-inspector-preferences';
+      state.agent.phase = 'completed';
+      state.agent.active = false;
+      socket.send(JSON.stringify(state));
+    });
+  });
+  const commands: string[] = [];
+  page.on('request', message => {if (message.method() === 'POST' && !message.url().endsWith('/api/preferences')) commands.push(message.url());});
+  await page.goto('/');
+  await page.getByRole('tab', {name: 'Settings', exact: true}).click();
+  await page.getByRole('textbox', {name: 'Foundry endpoint', exact: true}).fill('https://saved.example.com');
+  await page.getByRole('textbox', {name: 'Luna deployment', exact: true}).fill('saved-deployment');
+  await expect.poll(async () => (await (await request.get('/api/preferences')).json()).preferences.luna_deployment).toBe('saved-deployment');
+  await page.reload();
+  await expect(page.getByRole('tab', {name: 'Settings', exact: true})).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('textbox', {name: 'Foundry endpoint', exact: true})).toHaveValue('https://saved.example.com');
+  await expect(page.getByRole('button', {name: 'Start LLM control', exact: true})).toBeDisabled();
+  await expect(page.getByText('Connection changes not applied', {exact: true})).toBeVisible();
+  expect((await (await request.get('/api/agent')).json()).configuration.endpoint).toBe('');
+  expect(commands).toEqual([]);
+});
+
+test('workspace preferences expose save failures and retry without losing edits', async ({page, request}) => {
+  await request.post('/api/preferences', {data:{goals:{'standalone:bench::':'Older saved goal.'}}});
+  await page.addInitScript(() => localStorage.setItem('milo-workspace-preferences-v1', '{invalid'));
+  let unavailable = true;
+  await page.route('**/api/preferences', route => route.request().method() === 'POST' && unavailable
+    ? route.fulfill({status:503,json:{detail:'Preference store unavailable'}}) : route.continue());
+  await page.goto('/');
+  await page.getByRole('textbox', {name: 'Robot goal', exact: true}).fill('Retain this edit.');
+  await expect(page.getByRole('alert').filter({hasText:'Preferences are not saved'})).toBeVisible();
+  await expect(page.getByRole('textbox', {name: 'Robot goal', exact: true})).toHaveValue('Retain this edit.');
+  await page.reload();
+  await expect(page.getByRole('textbox', {name: 'Robot goal', exact: true})).toHaveValue('Retain this edit.');
+  await expect(page.getByRole('alert').filter({hasText:'Preferences are not saved'})).toBeVisible();
+  unavailable = false;
+  await page.getByRole('button', {name: 'Retry saving preferences', exact: true}).click();
+  await expect(page.getByRole('alert').filter({hasText:'Preferences are not saved'})).toHaveCount(0);
+  await expect.poll(async () => (await (await request.get('/api/preferences')).json()).preferences.goals['standalone:bench::']).toBe('Retain this edit.');
 });
 
 test('challenge menu closes after loading and preserves selection when reopened', async ({page, request}) => {
@@ -56,7 +181,7 @@ test('challenge menu closes after loading and preserves selection when reopened'
     expect((await launcher.boundingBox())!.height).toBeLessThan(60);
     await launcher.click();
     await expect(menu.getByRole('combobox',{name:'Predefined challenge',exact:true})).toHaveValue('park');
-    await expect(menu.getByRole('button',{name:'Stop robot',exact:true})).toBeInViewport();
+    await expect(menu.getByRole('button',{name:'Stop',exact:true})).toBeInViewport();
     const layout=await menu.evaluate(element=>({width:element.getBoundingClientRect().width,
       fits:element.scrollWidth<=element.clientWidth,viewport:innerWidth}));
     expect(layout.width).toBeLessThan(layout.viewport);
@@ -664,7 +789,7 @@ test('continuous local navigation tracks a camera destination without model call
   await expect(page.getByLabel('Continuous navigation status')).toHaveAttribute('data-status','running');
   await expect(page.getByRole('button',{name:'Start LLM control',exact:true})).toBeHidden();
   await expect(page.getByRole('button',{name:'Drive forward',exact:true})).toBeHidden();
-  await expect(page.getByRole('button',{name:'Stop local navigation',exact:true})).toBeVisible();
+  await expect(page.getByRole('button',{name:'Stop',exact:true})).toBeVisible();
   const during: LiveState = await (await request.get('/api/state')).json();
   const initialFrame = during.camera.seq;
   await expect.poll(async()=>((await (await request.get('/api/state')).json()) as LiveState).camera.seq).toBeGreaterThan(initialFrame);
@@ -843,6 +968,7 @@ test('furniture circuits expose object commands and retain selection on reset', 
     await expect(page.getByAltText('Authoritative robot head camera')).toHaveJSProperty('naturalWidth',640);
     await page.locator('.spectator-shell').screenshot({path:`test-results/furniture-circuit-${width}.png`});
   }
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button',{name:'Reset episode',exact:true}).click();
   await expect.poll(async () => (await (await request.get('/api/state')).json()).run_id).not.toBe(state.run_id);
   await openChallengeMenu(page);
@@ -953,7 +1079,6 @@ test('five-room kitchen search defaults to moving plans and Stop cancels prepara
   await request.post('/api/challenges/load', {data:{challenge_id:'flat_kitchen'}});
   await request.post('/api/agent/config', {data:{endpoint:'https://test.openai.azure.com',models:[
     {id:'luna',label:'Luna',deployment:'scripted-supervisor',reasoning_efforts:['low','medium','high']}]}});
-  await page.addInitScript(() => localStorage.setItem('milo-navigation-mode','luna_navigation'));
   await page.goto('/?graphics=enhanced');
   await expect(page.getByRole('heading',{name:'Find the Kitchen',exact:true})).toBeVisible();
   await page.locator('.run-options > summary').click();
@@ -986,9 +1111,10 @@ test('five-room kitchen search defaults to moving plans and Stop cancels prepara
   expect(stopped.stopped).toBe(true);
   expect(stopped.snapshot.simulated_time_s).toBe(latched.snapshot.simulated_time_s);
   expect(stopped.local_navigation_model?.phase).toBe('unloaded');
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button',{name:'Reset episode',exact:true}).click();
   await expect(page.getByRole('heading',{name:'Find the Kitchen',exact:true})).toBeVisible();
-  await page.locator('.run-options > summary').click();
+  await expect(page.locator('.run-options')).toHaveJSProperty('open', true);
   await expect(handoff).toBeChecked();
 });
 
@@ -1085,6 +1211,7 @@ for (const mode of ['luna_continuous', 'luna_navigation']) {
       expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
       await page.getByRole('region',{name:'Run chat',exact:true}).screenshot({path:`test-results/run-chat-${mode}-${width}.png`});
     }
+    if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
     await page.getByRole('button',{name:'Reset episode',exact:true}).click();
     await expect(page.getByRole('tab', {name:'Conversation',exact:true})).toHaveCount(0);
     await expect(page.locator('.chat-transcript article')).toHaveCount(0);
@@ -1141,7 +1268,9 @@ test('Luna supervises local motion in the selected scene and Stop retains loaded
     await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
     await expect.poll(async () => ((await (await request.get('/api/state')).json()) as LiveState).challenge?.id).toBe(challenge);
     const before: LiveState = await (await request.get('/api/state')).json();
-    await page.locator('.run-options > summary').click();
+    if (!await page.locator('.run-options').evaluate((element: HTMLDetailsElement) => element.open)) {
+      await page.locator('.run-options > summary').click();
+    }
     await page.getByRole('combobox', {name:'Navigation controller',exact:true}).selectOption('luna_navigation');
     const started = page.waitForResponse(response => response.url().endsWith('/api/agent/start') && response.request().method() === 'POST');
     await page.getByRole('button', { name: 'Start LLM control', exact: true }).click();
@@ -1338,7 +1467,8 @@ test('setup comes first and controls follow the run lifecycle', async ({page, re
 test('manual controls and challenge reset remain usable without Luna', async ({ page, request }) => {
   await page.goto('/');
   await page.getByRole('link',{name:'Controls',exact:true}).click();
-  await page.getByRole('button', { name: 'Resume manual control', exact: true }).isDisabled();
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
+  await page.getByRole('button', { name: 'Enable manual control', exact: true }).isDisabled();
   const before: LiveState = await (await request.get('/api/state')).json();
   const done = page.waitForResponse(response => response.url().endsWith('/api/command') && response.request().postDataJSON()?.tool === 'drive_base');
   await page.getByRole('button', { name: 'Drive backward', exact: true }).click();
@@ -1346,6 +1476,7 @@ test('manual controls and challenge reset remain usable without Luna', async ({ 
   await expect(page.locator('.event-list')).toContainText('drive_base');
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Drive backward', exact: true })).toBeDisabled();
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
   await expect.poll(async () => ((await (await request.get('/api/state')).json()) as LiveState).run_id).not.toBe(before.run_id);
   await expect(page.getByRole('button', { name: 'Drive backward', exact: true })).toBeEnabled();

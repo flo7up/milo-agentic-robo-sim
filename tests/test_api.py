@@ -17,6 +17,69 @@ def isolate_foundry_environment(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.mark.parametrize("challenge_id", ["bench", "park"])
+def test_workspace_preferences_restore_scene_stopped_without_commands(challenge_id):
+    from backend.preferences import PreferenceStore
+    with TestClient(app) as client:
+        before = client.get("/api/state").json()
+        response = client.post("/api/preferences", json={"turns": 21, "inspector": "settings", "handoff": False,
+            "challenge_selection": {"challenge_id": "tidy"}})
+        assert response.status_code == 200
+        assert client.get("/api/preferences").headers["cache-control"] == "no-store"
+        after = client.get("/api/state").json()
+        assert after["run_id"] == before["run_id"] and after["snapshot"] == before["snapshot"]
+        assert not after["agent"]["active"]
+        assert client.post("/api/preferences", json={"active": True}).status_code == 422
+        assert client.post("/api/preferences", json={"turns": 20}, headers={"Origin": "https://untrusted.example"}).status_code == 403
+        loaded = client.post("/api/challenges/load", json={"challenge_id": challenge_id, "reuse_saved_map": False})
+        assert loaded.status_code == 200
+        assert PreferenceStore().read()["scene"]["challenge_id"] == challenge_id
+    with TestClient(app) as client:
+        restored = client.get("/api/state").json()
+        assert (restored["challenge"]["id"] if restored["challenge"] else "bench") == challenge_id
+        assert restored["stopped"]
+        assert restored["snapshot"]["simulated_time_s"] == 0
+        assert not restored["agent"]["active"] and not restored["agent"]["auto_wake"] and not restored["busy"]
+        assert restored["map_setup"]["reuse_saved_map"] is False
+        preferences = client.get("/api/preferences").json()["preferences"]
+        assert preferences["turns"] == 21 and preferences["inspector"] == "settings"
+        assert preferences["challenge_selection"]["challenge_id"] == "tidy"
+
+
+def test_robot_power_preserves_scene_blocks_work_and_resumes_only_to_idle():
+    with TestClient(app) as client:
+        initial = client.get("/api/state").json()
+        identity = {"run_id": initial["run_id"], "episode_epoch": initial["episode_epoch"]}
+        off = client.post("/api/power", json={**identity, "on": False})
+        assert off.status_code == 200
+        assert off.json()["power"]["mode"] == "off" and off.json()["stopped"]
+        assert client.post("/api/resume").status_code == 409
+        assert client.post("/api/spatial", json={**identity, "enabled": True}).status_code == 409
+        assert client.post("/api/agent/start", json={**identity, "goal": "No work while off"}).status_code == 409
+        assert client.post("/api/power", json={**identity, "run_id": "old", "on": True}).status_code == 409
+        assert client.post("/api/power", json={**identity, "on": True}, headers={"Origin": "https://untrusted.example"}).status_code == 403
+        on = client.post("/api/power", json={**identity, "on": True}).json()
+        assert on["power"]["mode"] == "idle" and not on["agent"]["active"]
+        assert on["run_id"] == initial["run_id"] and on["snapshot"] == initial["snapshot"]
+        assert not on["agent"]["auto_wake"]
+        assert client.post("/api/power", json={**identity, "on": False}).status_code == 200
+        reset = client.post("/api/reset").json()
+        assert reset["power"]["mode"] == "off" and reset["stopped"]
+        assert client.post("/api/power", json={**identity, "on": True}).status_code == 409
+        assert client.post("/api/power", json={"run_id":reset["run_id"], "episode_epoch":reset["episode_epoch"], "on":True}).json()["power"]["mode"] == "idle"
+
+
+def test_corrupt_preferences_do_not_replace_store_or_prevent_startup(tmp_path):
+    path = tmp_path / "preferences.sqlite3"
+    path.write_bytes(b"retained invalid preferences")
+    with TestClient(app) as client:
+        state = client.get("/api/state").json()
+        assert state["challenge"] is None and state["preference_error"]
+        assert client.get("/api/preferences").status_code == 503
+        assert client.post("/api/preferences", json={"turns": 12}).status_code == 503
+        assert path.read_bytes() == b"retained invalid preferences"
+
+
 @pytest.mark.parametrize("ending", ["stop", "agent/takeover", "reset", "disconnect"])
 def test_browser_session_recording_survives_api_lifecycle(tmp_path, monkeypatch, ending):
     import time
@@ -963,7 +1026,7 @@ def test_agent_configuration_and_manual_ownership(monkeypatch):
 
 
 @pytest.mark.parametrize("action", ["stop", "agent/takeover", "agent/mode", "reset", "disconnect"])
-def test_operator_lifecycle_invalidates_idle_camera_wake(action):
+def test_operator_lifecycle_preserves_zero_inference_idle(action):
     from tests.test_agent import ScriptedModel, text_response
     with TestClient(app) as client:
         initial = client.get("/api/state").json()
@@ -976,12 +1039,12 @@ def test_operator_lifecycle_invalidates_idle_camera_wake(action):
             socket.receive_json()
             client.post("/api/agent/chat", json={"run_id": initial["run_id"], "episode_epoch": initial["episode_epoch"],
                 "goal": "Inspect the room", "message": "What do you see?"})
-            for _ in range(100):
-                if socket.receive_json()["agent"]["phase"] == "sleeping":
+            for _ in range(20):
+                if not socket.receive_json()["agent"]["active"]:
                     break
             else:
                 pytest.fail("Agent did not enter idle")
-            assert controller.state["auto_wake"]
+            assert not controller.state["auto_wake"] and controller.idle_task is None
             if action != "disconnect":
                 body = {"run_id": initial["run_id"], "episode_epoch": initial["episode_epoch"], "mode": "voice"} if action == "agent/mode" else {}
                 assert client.post(f"/api/{action}", json=body).status_code == 200

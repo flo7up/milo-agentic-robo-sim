@@ -81,6 +81,7 @@ class HomeMission:
         self.room_evidence_after = time.monotonic()
         self.room_report_deadline = 0.
         self.allow_expansion = True
+        self.mission_owner = None
 
     @property
     def active(self):
@@ -122,10 +123,11 @@ class HomeMission:
 
     def _sample(self, force=False):
         from backend.ros_navigation import capture_laser
-        if self.home is None:
+        if self.home is None or not self.worker.powered:
             return
         now = time.monotonic()
-        if not force and now - self.sampled_at < .2:
+        interval = self.worker.idle_sensor_interval_s if self.worker.power_state()["mode"] == "idle" else .2
+        if not force and now - self.sampled_at < interval:
             return
         sim = self.worker.sim
         if self.stop_revision != self.worker.stop_revision or self.task_revision != self.worker.task_revision or sim.cancel.is_set():
@@ -164,7 +166,7 @@ class HomeMission:
             if now - timestamp <= 2. and cell[1] * self.home.size + cell[0] not in clear_codes}
         for column, row in self.home.indices(endpoints[hits]):
             self.live[(int(column), int(row))] = now
-        mapped = self.stage == "mapping" or (self.active and self.task["kind"] == "explore")
+        mapped = self.stage == "mapping" or (self.active and self.task["kind"] == "explore") or bool(self.mission_owner and self.allow_expansion)
         moved = self.last_mapped_pose is None or math.dist(self.pose[:2], self.last_mapped_pose[:2]) > .08 or abs(self.pose[2] - self.last_mapped_pose[2]) > .08
         if mapped and (force or moved):
             self.home.observe(laser, self.pose, time.time())
@@ -191,7 +193,7 @@ class HomeMission:
         if sensor.sequence != self.last_depth_sequence and 0 <= now - sensor.captured_at <= 1.:
             _, points = point_cloud(sensor, stride=4)
             points = points[(points[:, 2] > .04) & (points[:, 2] < 1.3)]
-            mapped = self.stage == "mapping" or (self.active and self.task["kind"] == "explore")
+            mapped = self.stage == "mapping" or (self.active and self.task["kind"] == "explore") or bool(self.mission_owner and self.allow_expansion)
             cosine, sine = math.cos(self.transform[2]), math.sin(self.transform[2])
             positions = np.column_stack((cosine * points[:, 0] - sine * points[:, 1] + self.transform[0],
                 sine * points[:, 0] + cosine * points[:, 1] + self.transform[1]))
@@ -412,7 +414,7 @@ class HomeMission:
             self.store.remember_object(record, paired[1])
             self.object_records = self.store.object_observations(self.home.identity)
         elif request.action in {"navigate_to", "guided_to", "explore", "explore_frontier"}:
-            if not self.home.revision and request.action not in {"guided_to", "explore"}:
+            if not self.home.revision and request.action not in {"guided_to", "explore"} and not self.mission_owner:
                 raise ValueError("SAVE_REQUIRED: review and save the initial map before autonomous tasks")
             if not worker.spatial_enabled or worker.spatial_map is None:
                 raise ValueError("SPATIAL_REQUIRED: enable spatial sensing before mapped navigation")
@@ -468,6 +470,8 @@ class HomeMission:
                 "deadline": time.monotonic() + request.time_budget, "retries": 0, "segments": 0,
                 "frontier_id": chosen_frontier["frontier_id"] if chosen_frontier else None,
                 "single_frontier": chosen_frontier is not None, "visited_frontiers": 0, "completion_verified": False}
+            if self.mission_owner:
+                self.task.update(mission_id=self.mission_owner, local_exploration=True)
             self.stage = "mapping" if request.action == "guided_to" else "navigation" if request.action == "navigate_to" else "expansion"
             self.recheck_at = 0.
         return self.state()
@@ -552,11 +556,13 @@ class HomeMission:
                 return
             if worker.continuous and getattr(worker.continuous, "home_owned", False):
                 if worker.continuous.status != "arrived":
+                    self.record_route_failure("controller", worker.continuous.reason)
                     if worker.continuous.reason.startswith(("SPATIAL_STALE:", "CANCELLED")):
                         raise ValueError(worker.continuous.reason)
                     task["retries"] += 1
                     if task["retries"] > 2:
-                        raise ValueError("BLOCKED: bounded route retries exhausted")
+                        raise ValueError("BLOCKED: bounded route retries exhausted; last route: " + worker.continuous.reason)
+                    task["reason"] = "Replanning after " + worker.continuous.reason
                 worker.continuous = None
             if task["target_m"] is not None and math.dist(self.pose[:2], task["target_m"]) <= .15:
                 sim.hold_current()
@@ -618,13 +624,14 @@ class HomeMission:
             try:
                 self.route = self.home.route(self.pose[:2], task["target_m"], radius, self.obstacles())
             except ValueError as error:
+                self.record_route_failure("map_replan", str(error))
                 self.home.route(self.pose[:2], self.pose[:2], radius, self.obstacles())
                 if task["kind"] != "explore" or task.get("single_frontier") or task["retries"] >= 2:
                     raise
                 self.home.mark_frontier(task["frontier_id"])
                 task["target_m"] = None
                 task["retries"] += 1
-                task["reason"] = "Frontier blocked by fresh observations; selecting another reachable boundary"
+                task["reason"] = "Selecting another frontier after map rejection: " + str(error)
                 self.recheck_at = time.monotonic() + .2
                 return
             allowed = self.home.allowed(radius, self.obstacles())
@@ -653,6 +660,13 @@ class HomeMission:
             self.error = f"MAPPING_EXECUTION_FAILED: {type(error).__name__}: {error}"
             self.fail(self.error)
             sim.stop()
+
+    def record_route_failure(self, phase, reason):
+        failures = self.task.setdefault("route_failures", [])
+        failures.append({"phase": phase, "reason": reason, "segment": self.task.get("segments", 0),
+            "frontier_id": self.task.get("frontier_id"),
+            "elapsed_s": round(time.monotonic() - self.task.get("started_at", time.monotonic()), 3)})
+        del failures[:-4]
 
     def continue_local_exploration(self):
         worker, task = self.worker, self.task

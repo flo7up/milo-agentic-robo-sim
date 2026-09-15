@@ -1,68 +1,88 @@
 import { useEffect, useState } from 'react';
-import { Bot, Check, CircleStop, Compass, Hand, Play, Power, Settings2, Timer, Send, MessageSquare, History, Radio } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { Bot, Check, Play, Power, Settings2, Timer, Send, MessageSquare, History, Radio } from 'lucide-react';
 import { ExchangeFeed } from './ExchangeFeed';
 import { LocalModelProgress } from './LocalModelProgress';
+import { usePreference } from './Preferences';
 import type { LiveState, Reasoning } from './types';
 
-export function LunaNavigationControl({ state, connected, request }: {
-  state: LiveState; connected: boolean; request: (path: string, body?: unknown) => Promise<unknown>;
+function normalizedEndpoint(value: string) {
+  try {
+    const endpoint = new URL(value.trim());
+    const path = endpoint.pathname.replace(/\/+$/, '').replace(/^\/openai\/v1$/, '');
+    return `${endpoint.origin}${path}${endpoint.search}${endpoint.hash}`;
+  } catch { return value.trim(); }
+}
+
+function TokenCounter({ agent, connected }: { agent: LiveState['agent']; connected: boolean }) {
+  const counts = [
+    {label:'Total',value:agent.input_tokens + agent.output_tokens},
+    {label:'Input',value:agent.input_tokens},
+    {label:'Output',value:agent.output_tokens},
+  ];
+  return <div className="token-tracker" role="group" aria-label="Token usage"
+    title="Provider-reported tokens for this run; interrupted or unreported requests may be missing. Resets on a new run or episode.">
+    <div className="token-heading"><strong>Reported tokens</strong><span className="token-scope">{!connected ? 'Last received' : agent.active ? 'Current run' : 'Last run'}</span></div>
+    <dl className="token-counts">{counts.map(({label,value})=><div className={`token-${label.toLowerCase()}`} key={label}>
+      <dt>{label}</dt><dd className={value>=1000000 ? 'token-large' : ''}>{value.toLocaleString('en-US')}</dd>
+    </div>)}</dl>
+  </div>;
+}
+
+export function LunaNavigationControl({ state, connected, request, commandHost }: {
+  state: LiveState; connected: boolean; request: (path: string, body?: unknown) => Promise<unknown>; commandHost: HTMLElement | null;
 }) {
   const agent = state.agent;
   const kitchenSearch = state.challenge?.id === 'flat_kitchen';
-  const circleFurniture = state.challenge?.id === 'furniture_circuit';
   const luna = agent.configuration.models.find(model => model.id === 'luna' && model.provider === 'foundry');
-  const [goal, setGoal] = useState(state.challenge?.goal ?? 'Inspect the scene and navigate safely.');
-  const [interval, setInterval] = useState(.25);
-  const [turns, setTurns] = useState(80);
-  const [reasoning, setReasoning] = useState<Reasoning>(luna?.reasoning_efforts.includes('high') ? 'high' : luna?.reasoning_efforts[0] ?? 'high');
-  const [endpoint, setEndpoint] = useState(agent.configuration.endpoint);
-  const [deployment, setDeployment] = useState(luna?.deployment ?? '');
+  const goalKey = `${state.challenge?.environment ?? 'standalone'}:${state.challenge?.id ?? 'bench'}:${state.challenge?.orbit?.target ?? ''}:${state.challenge?.orbit?.direction ?? ''}`;
+  const [goals, setGoals] = usePreference('goals', {});
+  const goal = agent.active && agent.goal ? agent.goal : goals[goalKey] ?? state.challenge?.goal ?? 'Inspect the scene and navigate safely.';
+  const setGoal = (value: string) => setGoals(previous => ({...previous, [goalKey]: value}));
+  const [interval, setInterval] = usePreference('interval', .25);
+  const [turns, setTurns] = usePreference('turns', 80);
+  const [maxRequests, setMaxRequests] = usePreference('max_model_requests', 12);
+  const [maxTokens, setMaxTokens] = usePreference('max_model_tokens', 100000);
+  const [preferredReasoning, setReasoning] = usePreference('reasoning', 'high');
+  const reasoning = luna?.reasoning_efforts.includes(preferredReasoning) ? preferredReasoning : luna?.reasoning_efforts[0] ?? 'high';
+  const [endpoint, setEndpoint] = usePreference('luna_endpoint', agent.configuration.endpoint);
+  const [deployment, setDeployment] = usePreference('luna_deployment', luna?.deployment ?? '');
+  const connectionChanged = normalizedEndpoint(endpoint) !== normalizedEndpoint(agent.configuration.endpoint) || deployment !== (luna?.deployment ?? '');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
-  const [controlMode, setControlMode] = useState<'task' | 'exploration'>('task');
-  const [explorationBudget, setExplorationBudget] = useState(180);
-  const [home, setHome] = useState<{map_id: string | null; name: string | null; revision: number;
-    localization: {status: string}; expansion_allowed?: boolean; coverage: {free_m2: number} | null;
-    task: {status: string; reason: string; local_exploration?: boolean; continuations?: number; visited_frontiers: number} | null} | null>(null);
+  const [explorationBudget, setExplorationBudget] = usePreference('exploration_budget', 180);
+  const [diagnostic, setDiagnostic] = useState<'unified' | 'local' | 'legacy'>(() =>
+    new URLSearchParams(location.search).get('diagnostics') === 'legacy' ? 'legacy' : 'unified');
+  const [mapContext, setMapContext] = usePreference('mission_map_context', true);
+  const unified = diagnostic !== 'legacy';
+  const localOnly = diagnostic === 'local';
+  const [capabilities, setCapabilities] = useState<{ready: boolean; architecture?: {name:string;version:string;revision:string}}>({ready:false});
   useEffect(() => {
-    if (controlMode !== 'exploration' || !connected || pending) return;
     const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout>;
-    async function refresh() {
-      try {
-        const response = await fetch('/api/home?compact=true', {signal:controller.signal});
-        if (!response.ok) throw new Error('Local exploration state unavailable');
-        const value = await response.json();
-        if (!controller.signal.aborted) setHome(value);
-      } catch (failure) { if (!controller.signal.aborted) setError(String(failure)); }
-      finally { if (!controller.signal.aborted) timer = setTimeout(refresh, 1000); }
-    }
-    void refresh();
-    return () => { controller.abort(); clearTimeout(timer); };
-  }, [controlMode, connected, pending, state.run_id]);
+    void fetch('/api/mission/capabilities', {signal:controller.signal}).then(response => response.ok ? response.json() : null)
+      .then(value => {if (!controller.signal.aborted) setCapabilities({ready:value?.version===1 && value?.unified_mission===true, architecture:value?.architecture});})
+      .catch(() => {});
+    return () => controller.abort();
+  }, [state.run_id]);
   const [instruction, setInstruction] = useState('');
   const [sending, setSending] = useState(false);
   const [instructionError, setInstructionError] = useState('');
-  const [handoff, setHandoff] = useState(kitchenSearch);
-  const [skillComposer, setSkillComposer] = useState(false);
-  const [preferredBackend, setPreferredBackend] = useState<'nav2' | 'builtin'>(() =>
-    localStorage.getItem('milo-navigation-backend') === 'builtin' ? 'builtin' : 'nav2');
+  const [handoff, setHandoff] = usePreference('handoff', kitchenSearch);
+  const [skillComposer, setSkillComposer] = usePreference('skill_composer', false);
+  const [preferredBackend, setPreferredBackend] = usePreference('navigation_backend', 'nav2');
   const [nav2, setNav2] = useState({enabled:false, ready:false, message:'Nav2 bridge is offline'});
   const [supportsNavigationBackend, setSupportsNavigationBackend] = useState(false);
-  useEffect(() => { localStorage.setItem('milo-navigation-backend', preferredBackend); }, [preferredBackend]);
-  const [aiRoutes, setAiRoutes] = useState(() => localStorage.getItem('milo-ai-generated-routes') === 'true');
-  useEffect(() => { localStorage.setItem('milo-ai-generated-routes', String(aiRoutes)); }, [aiRoutes]);
-  const [adaptive, setAdaptive] = useState(() => localStorage.getItem('milo-adaptive-navigation') !== 'false');
-  useEffect(() => { localStorage.setItem('milo-adaptive-navigation', String(adaptive)); }, [adaptive]);
-  const [inspector, setInspector] = useState('trace');
-  const [connectionOpen, setConnectionOpen] = useState(!luna?.configured);
+  const [aiRoutes, setAiRoutes] = usePreference('ai_routes', false);
+  const [adaptive, setAdaptive] = usePreference('adaptive', true);
+  const [inspector, setInspector] = usePreference('inspector', 'trace');
+  const [connectionOpen, setConnectionOpen] = usePreference('connection_open', !luna?.configured);
+  const [runSettingsOpen, setRunSettingsOpen] = usePreference('run_settings_open', false);
+  const [compactArms] = usePreference('compact_arms', true);
   const hasRun = !!agent.session_id || agent.active;
-  useEffect(() => { setConnectionOpen(!luna?.configured); }, [luna?.configured]);
-  const [navigationMode, setNavigationMode] = useState<'luna_continuous' | 'luna_navigation'>(() =>
-    !kitchenSearch && !circleFurniture && localStorage.getItem('milo-navigation-mode') === 'luna_navigation' ? 'luna_navigation' : 'luna_continuous');
-  useEffect(() => { localStorage.setItem('milo-navigation-mode', navigationMode); }, [navigationMode]);
+  const [preferredMode, setNavigationMode] = usePreference('navigation_mode', 'luna_continuous');
+  const navigationMode = unified ? 'luna_continuous' : preferredMode;
   const continuous = (agent.active ? agent.execution_mode : navigationMode) === 'luna_continuous';
-  const backend = continuous && supportsNavigationBackend && nav2.enabled ? preferredBackend : 'builtin';
+  const backend = !unified && continuous && supportsNavigationBackend && nav2.enabled ? preferredBackend : 'builtin';
   const [variant, setVariant] = useState<{name:string;version:string;revision:string} | null>(null);
   const [supportsAiRoutes, setSupportsAiRoutes] = useState(false);
   const [supportsSkillComposer, setSupportsSkillComposer] = useState(false);
@@ -84,7 +104,6 @@ export function LunaNavigationControl({ state, connected, request }: {
     return () => { window.clearInterval(timer); controller.abort(); };
   }, [supportsNavigationBackend]);
   const resident = state.local_navigation_model;
-  useEffect(() => { if (agent.active && agent.goal) setGoal(agent.goal); }, [agent.session_id, agent.goal, agent.active]);
   async function sendInstruction() {
     setSending(true); setInstructionError('');
     try {
@@ -94,11 +113,6 @@ export function LunaNavigationControl({ state, connected, request }: {
     } catch (failure) { setInstructionError(failure instanceof Error ? failure.message : String(failure)); }
     finally { setSending(false); }
   }
-  useEffect(() => {
-    setEndpoint(agent.configuration.endpoint);
-    setDeployment(luna?.deployment ?? '');
-    if (luna) setReasoning(current => luna.reasoning_efforts.includes(current) ? current : luna.reasoning_efforts[0]);
-  }, [agent.configuration.endpoint, luna?.deployment, luna?.reasoning_efforts.join(',')]);
   async function perform(path: string, body: unknown) {
     setPending(true); setError('');
     try { await request(path, body); }
@@ -107,36 +121,9 @@ export function LunaNavigationControl({ state, connected, request }: {
   }
   const residentLabels = { unloaded: continuous ? 'Model not loaded / SmolVLA inactive' : 'Model not loaded / loads on first Start', loading: 'Loading model into GPU memory',
     ready: 'Model ready / kept in GPU memory', inferencing: 'Model loaded / processing a request', error: 'Model worker unavailable / reloads on Start' };
-  const exploring = home?.task?.status === 'running';
-  const modeSelector = <div className="control-mode-selector" role="group" aria-label="Robot control mode">
-    <button type="button" aria-pressed={controlMode === 'task'} disabled={pending || agent.active || state.busy || exploring} onClick={() => setControlMode('task')}><Bot size={16}/>Task / Luna</button>
-    <button type="button" aria-pressed={controlMode === 'exploration'} disabled={pending || agent.active || state.busy} onClick={() => setControlMode('exploration')}><Compass size={16}/>Explore / local</button>
-  </div>;
-  if (controlMode === 'exploration') return <section className="agent-section local-exploration" aria-label="Local exploration">
-    {modeSelector}
-    <div className="panel-header"><h3><Compass size={17}/>Explore locally</h3><span className="tag">No model inference</span></div>
-    <dl className="results-facts"><div><dt>Map</dt><dd>{home?.name ?? 'New unsaved sensor map'}</dd></div><div><dt>Localization</dt><dd>{home?.map_id ? home.localization.status : 'Starts at current robot pose'}</dd></div><div><dt>Observed free</dt><dd>{home?.coverage ? `${home.coverage.free_m2.toFixed(1)} m2` : 'Not measured'}</dd></div><div><dt>Model calls</dt><dd>0</dd></div></dl>
-    <form onSubmit={event => { event.preventDefault(); setPending(true); setError(''); void (async () => {
-      try {
-        await request('continuous/scan', {run_id:state.run_id,episode_epoch:state.episode_epoch,compact_arms:true});
-        const result = await request('home', {run_id:state.run_id,episode_epoch:state.episode_epoch,action:'start_exploration',time_budget:explorationBudget});
-        setHome(result as NonNullable<typeof home>);
-      } catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
-      finally { setPending(false); }
-    })(); }}>
-      <label>Exploration budget (s)<input aria-label="Local exploration budget" type="number" min={1} max={300} value={explorationBudget} disabled={pending || exploring} onChange={event => setExplorationBudget(Number(event.target.value))}/></label>
-      <div className="agent-actions"><button className="primary" type="submit" disabled={!connected || !home || pending || state.busy || state.stopped || agent.active || exploring || home.expansion_allowed === false || (home.map_id !== null && home.localization.status !== 'localized') || explorationBudget < 1 || explorationBudget > 300}><Play size={16}/>Start exploration</button>
-        <button type="button" className="stop-button" disabled={!connected} onClick={() => void request('home', {run_id:state.run_id,episode_epoch:state.episode_epoch,action:'cancel_task'}).catch(failure => setError(String(failure)))}><CircleStop size={16}/>Stop exploration</button></div>
-    </form>
-    {state.stopped && <p role="status">Stopped / manual resume required</p>}
-    {home?.map_id && home.localization.status !== 'localized' && <p role="status">Saved map loaded / localization required in Home map</p>}
-    {home?.task?.local_exploration && <div className="home-task-status" role="status"><strong>{home.task.status}</strong><span>{home.task.reason}</span><small>{home.task.visited_frontiers} frontiers / {home.task.continuations ?? 0} rolling continuations</small></div>}
-    {error && <p className="error" role="alert">{error}</p>}
-  </section>;
   return <section className="agent-section" aria-label="LLM control">
-    {modeSelector}
-    <div className="panel-header"><h3><Bot size={17} /> Luna</h3>
-      <span className="tag">{agent.active ? 'Supervisor active' : luna?.configured ? 'Ready for a goal' : 'Connection required'}</span></div>
+    <div className="panel-header"><h3><Bot size={17} /> {unified ? 'Mission' : 'Luna'}</h3></div>
+    {unified && !capabilities.ready && <p role="alert">Mission controller unavailable on this server. Restart with the current backend.</p>}
     <details className="agent-connection setup-connection" hidden={agent.active} open={connectionOpen}
       onToggle={event => setConnectionOpen(event.currentTarget.open)}><summary><Settings2 size={15} /> Luna connection</summary>
       <form onSubmit={event => {
@@ -151,53 +138,62 @@ export function LunaNavigationControl({ state, connected, request }: {
         <button type="submit"><Check size={16} /> Apply Luna connection</button>
       </fieldset></form>
     </details>
-    <div className="controller-caption" hidden={!luna?.configured && !hasRun}>{continuous ? (agent.active ? agent.navigation_backend : backend) === 'nav2' ? 'Nav2 navigation' : 'Continuous local navigation' : 'SmolVLA primitives'}<span className={luna?.configured ? 'ok' : 'bad'}>{luna?.configured ? 'Configured' : 'Connection required'}</span></div>
     {!continuous && agent.local_model && <LocalModelProgress live={agent.local_model} connected={connected} resident={resident} />}
-    <form className="agent-form" onSubmit={event => {
+    <form id="mission-form" className="agent-form" onSubmit={event => {
       event.preventDefault();
+      if (unified) {
+        void perform('mission/start', {run_id:state.run_id, episode_epoch:state.episode_epoch, execution_mode:'luna_continuous',
+          unified_mission:true, mission_local_only:localOnly, map_context:mapContext, mission_budget_s:explorationBudget,
+          images_per_request:2, context_tokens:8192, navigation_backend:'builtin', compact_arms:compactArms,
+          model_id:'luna', reasoning, goal:localOnly ? 'Explore the observed environment within the mission budget.' : goal,
+          max_turns:turns, feedback_interval_s:interval, max_model_requests:maxRequests, max_model_tokens:maxTokens});
+        return;
+      }
       void perform('agent/start', { run_id: state.run_id, episode_epoch: state.episode_epoch,
-        execution_mode: navigationMode, compact_arms: localStorage.getItem('milo-compact-arms') !== 'false',
+        execution_mode: navigationMode, compact_arms: compactArms,
         continuous_handoff: continuous && backend === 'builtin' && handoff,
         ...(continuous && supportsNavigationBackend ? {navigation_backend:backend} : {}),
         ...(continuous && backend === 'builtin' && skillComposer && supportsSkillComposer ? {skill_composer:true} : {}),
         ...(continuous && backend === 'builtin' && aiRoutes && supportsAiRoutes ? {ai_generated_routes:true} : {}),
         adaptive_navigation: adaptive,
-        model_id: 'luna', reasoning, goal, max_turns: turns, feedback_interval_s: interval });
+        model_id: 'luna', reasoning, goal, max_turns: turns, feedback_interval_s: interval,
+        max_model_requests:maxRequests, max_model_tokens:maxTokens });
     }}>
-      <div className="agent-goal-row"><label>Robot goal<textarea aria-label="Robot goal" value={goal} required maxLength={2000} rows={2}
+      <div className="agent-goal-row"><label>Robot goal<textarea aria-label="Robot goal" value={goal} required maxLength={2000} rows={4}
         disabled={agent.active || pending} onChange={event => setGoal(event.target.value)} /></label>
-        <div className="agent-actions" hidden={!luna?.configured && !hasRun}>{agent.active ? <>
-          {!continuous && <button type="button" disabled={pending || !connected || interval < .25 || interval > 30}
-            onClick={() => void perform('agent/rate', {feedback_interval_s: interval})}><Timer size={16} /> Apply rate</button>
-          }
-          <button type="button" disabled={pending || !connected} onClick={() => void perform('agent/takeover', {})}><Hand size={16} /> Take manual control</button>
-        </> : <button type="submit" className="primary" disabled={!connected || pending || state.busy || !luna?.configured || !goal.trim()
-          || (continuous && backend === 'builtin' && aiRoutes && !supportsAiRoutes) || (backend === 'nav2' && !nav2.ready)
+      </div>
+      {commandHost && createPortal(<button type="submit" form="mission-form" className="primary" aria-label={unified ? 'Start mission' : 'Start LLM control'} title={unified ? 'Start mission' : 'Start LLM control'} disabled={agent.active || !connected || pending || state.power?.on === false || state.busy || (!localOnly && (!luna?.configured || connectionChanged || !goal.trim()))
+          || !Number.isInteger(maxRequests) || maxRequests < 1 || maxRequests > 200 || !Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 2000000
+          || (unified && (!capabilities.ready || explorationBudget < 5 || explorationBudget > 300))
+          || (!unified && ((continuous && backend === 'builtin' && aiRoutes && !supportsAiRoutes) || (backend === 'nav2' && !nav2.ready)))
           || !Number.isInteger(turns) || turns < 1 || turns > 80 || interval < .25 || interval > 30}>
-          <Play size={16} /> Start LLM control</button>}</div></div>
+          <Play size={16} /> Start</button>, commandHost)}
     </form>
-    {(error || agent.error) && <div className="error" role="alert">{error || agent.error}</div>}
-    {agent.message && <p className="agent-message">{agent.message}</p>}
+    {error && <div className="error" role="alert">{error}</div>}
+    {hasRun && <TokenCounter agent={agent} connected={connected} />}
+    {agent.inference_budget && <div className="agent-metrics" aria-label="Luna task budget">
+      <span>Luna requests <strong>{agent.inference_budget.requests} / {agent.inference_budget.max_requests}</strong></span>
+      <span>Token threshold <strong>{agent.inference_budget.max_tokens.toLocaleString()}</strong></span>
+    </div>}
     {hasRun && <div className="agent-metrics"><span>Supervisor turns <strong>{agent.turns} / {agent.max_turns}</strong></span>
       <span>{continuous ? 'Route updates' : 'Local commands'} <strong>{continuous ? state.continuous_navigation?.updates ?? 0 : agent.local_model?.requests_completed ?? 0}</strong></span>
       <span>{continuous ? 'Luna inference' : 'Local inference'} <strong>{agent.inference_latency_s?.toFixed(2) ?? '-'} s</strong></span>
       <span>{agent.local_model?.instruction ?? ''}</span></div>}
     {hasRun && <div className="inspector-tabs tabs" role="tablist" aria-label="Robot inspector" onKeyDown={event => {
-      const keys = ['conversation', 'trace', 'settings'];
+      const keys = ['conversation', 'trace', 'settings'] as const;
       const index = keys.indexOf(inspector);
       const next = event.key === 'ArrowRight' ? (index + 1) % keys.length : event.key === 'ArrowLeft' ? (index + keys.length - 1) % keys.length : event.key === 'Home' ? 0 : event.key === 'End' ? keys.length - 1 : -1;
       if (next < 0) return;
       event.preventDefault(); setInspector(keys[next]);
       event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next].focus();
     }}>
-      {([{id:'conversation',label:'Conversation',icon:MessageSquare},{id:'trace',label:'Trace',icon:Radio},{id:'settings',label:'Settings',icon:Settings2}]).map(({id,label,icon:Icon}) =>
+      {([{id:'conversation',label:'Conversation',icon:MessageSquare},{id:'trace',label:'Trace',icon:Radio},{id:'settings',label:'Settings',icon:Settings2}] as const).map(({id,label,icon:Icon}) =>
         <button type="button" key={id} role="tab" id={`inspector-${id}`} aria-controls={`panel-${id}`} aria-selected={inspector === id}
           tabIndex={inspector === id ? 0 : -1} onClick={() => setInspector(id)}><Icon size={15} />{label}</button>)}
     </div>}
     <div id="panel-conversation" role="tabpanel" aria-labelledby="inspector-conversation" hidden={!hasRun || inspector !== 'conversation'}>
     <section className="chat-section" aria-label="Run chat">
-      <div className="panel-header"><h3><MessageSquare size={17} />Run chat</h3>
-        <span className="tag" role="status">{sending ? 'Updating instruction' : agent.active ? 'Run active' : 'Run stopped'}</span></div>
+      <div className="panel-header"><h3><MessageSquare size={17} />Run chat</h3></div>
       <div className="chat-transcript" role="log" aria-label="Run conversation" tabIndex={0}>
         {!agent.run_messages?.length && <p className="empty">No messages in this run.</p>}
         {(agent.run_messages ?? []).map(message => <article key={message.id} className={`chat-message chat-${message.role}`}>
@@ -226,15 +222,17 @@ export function LunaNavigationControl({ state, connected, request }: {
         {action.reason && <span>{action.reason}</span>}</li>)}</ol>
     </details>
     </div>
-    <details className="run-options" open={hasRun || undefined} hidden={(!luna?.configured && !hasRun) || (hasRun && inspector !== 'settings')}>
+    {connectionChanged && <p role="status">Connection changes not applied</p>}
+    <details className="run-options" open={hasRun || runSettingsOpen} onToggle={event => {if (!hasRun) setRunSettingsOpen(event.currentTarget.open);}}
+      hidden={(hasRun && inspector !== 'settings')}>
     <summary hidden={hasRun}><Settings2 size={15} />Run settings</summary>
     <div id="panel-settings" role={hasRun ? 'tabpanel' : undefined} aria-labelledby={hasRun ? 'inspector-settings' : undefined}>
-      {!agent.active && variant && <dl className="test-variant-preview" aria-label="Current architecture version"><div><dt>Architecture</dt><dd>{variant.name}</dd></div><div><dt>Version</dt><dd>{variant.version}+{variant.revision}</dd></div></dl>}
+      {!agent.active && (unified ? capabilities.architecture : variant) && <dl className="test-variant-preview" aria-label="Current architecture version"><div><dt>Architecture</dt><dd>{(unified ? capabilities.architecture : variant)?.name}</dd></div><div><dt>Version</dt><dd>{(unified ? capabilities.architecture : variant)?.version}+{(unified ? capabilities.architecture : variant)?.revision}</dd></div></dl>}
       <div className="agent-settings">
-        <label>Navigation controller<select aria-label="Navigation controller" value={navigationMode} disabled={agent.active || pending}
+        {!unified && <label>Navigation controller<select aria-label="Navigation controller" value={navigationMode} disabled={agent.active || pending}
           onChange={event => setNavigationMode(event.target.value as typeof navigationMode)}>
-          <option value="luna_continuous">Continuous local control</option><option value="luna_navigation">SmolVLA primitives</option></select></label>
-        {continuous && supportsNavigationBackend && <label>Navigation stack<select aria-label="Navigation stack" value={backend} disabled={agent.active || pending}
+          <option value="luna_continuous">Continuous local control</option><option value="luna_navigation">SmolVLA primitives</option></select></label>}
+        {!unified && continuous && supportsNavigationBackend && <label>Navigation stack<select aria-label="Navigation stack" value={backend} disabled={agent.active || pending}
           onChange={event => setPreferredBackend(event.target.value as 'nav2' | 'builtin')}>
           <option value="nav2" disabled={!nav2.enabled}>Nav2 (primary)</option><option value="builtin">Built-in (backup)</option></select></label>}
         <label>Supervisor reasoning<select aria-label="Supervisor reasoning" value={reasoning} disabled={agent.active || pending}
@@ -242,9 +240,26 @@ export function LunaNavigationControl({ state, connected, request }: {
           {(luna?.reasoning_efforts ?? ['low', 'medium', 'high']).map(effort => <option value={effort} key={effort}>{effort}</option>)}</select></label>
         <label>Supervisor turn limit<input aria-label="Supervisor turn limit" type="number" min={1} max={80} value={turns}
           disabled={agent.active || pending} onChange={event => setTurns(Number(event.target.value))} /></label>
+        <label>Luna request limit<input aria-label="Luna request limit" type="number" min={1} max={200} value={maxRequests}
+          disabled={agent.active || pending} onChange={event => setMaxRequests(Number(event.target.value))} /></label>
+        <label>Luna token threshold<input aria-label="Luna token threshold" type="number" min={1} max={2000000} step={1000} value={maxTokens}
+          title="Checked using reported usage after each request; one response may cross this threshold."
+          disabled={agent.active || pending} onChange={event => setMaxTokens(Number(event.target.value))} /></label>
+        {unified && <label>Mission budget (s)<input aria-label="Mission budget" type="number" min={5} max={300} value={explorationBudget}
+          disabled={agent.active || pending} onChange={event=>setExplorationBudget(Number(event.target.value))}/></label>}
         {!continuous && <label>Local feedback interval (s)<input aria-label="Feedback interval (s)" type="number" min={.25} max={30} step={.25}
           value={interval} onChange={event => setInterval(Number(event.target.value))} /></label>}
+        {!continuous && agent.active && <button type="button" disabled={pending || !connected || interval < .25 || interval > 30}
+          onClick={() => void perform('agent/rate', {feedback_interval_s: interval})}><Timer size={16} />Apply rate</button>}
       </div>
+      <details className="mission-diagnostics"><summary><Settings2 size={15}/>Diagnostics</summary>
+        <label>Execution profile<select aria-label="Diagnostic execution profile" value={diagnostic} disabled={agent.active || pending}
+          onChange={event=>setDiagnostic(event.target.value as typeof diagnostic)}><option value="unified">Unified mission</option>
+          <option value="local">Unified local-only exploration</option><option value="legacy">Legacy controller comparison</option></select></label>
+        {unified && <label className="toggle"><input type="checkbox" aria-label="Observed map context" checked={mapContext} disabled={agent.active || pending}
+          onChange={event=>setMapContext(event.target.checked)}/>Observed map context</label>}
+      </details>
+      {!unified && <>
       {continuous && backend === 'nav2' && <p role="status" aria-label="Nav2 readiness">{nav2.ready ? 'Nav2 ready' : nav2.message}</p>}
       {continuous && backend === 'builtin' && <label className="toggle handoff-toggle" title={supportsAiRoutes ? 'Experimental generic waypoint control' : 'This backend does not support generic AI routes. Uncheck to use observed continuous control.'}><input type="checkbox" aria-label="AI-generated routes" checked={aiRoutes}
         disabled={agent.active || pending || (!supportsAiRoutes && !aiRoutes)} onChange={event => setAiRoutes(event.target.checked)} />AI-generated routes ({supportsAiRoutes ? 'experimental' : 'unavailable'})</label>}
@@ -254,6 +269,7 @@ export function LunaNavigationControl({ state, connected, request }: {
         disabled={agent.active || pending || !supportsSkillComposer} onChange={event => setSkillComposer(event.target.checked)} />Motion skill composer (experimental)</label>}
       {continuous && !aiRoutes && <label className="toggle handoff-toggle"><input type="checkbox" aria-label="Adaptive exploration" checked={adaptive}
         disabled={agent.active || pending} onChange={event => setAdaptive(event.target.checked)} />Adaptive exploration</label>}
+      </>}
     {(!continuous || (resident && resident.phase !== 'unloaded')) && <div className="policy-readiness">
       <div className="panel-header"><h4>{resident?.checkpoint ?? 'Local navigation checkpoint'} / local CUDA</h4>
         <button type="button" className="icon-button" aria-label="Unload local model" title="Unload SmolVLA and release GPU memory"

@@ -20,12 +20,176 @@ async function spectatorPixels(page: Page) {
 }
 
 test.beforeEach(async ({ request }) => {
+  expect((await request.post('/api/test/preferences/reset')).ok()).toBe(true);
   const response = await request.post('/api/challenges/load', { data: { challenge_id: 'bench' } });
   expect(response.ok()).toBeTruthy();
   await request.post('/api/agent/config', { data: { endpoint: '', models: [
     { id: 'luna', label: 'GPT-5.6 Luna', deployment: '' },
   ] } });
   await request.post('/api/voice/config', { data: { endpoint: '', deployment: '' } });
+});
+
+for (const imageFailure of ['expired', 'stalled']) {
+  test(`spatial map telemetry stays independent of ${imageFailure} paired images`, async ({ page }) => {
+    let sequence = 1;
+    let stale = false;
+    let unavailable = false;
+    let releaseImages!: () => void;
+    const imagesReleased = new Promise<void>(resolve => { releaseImages = resolve; });
+    const cells = Array.from({ length: 160 * 160 }, (_, index) => index % 3 === 0 ? -1 : index % 3 === 1 ? 0 : 100);
+    await page.route('**/api/spatial', route => route.fulfill({ status: unavailable ? 503 : 200, json: {
+      enabled: true, paused: false, error: null,
+      frame: { sequence, simulated_time_s: sequence, rgb_url: '/api/test-spatial/rgb', depth_url: '/api/test-spatial/depth' },
+      map: { width: 160, height: 160, cells, resolution_m: .05, origin_m: [-4, -4], stale, age_s: stale ? 2 : 0,
+        observed_floor_cells: 100, obstacle_cells: 100, robot_odometry_m_rad: [0, 0, 0] }, footprint: null,
+    } }));
+    await page.route('**/api/test-spatial/*', async route => {
+      if (imageFailure === 'stalled') await imagesReleased;
+      await route.fulfill({ status: 404 });
+    });
+    try {
+      await page.goto('/');
+      const map = page.getByLabel('Observed floor and obstacle map', { exact: true });
+      await expect(map).toHaveAttribute('data-state', 'live');
+      stale = true;
+      sequence++;
+      await expect(map).toHaveAttribute('data-state', 'stale');
+      stale = false;
+      sequence++;
+      await expect(map).toHaveAttribute('data-state', 'live');
+      unavailable = true;
+      await expect(map).toHaveAttribute('data-state', 'unavailable');
+      unavailable = false;
+      sequence++;
+      await expect(map).toHaveAttribute('data-state', 'live');
+    } finally {
+      releaseImages();
+      await page.unrouteAll({ behavior: 'wait' });
+    }
+  });
+}
+
+test('camera and spatial map stay in the right-side 3D HUD across viewports', async ({ page, request }) => {
+  test.setTimeout(90000);
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto('/');
+  const hud = page.getByRole('complementary', { name: 'Robot sensor HUD' });
+  const map = page.getByRole('region', { name: 'Spatial map HUD' });
+  const camera = hud.getByAltText('Authoritative robot head camera');
+  const mapCanvas = page.getByLabel('Observed floor and obstacle map', { exact: true });
+  const mapColors = () => mapCanvas.evaluate((element: HTMLCanvasElement) => {
+    const pixels = element.getContext('2d')!.getImageData(0, 0, 320, 320).data;
+    const colors = new Set<string>();
+    for (let offset = 0; offset < pixels.length; offset += 32) colors.add(`${pixels[offset]},${pixels[offset + 1]},${pixels[offset + 2]}`);
+    return colors.size;
+  });
+  await expect(camera).toHaveJSProperty('naturalWidth', 640);
+  await expect(map).toContainText('Sensing off');
+  await expect(page.locator('.spatial-section')).not.toHaveAttribute('open');
+  await expect(mapCanvas).toBeVisible();
+  const initial: LiveState = await (await request.get('/api/state')).json();
+  expect((await request.post('/api/spatial', { data: { run_id: initial.run_id, episode_epoch: initial.episode_epoch, enabled: true } })).ok()).toBe(true);
+  await expect(mapCanvas).toHaveAttribute('data-state', 'idle');
+  await expect.poll(mapColors).toBeGreaterThan(2);
+  for (const width of [1440, 1024, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await page.locator('.world-viewport').scrollIntoViewIfNeeded();
+    await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(30);
+    const layout = await hud.evaluate(element => {
+      const viewport = element.closest('.world-viewport')!.getBoundingClientRect();
+      const bounds = element.getBoundingClientRect();
+      const widgets = [...element.querySelectorAll('.viewport-widget')].map(widget => widget.getBoundingClientRect());
+      const clipped = [...element.querySelectorAll('h3, .camera-meta, .viewport-map-meta')]
+        .filter(child => child.scrollWidth > child.clientWidth + 1).length;
+      return { rightGap: viewport.right - bounds.right, topGap: bounds.top - viewport.top,
+        bottomGap: viewport.bottom - bounds.bottom, separation: widgets[1].top - widgets[0].bottom,
+        worldVisible: bounds.left - viewport.left, clipped, pageOverflow: document.documentElement.scrollWidth > innerWidth };
+    });
+    expect(layout.rightGap).toBeGreaterThanOrEqual(7);
+    expect(layout.rightGap).toBeLessThanOrEqual(13);
+    expect(layout.topGap).toBeGreaterThanOrEqual(7);
+    expect(layout.bottomGap).toBeGreaterThanOrEqual(0);
+    expect(layout.separation).toBeGreaterThanOrEqual(7);
+    expect(layout.worldVisible).toBeGreaterThan(140);
+    expect(layout.clipped).toBe(0);
+    expect(layout.pageOverflow).toBe(false);
+    await page.locator('.world-viewport').screenshot({ path: `../.runtime/viewport-micro-hud-v2/hud-${width}.png` });
+    await page.getByRole('button', { name: 'Expand spatial map', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Spatial map', exact: true });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator('canvas')).toBeVisible();
+    await expect(mapCanvas).toHaveCount(1);
+    expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(dialog).not.toBeVisible();
+    await expect(hud.locator('canvas')).toBeVisible();
+    await expect.poll(mapColors).toBeGreaterThan(2);
+    await expect(page.getByRole('button', { name: 'Expand spatial map', exact: true })).toBeFocused();
+    await hud.getByRole('button', { name: 'Minimize head camera', exact: true }).click();
+    await expect(camera).toBeVisible();
+    await expect(mapCanvas).toBeVisible();
+    await expect(map).toHaveAttribute('data-minimized', 'false');
+    await hud.getByRole('button', { name: 'Minimize spatial map', exact: true }).click();
+    await expect(mapCanvas).toBeVisible();
+    await expect(hud.getByRole('button', { name: 'Restore head camera', exact: true })).toHaveAttribute('aria-expanded', 'false');
+    await expect(hud.getByRole('button', { name: 'Restore spatial map', exact: true })).toHaveAttribute('aria-expanded', 'false');
+    const microWidgets = await hud.locator('.viewport-widget').evaluateAll(elements => elements.map(element => {
+      const bounds = element.getBoundingClientRect();
+      return { width: bounds.width, height: bounds.height, text: (element as HTMLElement).innerText.trim() };
+    }));
+    for (const widget of microWidgets) {
+      expect(widget.width).toBe(width <= 600 ? 72 : 96);
+      expect(widget.text).toBe('');
+    }
+    expect(microWidgets[0].height).toBeCloseTo((microWidgets[0].width - 2) * .75 + 2, 0);
+    expect(microWidgets[1].height).toBe(microWidgets[1].width);
+    await expect.poll(mapColors).toBeGreaterThan(2);
+    for (const name of ['Restore head camera', 'Restore spatial map']) {
+      const restore = hud.getByRole('button', { name, exact: true });
+      await restore.hover();
+      expect(await restore.evaluate(element => {
+        const swatch = document.createElement('canvas').getContext('2d')!;
+        swatch.fillStyle = getComputedStyle(element).backgroundColor;
+        swatch.fillRect(0, 0, 1, 1);
+        return swatch.getImageData(0, 0, 1, 1).data[3];
+      })).toBeLessThan(32);
+    }
+    await page.locator('.world-viewport').screenshot({ path: `../.runtime/viewport-micro-hud-v2/minimized-${width}.png` });
+    await hud.getByRole('button', { name: 'Restore spatial map', exact: true }).focus();
+    await page.keyboard.press('Enter');
+    await expect(mapCanvas).toBeVisible();
+    await expect(map).toHaveAttribute('data-minimized', 'false');
+    await expect(hud.getByRole('region', { name: 'Head camera HUD' })).toHaveAttribute('data-minimized', 'true');
+    await hud.getByRole('button', { name: 'Restore head camera', exact: true }).click();
+    await expect(camera).toBeVisible();
+  }
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.locator('.spectator canvas').hover({ position: { x: 100, y: 200 } });
+  const beforeOrbit = await spectatorPixels(page);
+  const world = (await page.locator('.spectator canvas').boundingBox())!;
+  expect(await page.evaluate(({ left, top }) => document.elementFromPoint(left, top)?.getAttribute('aria-label'),
+    { left: world.x + 100, top: world.y + 200 })).toBe('Live robot spectator viewport');
+  await page.mouse.down();
+  await page.mouse.move(world.x + 200, world.y + 240, { steps: 8 });
+  await page.mouse.up();
+  await expect.poll(async () => (await spectatorPixels(page)).signature !== beforeOrbit.signature).toBe(true);
+  const before: LiveState = await (await request.get('/api/state')).json();
+  await hud.getByRole('button', { name: 'Minimize head camera', exact: true }).click();
+  const response = await request.post('/api/command', { data: { run_id: before.run_id, episode_epoch: before.episode_epoch,
+    observation_seq: before.observation.seq, action_id: 'hud-head-motion', tool: 'set_head',
+    arguments: { yaw_rad: .3, pitch_rad: .5, duration_s: 1 } } });
+  expect((await response.json()).status).toBe('ok');
+  await expect.poll(async () => Number(await camera.getAttribute('data-simulated-time'))).toBeGreaterThan(before.snapshot.simulated_time_s);
+  await expect(camera).toBeVisible();
+  await expect(hud.getByRole('region', { name: 'Head camera HUD' })).toHaveAttribute('data-minimized', 'true');
+  await hud.getByRole('button', { name: 'Restore head camera', exact: true }).click();
+  await expect(camera).toBeVisible();
+  expect((await request.post('/api/spatial', { data: { run_id: before.run_id, episode_epoch: before.episode_epoch, enabled: false } })).ok()).toBe(true);
+  await expect(map).toContainText('Sensing off');
+  await expect(mapCanvas).toBeVisible();
+  expect(errors).toEqual([]);
 });
 
 test('enhanced backend shares graphics across live RGB depth and world view', async ({ page, request }) => {
@@ -215,13 +379,13 @@ test('outcome feedback separates verified completion, agent reports, and unsucce
     socket.send(JSON.stringify({ ...initial, ...patch, agent: { ...initial.agent, ...agent } }));
   }
   await page.goto('/');
-  const outcome = page.getByRole('status', { name: 'Task outcome', exact: true });
-  await expect(outcome).toHaveCount(0);
+  const outcome = page.getByRole('region', { name: 'Robot activity', exact: true });
+  await expect(outcome).toContainText('On / Idle');
   for (const [kind, title] of [['completed', 'Agent reports completion'], ['unachievable', 'Task cannot be completed'],
-    ['limited', 'Turn limit reached'], ['interrupted', 'Run interrupted'], ['ended', 'Response finished']]) {
-    publish({}, { outcome: { kind, message: 'A clear reason for this outcome.', source: kind === 'completed' || kind === 'unachievable' ? 'agent' : 'controller', timestamp: 1 } });
-    await expect(outcome.getByRole('heading')).toHaveText(title);
-    await expect(outcome).not.toHaveAttribute('data-outcome', 'success');
+    ['limited', 'Task limit reached'], ['interrupted', 'Stopped'], ['ended', 'Response finished']]) {
+    publish({stopped:kind === 'interrupted'}, { outcome: { kind, message: 'A clear reason for this outcome.', source: kind === 'completed' || kind === 'unachievable' ? 'agent' : 'controller', timestamp: 1 } });
+    await expect(outcome.locator('.status')).toHaveText(title);
+    await expect(outcome).not.toHaveAttribute('data-state', 'success');
     await expect(outcome).toContainText('A clear reason for this outcome.');
   }
   publish({}, { error: 'The model connection timed out.' });
@@ -240,8 +404,8 @@ test('outcome feedback separates verified completion, agent reports, and unsucce
   await expect(outcome).toContainText('Task failed');
   await expect(outcome).toContainText('Battery empty');
   publish({ manual_placements: 1, challenge: { ...initial.challenge!, status: 'completed', completed_objectives: 1 } }, { phase: 'sleeping' });
-  await expect(outcome.getByRole('heading')).toHaveText('Task completed');
-  await expect(outcome).toHaveAttribute('data-outcome', 'success');
+  await expect(outcome.locator('.status')).toHaveText('Task completed');
+  await expect(outcome).toHaveAttribute('data-state', 'success');
   await expect(outcome).toContainText('verified by physics / Operator-assisted episode');
   for (const width of [1440, 390, 320]) {
     await page.setViewportSize({ width, height: 1000 });
@@ -251,7 +415,7 @@ test('outcome feedback separates verified completion, agent reports, and unsucce
     await page.locator('.robot-activity').screenshot({ path: `test-results/task-completed-${width}.png` });
   }
   publish({});
-  await expect(outcome).toHaveCount(0);
+  await expect(outcome).toContainText('On / Idle');
   socket!.close();
   await expect(outcome).toContainText('Connection lost');
   await expect(outcome).not.toHaveAttribute('data-outcome', 'success');
@@ -331,6 +495,7 @@ test('shared apartment selection preserves the common world and renders across v
     if (identifier === 'furniture_circuit') await writeScenarioPreview(page, 'shared_apartment_v1');
   }
   const resetResponse = page.waitForResponse(reply => reply.url().endsWith('/api/reset'));
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
   const reset: LiveState = await (await resetResponse).json();
   await expect(page.locator('.viewport-footer')).toContainText(`Epoch ${reset.episode_epoch}`);
@@ -390,6 +555,7 @@ test('predefined challenges load distinct scenes and goals and reset in place', 
     await page.screenshot({ path: `test-results/challenge-${preset.id}.png`, fullPage: true });
     const loaded = await (await request.get('/api/state')).json();
     const resetResponse = page.waitForResponse(response => response.url().endsWith('/api/reset') && response.request().method() === 'POST');
+    if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
     await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
     expect((await resetResponse).ok()).toBe(true);
     await expect.poll(async () => (await (await request.get('/api/state')).json()).run_id).not.toBe(loaded.run_id);
@@ -437,6 +603,7 @@ for (const width of [1440, 390]) {
         expect(result.observation.odometry_m_rad[0]).toBeGreaterThan(.05);
         await expect(page.getByAltText('Authoritative robot head camera')).toHaveAttribute('data-simulated-time', '1');
         await expect.poll(async () => (await spectatorPixels(page)).signature).not.toBe(pixelsBefore);
+        if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
         await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
         await expect(page.getByAltText('Authoritative robot head camera')).toHaveAttribute('data-simulated-time', '0');
         await expect(page.locator('.challenge-status')).toHaveText(`0 / ${identifier === 'warehouse' ? 3 : 1} goals complete`);
@@ -474,8 +641,8 @@ test('kitchen to bathroom shows recognizable camera views and resettable arrival
     action_id: 'bathroom-settle', tool: 'wait', arguments: { duration_s: .5 },
   } })).ok()).toBe(true);
   await expect(page.locator('.challenge-status')).toHaveText('Completed');
-  await expect(page.getByRole('status', { name: 'Task outcome', exact: true })).toContainText('Task completed');
-  await expect(page.getByRole('status', { name: 'Task outcome', exact: true })).toContainText('Operator-assisted');
+  await expect(page.getByRole('region', { name: 'Robot activity', exact: true })).toContainText('Task completed');
+  await expect(page.getByRole('region', { name: 'Robot activity', exact: true })).toContainText('Operator-assisted');
   await expect(camera).toHaveAttribute('data-simulated-time', '0.5');
   await page.locator('.camera-frame').screenshot({ path: 'test-results/bathroom-arrival-camera.png' });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -483,6 +650,7 @@ test('kitchen to bathroom shows recognizable camera views and resettable arrival
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: 'test-results/kitchen-bathroom-mobile.png', fullPage: true });
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
   await expect(page.locator('.challenge-status')).toHaveText('0 / 1 goals complete');
   await expect(selector).toHaveValue('kitchen_bathroom');
@@ -518,14 +686,15 @@ test('apartment search loads on mobile and shows inspected-target completion and
   expect((await inspected.json()).status).toBe('ok');
   await expect(page.locator('.challenge-status')).toHaveText('Completed');
   await expect(page.locator('.viewport-footer')).toContainText('Manual placements: 1');
-  await expect(page.getByRole('status', { name: 'Task outcome', exact: true })).toContainText('Task completed');
-  await expect(page.getByRole('status', { name: 'Task outcome', exact: true })).toContainText('Operator-assisted episode');
+  await expect(page.getByRole('region', { name: 'Robot activity', exact: true })).toContainText('Task completed');
+  await expect(page.getByRole('region', { name: 'Robot activity', exact: true })).toContainText('Operator-assisted episode');
   await expect(page.getByAltText('Authoritative robot head camera')).toHaveAttribute('data-simulated-time', '1.5');
   await page.locator('.camera-frame').screenshot({ path: 'test-results/apartment-target-camera.png' });
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
   await expect(page.locator('.challenge-status')).toHaveText('0 / 1 goals complete');
   await expect(page.getByRole('combobox', { name: 'Predefined challenge', exact: true })).toHaveValue('apartment');
-  await expect(page.getByRole('status', { name: 'Task outcome', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Robot activity', exact: true })).not.toContainText('Task completed');
 });
 
 test('parking challenge shows measured completion and mobile goals fit', async ({ page, request }) => {
@@ -546,6 +715,7 @@ test('parking challenge shows measured completion and mobile goals fit', async (
   await expect(page.locator('.challenge-status')).toHaveText('Completed');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: 'test-results/challenge-mobile.png', fullPage: true });
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
   await expect(page.locator('.challenge-status')).toHaveText('0 / 1 goals complete');
   await page.getByRole('combobox', { name: 'Predefined challenge', exact: true }).selectOption('sort');
@@ -582,6 +752,7 @@ test('remember and recharge exposes battery, wait, and a resettable mission', as
   const state = await (await request.get('/api/state')).json();
   expect(Object.keys(state.observation.battery).sort()).toEqual(['charge_pct', 'charging', 'low']);
   expect(JSON.stringify(state.observation)).not.toContain('charger_beacon');
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
   await expect(battery).toHaveAttribute('value', '100');
   await expect(page.locator('.challenge-status')).toHaveText('0 / 3 goals complete');
@@ -734,12 +905,12 @@ test('token tracker shows exact run totals and retains stale readings until reco
   await expect(tracker.locator('.token-total dd')).toHaveText('1,469,134');
   for (const width of [1440, 390, 320]) {
     await page.setViewportSize({ width, height: width === 1440 ? 1000 : 844 });
-    await page.locator('#controls').scrollIntoViewIfNeeded();
+    await tracker.scrollIntoViewIfNeeded();
     await expect(tracker).toBeVisible();
     await expect(page.getByRole('button', {name:'Stop',exact:true})).toBeInViewport();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     expect(await tracker.locator('dd').evaluateAll(elements => elements.every(element => element.scrollWidth <= element.clientWidth))).toBe(true);
-    await page.locator('.robot-activity').screenshot({ path: `test-results/token-tracker-${width}.png` });
+    await tracker.screenshot({ path: `../.runtime/unified-controls-v1/token-tracker-${width}.png` });
   }
   liveSocket!.close();
   await expect(tracker.locator('.token-scope')).toHaveText('Last received');
@@ -771,7 +942,7 @@ test('activity strip distinguishes execution, held phases, stop, and lost connec
   await page.goto('/');
   const activity = page.getByRole('region', { name: 'Robot activity', exact: true });
   const title = activity.locator('.status');
-  await expect(title).toHaveText('Robot idle');
+  await expect(title).toHaveText('On / Idle');
   await expect(activity.getByRole('status')).toHaveAttribute('aria-atomic', 'true');
   expect(await activity.getByRole('status').locator('.activity-clock').count()).toBe(0);
   for (const width of [1440, 390, 320]) {
@@ -809,7 +980,7 @@ test('activity strip distinguishes execution, held phases, stop, and lost connec
     await expect(activity).not.toHaveAttribute('data-state', 'running');
   }
   publish({}, { phase: 'completed' });
-  await expect(title).toHaveText('Run finished');
+  await expect(title).toHaveText('On / Idle');
   publish({}, { phase: 'error' });
   await expect(title).toHaveText('Control error');
   publish({ stopped: true, busy: true }, { active: true, phase: 'acting' });
@@ -828,7 +999,7 @@ test('activity strip distinguishes execution, held phases, stop, and lost connec
   await expect.poll(() => connections).toBe(2);
   await expect(title).toHaveText('Connection lost');
   publish();
-  await expect(title).toHaveText('Robot idle');
+  await expect(title).toHaveText('On / Idle');
 });
 
 for (const viewport of [{ name: 'desktop', width: 1440, height: 1000 }, { name: 'mobile', width: 390, height: 844 }]) {
@@ -949,8 +1120,9 @@ test('manual control, authoritative camera isolation, and immediate stop', async
   await expect(page.locator('.event-list')).toContainText('set_head');
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect(page.locator('.status')).toHaveText('Robot stopped');
-  await page.getByRole('button', { name: 'Resume manual control', exact: true }).click();
-  await expect(page.locator('.status')).toHaveText('Robot idle');
+  if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
+  await page.getByRole('button', { name: 'Enable manual control', exact: true }).click();
+  await expect(page.locator('.status')).toHaveText('On / Idle');
   await page.screenshot({ path: 'test-results/desktop.png', fullPage: true });
 });
 

@@ -23,6 +23,7 @@ export type Trial = {
   rendering: string; false_completion_claim: boolean; image_url: string | null; trajectory_url?: string | null;
 };
 export type Batch = {
+  home_map?: {mode?: string; map_id?: string | null; name?: string | null; revision?: number | null; sha256?: string | null; localization?: string} | null;
   benchmark?: {suite_id: string; suite_sha256: string; map_sha256: string; preflight: boolean;
     comparison?: {eligible: boolean; reasons: string[]; cohort_id: string; experiment_id: string; baseline_experiment_id: string};
     tasks: {task_id: string; title: string; planned: number; passed: number; failed: number; blocked: number; invalid: number; not_run: number; successful_median_s?: number | null}[]} | null;
@@ -295,6 +296,7 @@ export function TestResults({onNavigate, liveState, onStop}: {onNavigate?: (view
               <button type="button" aria-label="Download selected test results" title="Download selected test results" onClick={download}><Download size={17}/><span>JSON</span></button></div>
             <dl className="results-facts"><div><dt>Design</dt><dd>{selected.design}</dd></div><div><dt>Controller</dt><dd>{selected.mode.replaceAll('_',' ')}</dd></div><div><dt>Deployment</dt><dd>{selected.model}</dd></div><div><dt>Reasoning</dt><dd>{selected.reasoning}</dd></div><div><dt>Time budget</dt><dd>{measurement(selected.budget_s,'s')}</dd></div><div><dt>Camera history</dt><dd>{selected.history}</dd></div></dl>
             <dl className="results-facts"><div><dt>Architecture version</dt><dd>{selected.architecture?.version_key ?? 'Legacy / not recorded'}</dd></div><div><dt>Model configuration</dt><dd>{selected.model_variant ? `${selected.model_variant.deployment} / ${selected.model_variant.revision}` : 'Legacy / not recorded'}</dd></div></dl>
+            <dl className="results-facts"><div><dt>Starting map</dt><dd>{selected.home_map ? selected.home_map.map_id ? `${selected.home_map.name ?? selected.home_map.map_id} / v${selected.home_map.revision ?? '?'}` : 'No saved map' : selected.benchmark ? `Frozen map ${selected.benchmark.map_sha256.slice(0, 12)}` : 'Not recorded'}</dd></div><div><dt>Initial localization</dt><dd>{selected.home_map?.localization ?? 'Not recorded'}</dd></div></dl>
             {(selected.legacy || selected.source_changed) && <p className="results-warning"><TriangleAlert size={16}/>{selected.source_changed?'Source changed during this run.':'Legacy report: design and configuration may be incomplete.'}</p>}
             {selected.benchmark && <section className="variant-progress" aria-label="Standardized benchmark baseline">
               <h3>{selected.benchmark.suite_id}{selected.benchmark.preflight ? ' / preflight only' : ''}</h3>

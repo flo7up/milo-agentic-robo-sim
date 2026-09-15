@@ -1,7 +1,9 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { CheckCircle2, Circle, CircleStop, FolderOpen, ImageOff, LoaderCircle, RotateCcw, Target, X } from 'lucide-react';
+import { CheckCircle2, Circle, FolderOpen, ImageOff, LoaderCircle, RotateCcw, Target, X } from 'lucide-react';
+import { RobotControlSlot } from './RobotControlSurface';
 import type { ChallengeEnvironment, ChallengeId, ChallengePreset, LiveState } from './types';
+import { usePreference, type SceneSelection } from './Preferences';
 
 const scenarioNotes: Record<ChallengeId, { summary: string; completion: string }> = {
   bench: { summary: 'An open practice area with a cube for driving, camera movement and arm control.', completion: 'Free practice, without scored objectives.' },
@@ -41,13 +43,26 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
   const menuId = useId();
   const [menuOpen, setMenuOpen] = useState(false);
   const [presets, setPresets] = useState<ChallengePreset[]>([]);
-  const [environment, setEnvironment] = useState<ChallengeEnvironment>(state.challenge?.environment ?? 'standalone');
-  const [selected, setSelected] = useState<ChallengeId>(state.challenge?.id ?? 'bench');
-  const [orbitTarget, setOrbitTarget] = useState(state.challenge?.orbit?.target ?? 'table');
-  const [orbitDirection, setOrbitDirection] = useState(state.challenge?.orbit?.direction ?? 'clockwise');
+  const loadedSelection: SceneSelection = {challenge_id: state.challenge?.id ?? 'bench', environment: state.challenge?.environment ?? 'standalone',
+    reuse_saved_map: state.map_setup?.reuse_saved_map ?? true, ...(state.challenge?.orbit ? {
+      orbit_target: state.challenge.orbit.target as SceneSelection['orbit_target'], orbit_direction: state.challenge.orbit.direction} : {})};
+  const [selection, setSelection] = usePreference('challenge_selection', loadedSelection);
+  const [detailsOpen, setDetailsOpen] = usePreference('challenge_details_open', false);
+  const loadedRun = useRef(state.run_id);
+  const {environment, challenge_id: selected, reuse_saved_map: reuseMap} = selection;
+  const orbitTarget = selection.orbit_target ?? 'table';
+  const orbitDirection = selection.orbit_direction ?? 'clockwise';
   const [loading, setLoading] = useState(false);
-  const [reuseMap, setReuseMap] = useState(state.map_setup?.reuse_saved_map ?? true);
   const [error, setError] = useState('');
+  function updateSelection(changes: Partial<SceneSelection>) {
+    const next = {...selection, ...changes};
+    if (next.environment === 'shared_apartment_v1') {
+      if (!['furniture_circuit', 'apartment', 'flat_kitchen', 'recharge'].includes(next.challenge_id)) next.challenge_id = 'furniture_circuit';
+      next.orbit_target = 'table';
+    }
+    if (next.challenge_id !== 'furniture_circuit') { delete next.orbit_target; delete next.orbit_direction; }
+    setSelection(next);
+  }
   useEffect(() => {
     const controller = new AbortController();
     setPresets([]);
@@ -62,11 +77,9 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
     return () => controller.abort();
   }, [environment]);
   useEffect(() => {
-    setSelected(state.challenge?.id ?? 'bench');
-    setEnvironment(state.challenge?.environment ?? 'standalone');
-    setOrbitTarget(state.challenge?.orbit?.target ?? 'table');
-    setOrbitDirection(state.challenge?.orbit?.direction ?? 'clockwise');
-    setReuseMap(state.map_setup?.reuse_saved_map ?? true);
+    if (loadedRun.current === state.run_id) return;
+    loadedRun.current = state.run_id;
+    setSelection(loadedSelection);
   }, [state.run_id]);
 
   const preset = presets.find(entry => entry.id === selected);
@@ -99,23 +112,15 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
       onClose={() => setMenuOpen(false)} onCancel={event => { if (loading) event.preventDefault(); }}>
       <div className="challenge-menu-heading">
         <h2 id={`${menuId}-title`}>Load challenge</h2>
-        <button type="button" className="stop-button" aria-label="Stop robot" title="Stop robot"
-          onClick={() => { void request('stop', {}).catch(failure => setError(String(failure))); }}><CircleStop size={17} />Stop</button>
         <button type="button" className="icon-button" aria-label="Close challenge menu" title="Close challenge menu" disabled={loading}
           onClick={() => dialog.current?.close()}><X size={18} /></button>
       </div>
+      <RobotControlSlot active={menuOpen} />
       <section className="challenge-section scenario-setup" aria-label="Predefined challenges" aria-busy={loading}>
     <div className="challenge-toolbar">
       <label>Environment<select aria-label="Training environment" value={environment} disabled={!connected || loading}
-        onChange={event => {
-          const next = event.target.value as ChallengeEnvironment;
-          setEnvironment(next);
-          if (next === 'shared_apartment_v1') {
-            if (!['furniture_circuit', 'apartment', 'flat_kitchen', 'recharge'].includes(selected)) setSelected('furniture_circuit');
-            setOrbitTarget('table');
-          }
-        }}><option value="standalone">Standalone scenarios</option><option value="shared_apartment_v1">Shared Apartment V1</option></select></label>
-      <label><Target size={16} /> Scenario<select aria-label="Predefined challenge" value={selected} disabled={!connected || loading} onChange={event => setSelected(event.target.value as ChallengeId)}>
+        onChange={event => updateSelection({environment: event.target.value as ChallengeEnvironment})}><option value="standalone">Standalone scenarios</option><option value="shared_apartment_v1">Shared Apartment V1</option></select></label>
+      <label><Target size={16} /> Scenario<select aria-label="Predefined challenge" value={selected} disabled={!connected || loading} onChange={event => updateSelection({challenge_id: event.target.value as ChallengeId})}>
         {!shared && <option value="bench">Practice bench</option>}
         {['Navigation', 'Perception', 'Manipulation'].map(category => <optgroup label={category} key={category}>
           {presets.filter(entry => (entry.category ?? 'Navigation') === category).map(entry =>
@@ -123,14 +128,14 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
         </optgroup>)}
       </select></label>
       <label>Map source<select aria-label="Map source" value={reuseMap ? 'saved' : 'none'} disabled={!connected || loading}
-        onChange={event => setReuseMap(event.target.value === 'saved')}><option value="saved">Reuse saved environment map</option><option value="none">Start without saved map</option></select></label>
+        onChange={event => updateSelection({reuse_saved_map: event.target.value === 'saved'})}><option value="saved">Reuse saved environment map</option><option value="none">Start without saved map</option></select></label>
       {selected === 'furniture_circuit' && <>
         <label>Object<select aria-label="Object to circle" value={orbitTarget} disabled={!connected || loading}
-          onChange={event => setOrbitTarget(event.target.value as typeof orbitTarget)}>
+          onChange={event => updateSelection({orbit_target: event.target.value as typeof orbitTarget})}>
           {(shared ? ['table'] : ['table','sofa','chair','floor lamp']).map(target => <option key={target} value={target}>{target}</option>)}
         </select></label>
         <label>Direction<select aria-label="Circuit direction" value={orbitDirection} disabled={!connected || loading}
-          onChange={event => setOrbitDirection(event.target.value as typeof orbitDirection)}>
+          onChange={event => updateSelection({orbit_direction: event.target.value as typeof orbitDirection})}>
           <option value="clockwise">Clockwise</option><option value="counterclockwise">Counterclockwise</option>
         </select></label>
       </>}
@@ -152,7 +157,7 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
     {state.map_setup && <output className="scenario-map-status" aria-label="Loaded map source">{state.map_setup.map_id
       ? `${state.map_setup.name} / v${state.map_setup.revision} / ${state.map_setup.localization}`
       : state.map_setup.reuse_saved_map ? 'No saved map loaded for the current environment' : 'Current run: no saved map'}</output>}
-    <details className="challenge-details">
+    <details className="challenge-details" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
     <summary>Goal & objectives</summary>
     <p className="challenge-goal">{selected === 'furniture_circuit' && (orbitTarget !== preset?.orbit?.target || orbitDirection !== preset?.orbit?.direction)
       ? `Identify the ${orbitTarget}, drive one complete ${orbitDirection} circuit around it as quickly as safely possible, then stop for half a second. Keep the arms stowed and avoid contact.`

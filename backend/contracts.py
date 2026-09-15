@@ -193,6 +193,39 @@ class SkillFeedback(StrictModel):
     completion_source: Literal["supervisor"] | None = None
 
 
+class ObservedMapContext(StrictModel):
+    version: Literal[1] = 1
+    map_id: str
+    revision: str
+    run_id: str
+    episode_epoch: int
+    source_sequence: int
+    captured_at: float
+    age_s: float
+    geometry_updated_unix_s: float | None = None
+    geometry_source: Literal["rolling_sensor", "accumulated_sensor_map"] = "rolling_sensor"
+    frame: Literal["map", "wheel_odometry"]
+    localization: str
+    scope: Literal["local", "overview"] = "local"
+    width: int = Field(ge=1, le=96)
+    height: int = Field(ge=1, le=96)
+    resolution_m: float = Field(gt=0)
+    origin_m: list[float] = Field(min_length=2, max_length=2)
+    cells: list[Literal[-1, 0, 100]] = Field(max_length=9216)
+    robot_pose_m_rad: list[float] = Field(min_length=3, max_length=3)
+    camera_yaw_rad: float
+    destinations: list[dict] = Field(default_factory=list, max_length=24)
+    trail_m: list[list[float]] = Field(default_factory=list, max_length=128)
+    route_m: list[list[float]] = Field(default_factory=list, max_length=128)
+    note: str = "Observed geometry only; unknown is not traversable. Labels are hypotheses. Revalidate all motion."
+
+    @model_validator(mode="after")
+    def grid_shape(self):
+        if len(self.cells) != self.width * self.height:
+            raise ValueError("Observed map dimensions must match its cells")
+        return self
+
+
 class AgentObservation(StrictModel):
     run_id: str
     episode_epoch: int
@@ -210,6 +243,7 @@ class AgentObservation(StrictModel):
     navigation: NavigationFeedback | None = None
     skill: SkillFeedback | None = None
     spatial: dict | None = None
+    observed_map: ObservedMapContext | None = None
     sensor_profile: Literal["rgb_proprioception"] = "rgb_proprioception"
 
 

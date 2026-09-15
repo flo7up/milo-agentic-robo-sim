@@ -33,6 +33,12 @@ The occupied-destination task is a **safe rejection test**, not a closed-door tr
 
 ## Outcomes And Archive
 
+**Progress** is the archive's default view when an eligible standardized series exists. Choose a fixed baseline and a compatible candidate; the baseline selection persists in this browser. Each capability shows pass/planned deltas, remaining failures/blocked/invalid/missing attempts, and paired timing medians only for identical cases that passed in both runs. The series matrix keeps historical results visible. Clicking a task opens a non-passing candidate trial and its recording when available. **Run History** preserves all individual diagnostics and sessions.
+
+Only complete, finalized, unassisted frozen-code series with matching suite/map/fixture/case/evidence/runtime/settings fingerprints can be compared. Older, partial, malformed or source-drift runs stay inspectable under **Not comparable**; missing fields are not guessed. Model configuration must be recorded for real-model series. Recorded settings matching is not a causal or workload-isolation guarantee.
+
+Every full runner invocation must specify `--baseline EXISTING_RUN` or `--establish-baseline` for an explicitly new series. The candidate records `baseline_experiment_id` and writes its comparison after the entire run. Baseline validation happens before creating the output or starting physics. Any altered suite/map/fixture/runtime input is rejected. Use preflight or separately labelled diagnostics for local checks, not as replacement full-series evidence.
+
 Every planned attempt receives Passed, Failed, Blocked prerequisite, Invalid evidence, or Not run. Timeouts, sensor faults and partial returns remain failures. Missing/corrupt recordings or source drift invalidate evidence; invalid attempts are never counted as passes. No aggregate autonomy percentage is produced across heterogeneous tasks. Show per-task counts and successful-run timing separately; three nearby starts are a development baseline, not a statistical reliability estimate or held-out-layout generalization result.
 
 Each attempted robot run retains synchronized head camera, depth, observed-map snapshots, mission events and evaluator trajectory. The Test Archive displays a **Standardized benchmark baseline** table, criteria, failure reason, setup time and fingerprints. Benchmark passes are separate from scenario success and real-model results. Blocked prerequisites have reports but no fabricated motion/replay.
@@ -42,13 +48,16 @@ Each attempted robot run retains synchronized head camera, depth, observed-map s
 ```powershell
 ./.runtime/env/python.exe -m scripts.benchmark_household --stage plan
 ./.runtime/env/python.exe -m scripts.benchmark_household --stage preflight --output .runtime/performance/NEW_PREFLIGHT
-./.runtime/env/python.exe -m scripts.benchmark_household --stage run --output .runtime/performance/NEW_BASELINE
+./.runtime/env/python.exe -m scripts.benchmark_household --stage run --establish-baseline --design household-foundation-v1 --output .runtime/performance/NEW_BASELINE
+./.runtime/env/python.exe -m scripts.benchmark_household --stage run --baseline .runtime/performance/household-foundation-v1-baseline-20260914 --design CANDIDATE_LABEL --output .runtime/performance/NEW_CANDIDATE
 ./.runtime/env/python.exe -m scripts.benchmark_household --stage compare --baseline .runtime/performance/BASELINE --candidate .runtime/performance/CANDIDATE
 ```
 
 Output directories must be new. `--map-store` can select a preserved SQLite store containing the exact frozen source document; a changed source-map hash is rejected. Each run also saves the source map JSON for recovery of the original benchmark input without remapping. Comparison requires identical suite, derived map, fixture hashes and evidence type, distinct completed run IDs, and no source drift. Runtime differences are flagged. Do not modify thresholds or omit a task while calling the result the same suite.
 
 ## Baseline Status
+
+The [2026-09-15 complete candidate](../.runtime/performance/household-foundation-v1-progress-20260915/summary.md) and [audit](../.runtime/baseline-progress-review/analysis.json) retain **13 passed, 5 failed and 3 blocked**: localization 3/3, checkpoint 2/3, return 1/3, occupied rejection 3/3, exploration 2/3, Stop 2/3, and three blocked room prerequisites. Eighteen complete recordings contain 4,461 samples with zero drops or sampled contacts. All 94 source/build files stayed frozen and original inputs are unchanged. Some pass counts improve over the original negative baseline, but four tasks regress relative to the historical motion-refresh candidate. Workload and intervening source changes prevent attribution to one feature. One Stop acknowledgement took 0.593 s against 0.5 s; one checkpoint arrival had only 0.45 s of independent dwell against 0.5 s. Both remain failed. [Full context](../.runtime/baseline-progress-review/summary.md).
 
 The original baseline below is preserved. The matched [motion-refresh candidate comparison](../.runtime/mapped-motion-refresh-review/summary.md) now reports navigation, Home return, useful exploration and actual Stop 3/3 each, with localization/rejection3/3 retained and room prerequisites still blocked. Suite, map, fixtures, budgets and scoring are unchanged. This is fixed scripted-physics evidence, not a real-Luna track.
 

@@ -746,6 +746,22 @@ async def test_explicit_local_exploration_builds_draft_without_model_or_saved_ma
         await worker.close()
 
 
+def test_recorded_starting_map_distinguishes_none_draft_and_saved(tmp_path):
+    from types import SimpleNamespace
+    from backend.session_recording import map_provenance
+    from scripts.benchmark_household import digest
+    worker = SimpleNamespace(home_mission=None)
+    assert map_provenance(worker)["mode"] == "none"
+    home = HomeMap("shared_apartment_v1")
+    home.scan_count = 1
+    worker.home_mission = SimpleNamespace(home=home, localization={"status":"unlocalized"})
+    assert map_provenance(worker)["mode"] == "draft"
+    MapStore(tmp_path / "provenance.sqlite3").save(home, "Reused home")
+    result = map_provenance(worker)
+    assert result["mode"] == "saved" and result["revision"] == 1 and result["sha256"] == digest(home.document())
+    assert result["localization"] == "unlocalized"
+
+
 async def test_luna_home_dispatch_is_grounded_bounded_and_compact(tmp_path):
     import time
     from types import SimpleNamespace

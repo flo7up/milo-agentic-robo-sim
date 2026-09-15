@@ -14,6 +14,17 @@ ROOT = Path(__file__).resolve().parents[1]
 SESSION_RESULTS_ROOT = ROOT / ".runtime/performance"
 
 
+def map_provenance(worker):
+    mission = getattr(worker, "home_mission", None)
+    home = mission.home if mission else None
+    if home is None:
+        return {"mode": "none", "map_id": None, "revision": None, "sha256": None}
+    return {"mode": "saved" if home.revision else "draft", "map_id": home.identity, "name": home.name,
+        "revision": home.revision, "environment_id": home.environment_id,
+        "sha256": hashlib.sha256(json.dumps(home.document(), sort_keys=True).encode()).hexdigest(),
+        "localization": mission.localization["status"], "geometry_updates": not home.saved}
+
+
 class HomeSessionRecording:
     def __init__(self, worker, request, evidence="operator_session", directory=None):
         self.worker = worker
@@ -46,11 +57,13 @@ class HomeSessionRecording:
         def attach(sim):
             if self.worker.recorder is not None:
                 raise ValueError("Another recording already owns this worker")
+            self.manifest["home_map"] = map_provenance(self.worker)
             self.worker.recorder = self.recorder
             self.recorder.capture(self.worker)
         try:
             await asyncio.to_thread(write_recording_json, self.directory / "experiment.json", self.manifest)
             await self.worker.call(attach)
+            await asyncio.to_thread(write_recording_json, self.directory / "experiment.json", self.manifest)
             await asyncio.to_thread(self.publish)
         except BaseException:
             await self.worker.call(lambda sim: setattr(self.worker, "recorder", None) if self.worker.recorder is self.recorder else None)
@@ -147,6 +160,8 @@ def create_session(controller, worker, settings, profile):
     evidence = controller.recording_evidence
     if evidence == "real_model" and controller.model_factory is not ConfiguredModel:
         evidence = "unknown"
+    if getattr(settings, "mission_local_only", False):
+        evidence = "scripted_test"
     directory = SESSION_RESULTS_ROOT / f"browser-session-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
     challenge = worker.challenge
     case_id = challenge.id if challenge else "bench"
@@ -209,10 +224,12 @@ async def run_recorded_session(controller, worker, settings, profile, stop_revis
         directory, recorder, manifest = create_session(controller, worker, settings, profile)
 
         def attach(sim):
+            manifest["home_map"] = map_provenance(worker)
             worker.recorder = recorder
             recorder.capture(worker)
 
         await worker.call(attach)
+        await asyncio.to_thread(write_recording_json, directory / "experiment.json", manifest)
         await asyncio.to_thread(publish_live_report, directory, recorder, manifest, dict(controller.state), worker.latest.get("challenge"))
 
         async def flush_pending():

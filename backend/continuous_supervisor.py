@@ -14,6 +14,7 @@ from backend.contracts import Command, StrictModel
 from backend.continuous_navigation import ContinuousScan, ContinuousTarget, MotionSkillBudgetError, MotionSkillPlan
 from backend.navigation_memory import MEMORY_GUIDANCE, TaskProgress
 from backend.spatial import PLACE_GUIDANCE, FloorRegionTracker, PlaceSighting
+from backend.simulation import MotionError
 
 
 class SensorCondition(StrictModel):
@@ -50,7 +51,10 @@ class SensorCondition(StrictModel):
 
 
 class GuideContinuous(StrictModel):
-    action: Literal["navigate", "explore", "approach_target", "circle", "look", "turn", "scan", "wait", "wait_until", "inspect_history", "inspect_arrival", "finish", "continue", "advance_subgoal", "compose", "navigate_place", "explore_map", "explore_frontier", "cancel_task", "spatial_state", "remember_object", "observe_room"]
+    action: Literal["navigate", "explore", "approach_target", "circle", "look", "turn", "scan", "wait", "wait_until", "inspect_history", "inspect_arrival", "finish", "continue", "advance_subgoal", "compose", "navigate_place", "explore_map", "explore_frontier", "cancel_task", "spatial_state", "remember_object", "observe_room", "select_object", "approach_object", "verify_object"]
+    object_goal_id: str | None = Field(default=None, min_length=1, max_length=80)
+    approach_side: Literal["front", "left", "right"] = "front"
+    standoff_m: float = Field(default=.8, ge=.4, le=1., allow_inf_nan=False)
     room_name: str = Field(default="", max_length=80)
     return_place_id: str | None = Field(default=None, max_length=80)
     place_kind: Literal["room", "doorway"] = "room"
@@ -75,7 +79,7 @@ class GuideContinuous(StrictModel):
     circle_direction: Literal["clockwise", "counterclockwise"] = "clockwise"
     floor_target_id: str | None = Field(default=None, min_length=1, max_length=80)
     duration_s: float = Field(default=1., ge=.5, le=4.)
-    completion_mode: Literal["parking", "visual_inspection"] = "parking"
+    completion_mode: Literal["parking", "visual_inspection", "object", "saved_place"] = "parking"
     entry_confirmed: bool = False
     destination_candidate_id: int | None = Field(default=None, ge=0, le=40)
     candidate_id: int = Field(default=0, ge=0, le=40)
@@ -90,6 +94,16 @@ class GuideContinuous(StrictModel):
     def compose_requires_plan(self):
         if (self.action == "compose") != (self.skill_plan is not None):
             raise ValueError("Only compose accepts a required skill_plan")
+        if self.action in {"select_object", "verify_object"} and self.object_bounds is None:
+            raise ValueError("Object selection and verification require a current object_bounds box")
+        if self.action == "select_object" and not self.object_label.strip():
+            raise ValueError("Object selection requires a visual object_label")
+        if self.action in {"approach_object", "verify_object"} and self.object_goal_id is None:
+            raise ValueError("Use the existing object_goal_id")
+        if self.action == "finish" and self.completion_mode == "object" and self.object_goal_id is None:
+            raise ValueError("Object completion requires its object_goal_id")
+        if self.action == "finish" and self.completion_mode == "saved_place" and self.place_id is None:
+            raise ValueError("Saved-place completion requires the reached place_id")
         return self
 
 
@@ -167,7 +181,28 @@ review fresh feedback. Stop, disconnect and a new instruction invalidate pending
 """
 
 
-INSTRUCTIONS = """You direct Milo through observed rooms to satisfy the user goal.
+OBJECT_GUIDANCE = """For going beside a nearby object, use select_object with object_label and
+object_bounds around that one object in the CURRENT head image, plus standoff_m (0.4-1.0,
+default 0.8). This measures visible surfaces without motion, not the object's hidden center.
+object_goal lists stable front/left/right approach IDs, reachable or blocked, and stopping poses.
+Use approach_object(object_goal_id,approach_side) with a reachable option. The local worker
+refreshes the path toward that SAME pose without waiting for you; clearance or expired sensing
+can still stop it. Do not keep selecting the object again or silently switch approach sides.
+After awaiting_object_verification, identify the SAME object in the NEW current image and
+use verify_object(object_goal_id,object_bounds). This checks fresh surface association,
+distance, facing direction and stopped dwell; it does not independently recognize identity.
+If association is uncertain, inspect or explicitly select a new goal. Moving objects are not
+automatically tracked. Unknown/blocked approaches require another observed view or option.
+After object_arrival_verified, finish(completion_mode=object,object_goal_id,entry_confirmed=true)
+is appropriate ONLY for an object-only task. For a requested return, advance_subgoal and
+navigate_place(Home). After its completed task, use finish(completion_mode=saved_place,
+place_id=Home,entry_confirmed=true). These two explicit completion modes do not require a
+room-floor reference. Do not use them to certify unrelated room, parking or circuit tasks.
+Object approaches currently use the Built-in controller; they are unavailable with Nav2.
+"""
+
+
+INSTRUCTIONS = OBJECT_GUIDANCE + """You direct Milo through observed rooms to satisfy the user goal.
 Reason and memory are optional commentary; keep them concise. They do not authorize motion.
 Use next_subgoal only with advance_subgoal, whose evidence and transition checks remain required.
 An ordinary motion lease can expire without ending the task: the worker stops, discards old
@@ -730,6 +765,42 @@ async def execute_home_capability(controller, worker, settings, guide, sensor, s
     return await worker.home_state(compact=True)
 
 
+async def execute_object_capability(controller, worker, settings, guide, sensor, stop_revision, task_revision):
+    controller._check_live(worker, settings)
+    if settings.navigation_backend != "builtin":
+        raise ValueError("Object approach requires the explicitly selected Built-in controller")
+    actions = {"select_object": "select", "approach_object": "approach", "verify_object": "verify"}
+    result = await worker.object_command(sensor, actions[guide.action], stop_revision, task_revision,
+        goal_id=guide.object_goal_id, bounds=guide.object_bounds, label=guide.object_label,
+        standoff_m=guide.standoff_m, approach=guide.approach_side)
+    if guide.action == "approach_object":
+        while result["motion_started"] and worker.continuous and worker.continuous.active:
+            controller._check_live(worker, settings)
+            await asyncio.sleep(.05)
+        controller._check_live(worker, settings)
+        if result["motion_started"] and worker.continuous and worker.continuous.status != "arrived":
+            return {"status": "blocked", "motion_authorized": False, "reason": worker.continuous.reason}
+        observation, _ = await worker.feedback()
+        angle = result["target_pose_m_rad"][2] - observation.odometry_m_rad[2]
+        angle = math.atan2(math.sin(angle), math.cos(angle))
+        if abs(angle) > .035:
+            await rotate(controller, worker, settings, stop_revision, angle)
+        controller._check_live(worker, settings)
+        await rotate(controller, worker, settings, stop_revision, 2 * math.pi, panoramic=True, pitch=.85)
+        controller._check_live(worker, settings)
+        observation, _ = await worker.feedback()
+        reply = await worker.execute(Command(run_id=settings.run_id, episode_epoch=settings.episode_epoch,
+            observation_seq=observation.seq, action_id=str(uuid4()), tool="set_head",
+            arguments={"yaw_rad": 0., "pitch_rad": .2, "duration_s": 1.}), assisted=False)
+        if reply.status != "ok":
+            raise ValueError(reply.message)
+        sensor, _, _, _ = await worker.continuous_candidates()
+        controller._check_live(worker, settings)
+        result = await worker.object_command(sensor, "ready", stop_revision, task_revision, goal_id=guide.object_goal_id)
+    controller._check_live(worker, settings)
+    return result
+
+
 async def run(controller, worker, settings, model, profile, stop_revision):
     from backend.agent import feedback_message
     if not await worker.resume_manual(expected_stop_revision=stop_revision):
@@ -808,6 +879,7 @@ async def run(controller, worker, settings, model, profile, stop_revision):
         panorama = nearby_panorama(panorama, observation)
         episode_memory = controller.navigation_memory.observe(observation)
         progress_feedback = task_progress.observe(observation)
+        object_feedback = await worker.object_state()
         parking = await worker.parking_clearance(floor_target)
         parking["destination_surface_match"] = matching_floor(parking["floor_rgb"], destination_floor)
         position = observation.odometry_m_rad
@@ -838,6 +910,7 @@ async def run(controller, worker, settings, model, profile, stop_revision):
         controller._check_live(worker, settings)
         message = feedback_message(observation, annotated)
         message["content"].append({"type": "input_text", "text": json.dumps({"reachable_floor_candidates": candidates,
+            "object_goal": object_feedback,
             "floor_regions": regions, "selected_floor_target": floor_target,
             "memory": memory, "arrival_inspected": finish_checked, "current_parking": parking,
             "task_progress": progress_feedback,
@@ -872,6 +945,7 @@ async def run(controller, worker, settings, model, profile, stop_revision):
         task_revision = worker.task_revision
         controller.state.update(phase="thinking", turns=turn + 1, last_feedback_at=time.time())
         controller._trace("feedback", "Continuous navigation camera + sensors", {"observation": observation.model_dump(),
+            "object_goal": object_feedback,
             "task_progress": progress_feedback,
             "decision_validation": decision_validation,
             "measured_episode_memory": episode_memory, "place_sightings": sightings,
@@ -972,6 +1046,18 @@ async def run(controller, worker, settings, model, profile, stop_revision):
             memory += " Historical inspection finished. Select movement or completion only after this new current view; old image coordinates are not actionable."
             controller._trace("policy", "Historical motion selection deferred", {"action": guide.action, "frame_id": historical_original[0]["frame_id"], "reason": memory})
             continue
+        if guide.action in {"select_object", "approach_object", "verify_object"}:
+            controller.state.update(phase="acting", message=guide.reason)
+            try:
+                last_execution = await execute_object_capability(controller, worker, settings, guide, sensor, stop_revision, task_revision)
+            except (ValueError, MotionError) as error:
+                last_execution = {"status": "rejected", "reason": str(error), "motion_authorized": False}
+            controller._check_live(worker, settings)
+            controller.navigation_reply(guide.reason)
+            controller._trace("policy", "Object approach feedback", last_execution)
+            history.extend([{"role": "assistant", "content": [{"type": "output_text", "text": json.dumps(guide.model_dump())}]},
+                {"role": "user", "content": [{"type": "input_text", "text": json.dumps(last_execution)}]}])
+            continue
         if guide.action in {"navigate_place", "explore_map", "explore_frontier", "cancel_task", "spatial_state", "remember_object", "observe_room"}:
             controller.state.update(phase="acting", message=guide.reason)
             try:
@@ -1071,6 +1157,31 @@ async def run(controller, worker, settings, model, profile, stop_revision):
             if (worker.latest.get("challenge") or {}).get("id") == "furniture_circuit":
                 memory = "Circling is not a room-entry task. Identify the requested object and use circle; the independent circuit scorer ends the scenario after a full lap and rest."
                 continue
+            if guide.completion_mode in {"object", "saved_place"}:
+                try:
+                    if guide.action != "finish" or not guide.entry_confirmed:
+                        raise ValueError("Use explicit finish with entry_confirmed after the task-specific arrival check")
+                    if guide.completion_mode == "object":
+                        state = await worker.object_state()
+                        if not state or state["goal_id"] != guide.object_goal_id or not state.get("arrival_valid"):
+                            raise ValueError("Fresh object arrival verification is required at this pose")
+                        clearance = await worker.parking_clearance(stationary_request=settings)
+                        if not clearance["parking_margin_ok"]:
+                            raise ValueError("Object stopping footprint lacks fresh parking clearance")
+                        last_execution = {"status": "object_goal_completed", "goal_id": guide.object_goal_id}
+                    else:
+                        last_execution = await worker.verify_saved_place(guide.place_id, stop_revision, task_revision)
+                    controller._check_live(worker, settings)
+                except (ValueError, MotionError) as error:
+                    last_execution = {"status": "rejected", "reason": str(error), "motion_authorized": False}
+                    controller._trace("policy", "Task-specific completion rejected", last_execution)
+                    if record_inspection_progress(controller, task_progress, str(error)):
+                        return
+                    continue
+                controller._trace("policy", "Task-specific completion", last_execution)
+                controller.state["phase"] = "completed"
+                controller._set_outcome("completed", guide.reason, "agent")
+                return
             if floor_target_id is not None and guide.completion_mode == "parking":
                 if floor_target is None:
                     finish_checked = False

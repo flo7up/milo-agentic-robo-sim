@@ -211,7 +211,7 @@ async def attempt(options, directory, task, resources, hashes):
                     turns=controller.state["turns"], room_observations=len(state.get("room_observations", [])))
                 await capture()
             elif task["id"] == "survey":
-                await command("explore", time_budget=task["budget_s"])
+                await command("start_exploration" if getattr(options, "local_exploration", False) else "explore", time_budget=task["budget_s"])
                 while worker.home_mission.active:
                     await asyncio.sleep(.1)
                 metrics["mission"] = dict(worker.home_mission.task)
@@ -299,6 +299,8 @@ async def run(options):
     read_map(options.original_map)
     options.output.mkdir(parents=True, exist_ok=False)
     design = design_snapshot("room-memory-v1-" + options.stage)
+    if getattr(options, "local_exploration", False):
+        design["label"] = "sensor-frontier-exploration-v1-diagnostic"
     with sqlite3.connect(f"file:{options.map_store.resolve().as_posix()}?mode=ro", uri=True) as connection:
         input_map = json.loads(connection.execute("SELECT document FROM maps WHERE map_id=?", (MAP_ID,)).fetchone()[0])
     tasks = [{"id": "survey", "title": "Sensor-only working-map expansion", "budget_s": options.budget}] if options.stage == "survey" else list(TASKS)
@@ -306,7 +308,7 @@ async def run(options):
         "finished_at": None, "evidence": "scripted_test", "mode": "home_mapping", "stage": "spatial_workflow", "design": design,
         "suite": definition() if options.stage == "run" else None, "suite_sha256": digest(definition()) if options.stage == "run" else None,
         "map_document_sha256": digest(input_map), "derived_map_sha256": digest(input_map),
-        "map_id": MAP_ID, "map_revision": input_map["revision"],
+        "map_id": MAP_ID, "map_revision": input_map["revision"], "local_exploration": getattr(options, "local_exploration", False),
         "cases": planned_cases(tasks)}
     write_recording_json(options.output / "input-map.json", input_map)
     results = []
@@ -342,7 +344,10 @@ if __name__ == "__main__":
     parser.add_argument("--map-store", type=Path, default=Path(".runtime/maps/homes.sqlite3"))
     parser.add_argument("--original-map", type=Path, default=Path(".runtime/maps/homes.sqlite3"))
     parser.add_argument("--budget", type=float, default=180.)
+    parser.add_argument("--local-exploration", action="store_true")
     options = parser.parse_args()
+    if options.local_exploration and options.stage != "survey":
+        parser.error("--local-exploration requires --stage survey")
     if not 1 <= options.budget <= 300:
         parser.error("Survey budget must be 1-300 seconds")
     print(json.dumps(asyncio.run(run(options)), indent=2))

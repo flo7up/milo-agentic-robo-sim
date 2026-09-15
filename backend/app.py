@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -12,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.agent import AgentController, AgentStart, ChatStart, FeedbackRate, FoundryConfig, InteractionMode, RunInstruction, robot_tools
 from backend.challenges import ChallengeLoad, PRESETS, furniture_circuit, get_challenge, shared_apartment
-from backend.contracts import Command, ManualPlacement, SpatialSettings, tool_schemas
+from backend.contracts import Command, ManualPlacement, SpatialSettings, StrictModel, tool_schemas
 from backend.continuous_navigation import ContinuousScan, ContinuousTarget
 from backend.local_progress import read_navigation_progress
 from backend.local_navigation import ResidentNavigationModel
@@ -24,6 +25,7 @@ from backend.simulation import MotionError
 from backend.worker import SimulationWorker
 from backend.ros_navigation import RosBridgeStatus, RosGoalResult, RosStart, RosVelocity
 from backend.home_mission import HomeRequest
+from backend.preferences import PreferenceStore, PreferencesPatch
 
 
 class Lab:
@@ -44,6 +46,9 @@ class Lab:
         self.interaction_mode = "chat"
         self.home_recording = None
         self.reuse_saved_map = True
+        self.preference_error = None
+        self.power_off_pending = False
+        self.robot_on = True
 
     async def finish_home_recording(self, reason=None):
         recording = self.home_recording
@@ -55,7 +60,8 @@ class Lab:
     def state(self):
         mission = self.worker.home_mission
         home = mission.home if mission else None
-        return {**self.worker.latest, "agent": self.agent.public(), "realtime": self.realtime_config.public(),
+        return {**self.worker.latest, "power": self.worker.power_state(), "agent": self.agent.public(), "realtime": self.realtime_config.public(),
+            "preference_error": self.preference_error,
             "map_setup": {"reuse_saved_map": self.reuse_saved_map, "map_id": home.identity if home else None,
                 "name": home.name if home else None, "revision": home.revision if home else None,
                 "localization": mission.localization["status"] if mission else "unlocalized"},
@@ -95,6 +101,8 @@ class Lab:
             if spatial_enabled:
                 await replacement.configure_spatial(SpatialSettings(run_id=replacement.latest["run_id"],
                     episode_epoch=self.epoch, enabled=True))
+            if not self.robot_on:
+                await replacement.set_power(False)
             self.worker = replacement
             self.challenge_id = selected
             self.environment = layout
@@ -116,6 +124,7 @@ lab = Lab()
 
 @asynccontextmanager
 async def lifespan(app):
+    lab.robot_on = True
     load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
     load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
     configuration_error = None
@@ -125,7 +134,18 @@ async def lifespan(app):
     except ValueError:
         lab.agent = AgentController(local_navigation_factory=lab.local_navigation)
         configuration_error = "Invalid Foundry configuration. Check the endpoint and model profiles."
-    await lab.reset("bench", reuse_saved_map=True)
+    lab.preference_error = None
+    try:
+        saved_scene = (await asyncio.to_thread(PreferenceStore().read))["scene"]
+    except (OSError, sqlite3.Error, ValueError):
+        saved_scene = None
+        lab.preference_error = "Saved preferences are unavailable; the original store was left unchanged."
+    selection = ChallengeLoad.model_validate(saved_scene or {"challenge_id": "bench"})
+    await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction,
+        selection.environment, selection.reuse_saved_map)
+    if saved_scene is not None:
+        lab.worker.stop()
+        await lab.worker.hold_stopped()
     try:
         lab.realtime_config = RealtimeConfig.from_environment()
     except ValueError:
@@ -156,10 +176,14 @@ async def local_origin_guard(request: Request, call_next):
     origin = request.headers.get("origin")
     if origin and origin not in {f"http://{request.headers.get('host')}", f"https://{request.headers.get('host')}"}:
         return Response("Same-origin access required", status_code=403)
+    if request.method == "POST" and lab.worker and not lab.worker.powered and request.url.path not in {
+            "/api/power", "/api/stop", "/api/command", "/api/reset", "/api/challenges/load", "/api/preferences",
+            "/api/agent/config", "/api/voice/config"}:
+        return JSONResponse({"detail": "Turn the robot on before starting work"}, status_code=409)
     ros = getattr(lab.worker, "ros_navigation", None)
     if request.method == "POST" and ros and ros.active and request.url.path not in {
             "/api/ros/velocity", "/api/ros/heartbeat", "/api/ros/result", "/api/agent/instruction",
-            "/api/stop", "/api/resume", "/api/agent/takeover", "/api/reset", "/api/challenges/load"}:
+            "/api/power", "/api/stop", "/api/resume", "/api/agent/takeover", "/api/reset", "/api/challenges/load", "/api/preferences"}:
         return Response("Stop ROS navigation before changing control", status_code=409)
     response = await call_next(request)
     if request.url.path in {"/", "/index.html"}:
@@ -170,6 +194,22 @@ async def local_origin_guard(request: Request, call_next):
 @app.get("/api/state")
 async def state():
     return lab.state()
+
+
+@app.get("/api/preferences")
+async def read_preferences():
+    try:
+        return JSONResponse(await asyncio.to_thread(PreferenceStore().read), headers={"Cache-Control": "no-store"})
+    except (OSError, sqlite3.Error, ValueError):
+        raise HTTPException(503, "Saved preferences are unavailable; the original store was left unchanged.") from None
+
+
+@app.post("/api/preferences")
+async def save_preferences(patch: PreferencesPatch):
+    try:
+        return await asyncio.to_thread(PreferenceStore().update, patch)
+    except (OSError, sqlite3.Error, ValueError):
+        raise HTTPException(503, "Preferences could not be saved.") from None
 
 
 @app.get("/api/test-variant")
@@ -506,6 +546,8 @@ async def command(envelope: Command):
         await lab.agent.halt()
         lab.worker.stop()
         return await lab.worker.execute(envelope)
+    if not lab.worker.powered:
+        raise HTTPException(409, "Turn the robot on before starting work")
     if lab.agent.active or lab.lock.locked() or lab.worker.latest.get("busy"):
         raise HTTPException(409, "Take manual control before issuing a command; another controller is active")
     async with lab.lock:
@@ -522,6 +564,41 @@ async def place_robot(placement: ManualPlacement):
             lab.agent.navigation_memory.bind(placement.run_id, placement.episode_epoch, reset=True)
         except MotionError as error:
             raise HTTPException(409 if error.code in {"STALE_STATE", "CANCELLED", "OBJECT_HELD"} else 422, str(error)) from error
+    return lab.state()
+
+
+class RobotPower(StrictModel):
+    run_id: str
+    episode_epoch: int
+    on: bool
+
+
+@app.post("/api/power")
+async def power(settings: RobotPower):
+    worker = lab.worker
+    if settings.run_id != worker.latest["run_id"] or settings.episode_epoch != worker.epoch:
+        raise HTTPException(409, "Power request belongs to another episode")
+    if not settings.on:
+        if lab.power_off_pending:
+            raise HTTPException(409, "Robot power-off is already in progress")
+        lab.power_off_pending = True
+        lab.robot_on = False
+        lab.agent.interrupt("Robot powered off")
+        try:
+            await worker.set_power(False)
+            await lab.agent.halt("Robot powered off")
+            await lab.finish_home_recording("powered_off")
+            await lab.local_navigation.close()
+        finally:
+            lab.power_off_pending = False
+    else:
+        if lab.lock.locked() or lab.power_off_pending:
+            raise HTTPException(409, "Wait for the episode transition to finish")
+        async with lab.lock:
+            if worker is not lab.worker or lab.power_off_pending:
+                raise HTTPException(409, "Power request invalidated by an episode or power transition")
+            await worker.set_power(True)
+            lab.robot_on = worker.powered
     return lab.state()
 
 
@@ -562,7 +639,13 @@ async def challenges(environment: Literal["standalone", "shared_apartment_v1"] =
 async def load_challenge(selection: ChallengeLoad):
     lab.worker.stop()
     await lab.agent.halt("Challenge changed")
-    return await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction, selection.environment, selection.reuse_saved_map)
+    await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction, selection.environment, selection.reuse_saved_map)
+    try:
+        await asyncio.to_thread(PreferenceStore().save_scene, selection)
+        lab.preference_error = None
+    except (OSError, sqlite3.Error, ValueError):
+        lab.preference_error = "The scene loaded, but its startup selection could not be saved."
+    return lab.state()
 
 
 @app.get("/api/agent")
@@ -632,6 +715,24 @@ async def run_instruction(instruction: RunInstruction):
             raise HTTPException(409, str(error)) from error
 
 
+@app.get("/api/mission/capabilities")
+async def mission_capabilities():
+    from backend.experiment_variants import variant_snapshot
+    settings = AgentStart(run_id="capability", episode_epoch=0, execution_mode="luna_continuous", goal="capability",
+        unified_mission=True, images_per_request=2)
+    return {"version": 1, "unified_mission": True, "observed_map_version": 1, "backends": ["builtin"],
+        "task_kinds": ["explore", "object", "room", "place"], "image_slots": 2,
+        "review_policy": "bounded_stopped_checkpoints", "qualification": "experimental",
+        "architecture": variant_snapshot(settings, None)["architecture"]}
+
+
+@app.post("/api/mission/start")
+async def start_mission(settings: AgentStart):
+    if not settings.unified_mission:
+        raise HTTPException(422, "The mission endpoint requires unified_mission=true")
+    return await start_agent(settings)
+
+
 @app.post("/api/agent/start")
 async def start_agent(settings: AgentStart):
     if lab.interaction_mode != "chat":
@@ -689,7 +790,7 @@ async def voice_session(socket: WebSocket):
         if len(raw) > 1024:
             raise ValueError("Invalid voice start request")
         settings = VoiceStart.model_validate_json(raw)
-        if lab.lock.locked() or not lab.connections or lab.interaction_mode != "voice":
+        if not lab.worker.powered or lab.lock.locked() or not lab.connections or lab.interaction_mode != "voice":
             raise ValueError("Keep the robot view connected and wait for manual motion to finish")
         async with lab.lock:
             if settings.run_id != lab.worker.latest["run_id"] or settings.episode_epoch != lab.worker.latest["episode_epoch"]:
@@ -747,7 +848,7 @@ async def live(socket: WebSocket):
     try:
         while True:
             await socket.send_json(lab.state())
-            await asyncio.sleep(.05)
+            await asyncio.sleep(.05 if lab.worker.power_state()["mode"] == "working" else 1.)
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:

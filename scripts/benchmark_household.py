@@ -119,7 +119,29 @@ def argument_parser():
     parser.add_argument("--map-store", type=Path)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--establish-baseline", action="store_true")
+    parser.add_argument("--design", default="household-candidate")
     return parser
+
+
+def validate_baseline(options, definition, document, fixtures):
+    if options.stage != "run":
+        return None
+    establish = getattr(options, "establish_baseline", False)
+    if bool(options.baseline) == establish:
+        raise ValueError("Choose --baseline EXISTING_RUN or --establish-baseline for a full series")
+    if establish:
+        return None
+    from backend.saved_results import saved_results
+    candidate = options.baseline.resolve()
+    batch = next((batch for batch in saved_results(candidate.parent)["batches"] if batch["name"] == candidate.name), None)
+    if not batch or not (batch.get("benchmark") or {}).get("comparison", {}).get("eligible"):
+        raise ValueError("Baseline must be a complete, frozen, comparable benchmark series")
+    manifest = json.loads((candidate / "experiment.json").read_text(encoding="utf-8"))
+    for key, value in (("suite_sha256", digest(definition)), ("derived_map_sha256", digest(document)), ("fixture_sha256", digest(fixtures))):
+        if manifest.get(key) != value:
+            raise ValueError("Baseline input mismatch: " + key)
+    return manifest
 
 
 def read_map(path):
@@ -479,14 +501,18 @@ async def run_suite(options):
     map_path = options.map_store or DEFAULT_MAP_PATH
     source_document = read_map(map_path)
     document = benchmark_map(source_document)
-    options.output.mkdir(parents=True, exist_ok=False)
-    design = design_snapshot(SUITE_ID + ("-preflight" if options.stage == "preflight" else "-baseline"))
+    design = design_snapshot(getattr(options, "design", "household-candidate") + ("-preflight" if options.stage == "preflight" else "-baseline" if getattr(options, "establish_baseline", False) else ""))
     cases = planned_cases(definition)
     for case in cases:
         challenge, _ = fixture(case)
         case["challenge_sha256"] = digest(challenge.model_dump())
+    baseline = validate_baseline(options, definition, document, [case["challenge_sha256"] for case in cases])
+    if baseline and baseline["design"]["runtime"] != design["runtime"]:
+        raise ValueError("Baseline runtime differs; establish a separate series instead of claiming a matched comparison")
+    options.output.mkdir(parents=True, exist_ok=False)
     manifest = {"schema_version": 2, "experiment_id": str(uuid4()), "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None, "mode": "home_mapping", "stage": "spatial_workflow", "evidence": "scripted_test",
+        "baseline_experiment_id": baseline["experiment_id"] if baseline else None,
         "supervisor_deployment": "None", "suite": definition, "suite_sha256": digest(definition),
         "derived_map_sha256": digest(document), "fixture_sha256": digest([case["challenge_sha256"] for case in cases]),
         "cases": cases, "design": design, "preflight_only": options.stage == "preflight", "workload_before": workload_snapshot(),
@@ -531,6 +557,9 @@ async def run_suite(options):
         (options.output / "summary.md").write_text(markdown_report(summary, results), encoding="utf-8")
     if manifest["source_changed_during_run"] or not manifest["original_map_unchanged"]:
         raise RuntimeError("Run is not eligible as a frozen baseline; input drift retained in manifest")
+    if baseline:
+        comparison = compare_runs(options.baseline, options.output)
+        write_recording_json(options.output / "comparison.json", comparison)
     return summary
 
 

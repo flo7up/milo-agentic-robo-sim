@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { CircleStop, Maximize2, RefreshCw, X } from 'lucide-react';
+import { Camera, Maximize2, RefreshCw, X } from 'lucide-react';
+import { RobotControlSlot } from './RobotControlSurface';
 import type { CameraFrame } from './types';
 
-export function HeadCamera({ frame, connected = true, onStop }: { frame: CameraFrame; connected?: boolean; onStop: () => void }) {
+export function HeadCamera({ frame, connected = true, compact = false }: { frame: CameraFrame; connected?: boolean; compact?: boolean }) {
   const latest = useRef(frame);
   latest.current = frame;
   const refresh = useRef<(force?: boolean) => void>(() => {});
@@ -100,7 +101,8 @@ export function HeadCamera({ frame, connected = true, onStop }: { frame: CameraF
   return <>
     <div className="camera-frame">{displayed && <img alt="Authoritative robot head camera" src={displayed.url}
       data-frame={displayed.frame.frame_ref} data-simulated-time={displayed.frame.simulated_time_s} />}
-      {!displayed && <div className="camera-empty" role="status">{!connected ? 'Camera disconnected' : error ? 'Reconnecting camera...' : 'Loading robot camera...'}</div>}
+      {!displayed && <div className="camera-empty" role="status" aria-label={!connected ? 'Camera disconnected' : error ? 'Reconnecting camera' : 'Loading robot camera'}>
+        {compact ? <Camera size={20} /> : !connected ? 'Camera disconnected' : error ? 'Reconnecting camera...' : 'Loading robot camera...'}</div>}
       <button className="icon-button camera-expand" type="button" aria-label="Expand robot camera" title="Expand robot camera"
         onClick={() => setExpanded(true)}><Maximize2 size={19} /></button>
     </div>
@@ -108,9 +110,9 @@ export function HeadCamera({ frame, connected = true, onStop }: { frame: CameraF
     {error && connected && <div className="exchange-error" role="alert"><span>Camera reconnecting</span><button className="icon-button" type="button" aria-label="Retry live camera" title="Retry live camera" onClick={() => refresh.current(true)}><RefreshCw size={16} /></button></div>}
     <dialog ref={dialog} className="robot-camera-dialog" aria-label="Robot camera" onClose={() => setExpanded(false)}>
       <div className="robot-camera-toolbar"><h3>Robot camera</h3><span role="status">{!connected ? 'Disconnected / last frame' : error ? 'Camera reconnecting / last frame' : 'Live head view'}</span>
-        <button className="stop-button" type="button" disabled={!connected} onClick={onStop}><CircleStop size={18} /> Stop</button>
         <button className="icon-button" type="button" aria-label="Close robot camera" title="Close robot camera" onClick={() => setExpanded(false)}><X size={19} /></button>
       </div>
+      <RobotControlSlot active={expanded} />
       <div className="robot-camera-expanded-image">{displayed ? <img alt="Expanded robot head camera" src={displayed.url}
         data-frame={displayed.frame.frame_ref} data-simulated-time={displayed.frame.simulated_time_s} /> : <p role="status">Waiting for the robot camera...</p>}</div>
       <div className="camera-meta"><span>{displayed ? `${displayed.width} x ${displayed.height}` : '-'} / 65 deg</span><span>Frame {displayed?.frame.seq ?? '-'} / {displayed?.frame.simulated_time_s.toFixed(2) ?? '0.00'} s</span></div>
