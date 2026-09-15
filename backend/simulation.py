@@ -493,16 +493,53 @@ class BulletSimulation:
         position, orientation = bullet.getBasePositionAndOrientation(self.robot, physicsClientId=self.client)
         rotation = np.array(bullet.getMatrixFromQuaternion(orientation)).reshape(3, 3)
         corners = []
+        if not hasattr(self, "footprint_geometry"):
+            self.footprint_geometry = {}
         for index in [-1, *self.joints.values()]:
-            lower, upper = bullet.getAABB(self.robot, index, physicsClientId=self.client)
+            if index not in self.footprint_geometry:
+                points = []
+                mesh_margin = 0.
+                for shape in bullet.getCollisionShapeData(self.robot, index, physicsClientId=self.client):
+                    shape_type, dimensions = shape[2:4]
+                    if shape_type == bullet.GEOM_MESH:
+                        vertices = bullet.getMeshData(self.robot, index, flags=bullet.MESH_DATA_SIMULATION_MESH,
+                            physicsClientId=self.client)[1]
+                        if not vertices:
+                            raise ValueError("Robot collision mesh has no footprint geometry")
+                        points.extend(vertices)
+                        mesh_margin = max(mesh_margin, bullet.getDynamicsInfo(self.robot, index, physicsClientId=self.client)[11])
+                        continue
+                    if shape_type == bullet.GEOM_BOX:
+                        extent = np.asarray(dimensions) / 2
+                    elif shape_type == bullet.GEOM_SPHERE:
+                        extent = np.repeat(dimensions[0], 3)
+                    elif shape_type in {bullet.GEOM_CYLINDER, bullet.GEOM_CAPSULE}:
+                        extent = np.array([dimensions[1], dimensions[1], dimensions[0] / 2])
+                        if shape_type == bullet.GEOM_CAPSULE:
+                            extent[2] += dimensions[1]
+                    else:
+                        raise ValueError("Unsupported robot collision shape for footprint")
+                    local_rotation = np.array(bullet.getMatrixFromQuaternion(shape[6])).reshape(3, 3)
+                    for horizontal in (-extent[0], extent[0]):
+                        for lateral in (-extent[1], extent[1]):
+                            for height in (-extent[2], extent[2]):
+                                points.append(np.array([horizontal, lateral, height]) @ local_rotation.T + shape[5])
+                self.footprint_geometry[index] = (np.asarray(points).reshape(-1, 3), mesh_margin)
+            local_points, margin = self.footprint_geometry[index]
+            if not len(local_points):
+                continue
+            link_position, link_orientation = (position, orientation) if index == -1 else bullet.getLinkState(
+                self.robot, index, computeForwardKinematics=True, physicsClientId=self.client)[:2]
+            link_rotation = np.array(bullet.getMatrixFromQuaternion(link_orientation)).reshape(3, 3)
+            points = (local_points @ link_rotation.T + link_position - position) @ rotation
+            lower, upper = points.min(axis=0) - margin, points.max(axis=0) + margin
             for horizontal in (lower[0], upper[0]):
                 for lateral in (lower[1], upper[1]):
-                    for height in (lower[2], upper[2]):
-                        corners.append((np.array([horizontal, lateral, height]) - position) @ rotation)
+                    corners.append([horizontal, lateral, 0.])
         corners = np.array(corners)
         return {"lower_xy_m": corners[:, :2].min(axis=0).tolist(), "upper_xy_m": corners[:, :2].max(axis=0).tolist(),
             "radius_m": float(np.linalg.norm(corners[:, :2], axis=1).max()), "frame": "robot_base",
-            "method": "Conservative union of current robot link collision bounds"}
+            "method": "Conservative union of robot-frame collision-shape bounds including margins"}
 
     def capture_spatial(self, sequence):
         from scipy.ndimage import binary_dilation

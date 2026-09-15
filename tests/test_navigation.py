@@ -89,6 +89,35 @@ def test_supervisor_clearance_pause_still_brakes_and_invalidates_pending_motion(
         sim.close()
 
 
+@pytest.mark.parametrize("status", ["cancelled", "failed"])
+def test_navigation_tick_preserves_revocation_inside_physics_callback(status):
+    from backend.challenges import get_challenge
+    from backend.navigation import NavigationRuntime
+    from backend.simulation import BulletSimulation, MotionError
+    from scripts.navigation_policy import apply
+    sim = BulletSimulation(challenge=get_challenge("park"), width=160, height=120, rendering="tiny")
+    runtime = NavigationRuntime(clock=lambda: sim.ticks / 240)
+    try:
+        apply(runtime, sim, "begin_local_subgoal", {"goal": "Exercise callback revocation"})
+        apply(runtime, sim, "replace_motion_buffer", {"segments": [
+            {"kind": "drive", "linear_mps": .15, "angular_radps": 0., "duration_s": 1.}]})
+        revision = runtime.revision
+        reason = "Objective authorization expired during physics publication"
+        sim.ticks = 6
+        sim.on_tick = lambda: getattr(runtime, "cancel" if status == "cancelled" else "fail")(sim, reason)
+        runtime.tick(sim)
+        assert sim.ticks == 12
+        assert runtime.status == status and runtime.reason == reason
+        assert runtime.revision == revision + 1 and not runtime.buffer and not runtime.tickets
+        assert not runtime.velocity.any() and sim.cancel.is_set() == (status == "failed")
+        runtime.tick(sim)
+        assert sim.ticks == 12 and runtime.revision == revision + 1
+        with pytest.raises(MotionError):
+            runtime.validate_ticket(sim, 0, revision)
+    finally:
+        sim.close()
+
+
 @pytest.mark.parametrize("recover", [False, True])
 @pytest.mark.parametrize("phase", ["before_tick", "during_tick", "stop"])
 def test_motion_lease_expiry_brakes_without_reviving_authority(recover, phase):

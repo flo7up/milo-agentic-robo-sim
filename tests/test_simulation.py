@@ -274,6 +274,26 @@ def test_travel_posture_reduces_footprint_through_real_joint_motion():
             sim.close()
 
 
+def test_robot_footprint_does_not_grow_when_only_base_heading_changes():
+    from backend.robot import TRAVEL
+    sim = BulletSimulation(width=160, height=120)
+    try:
+        for side in ("left", "right"):
+            assert command(sim, "set_arm_joints", arm=side, joint_positions_rad=TRAVEL, duration_s=2).status == "ok"
+        position, orientation = bullet.getBasePositionAndOrientation(sim.robot, physicsClientId=sim.client)
+        measured = []
+        for heading in (0., .08, .4, .8, 1.5, 3.1):
+            bullet.resetBasePositionAndOrientation(sim.robot, position, bullet.getQuaternionFromEuler([0., 0., heading]),
+                physicsClientId=sim.client)
+            measured.append(sim.robot_footprint())
+        for footprint in measured[1:]:
+            assert footprint["radius_m"] == pytest.approx(measured[0]["radius_m"], abs=1e-6)
+            np.testing.assert_allclose(footprint["lower_xy_m"], measured[0]["lower_xy_m"], atol=1e-6)
+            np.testing.assert_allclose(footprint["upper_xy_m"], measured[0]["upper_xy_m"], atol=1e-6)
+    finally:
+        sim.close()
+
+
 def test_spatial_depth_invalid_and_self_pixels_are_not_free_space():
     from backend.contracts import SpatialObservation
     from backend.spatial import calibration, metric_depth, point_cloud

@@ -187,7 +187,7 @@ class HomeMap:
         return {"connections": connections, "truncated": len(self.edges) > limit,
             "claim": "Path clearance only; room identity and doorway opening are separate observations"}
 
-    def frontiers(self, pose, radius_m, obstacles=(), region_id=None):
+    def frontiers(self, pose, radius_m, obstacles=(), region_id=None, *, excluded=()):
         allowed = self.allowed(radius_m, obstacles)
         position = self.indices(pose[:2])
         components, _ = label(allowed)
@@ -202,23 +202,31 @@ class HomeMap:
             if region is None:
                 raise ValueError("UNKNOWN_REGION: select a named room or the whole mapped area")
         result = []
+        known = int(np.count_nonzero(self.evidence))
         for group_id in range(1, count + 1):
             rows, columns = np.where(groups == group_id)
             if len(rows) < 3:
                 continue
             points = self.origin + (np.column_stack((columns, rows)) + .5) * self.resolution_m
             distances = np.linalg.norm(points - pose[:2], axis=1)
-            selected = int(np.argmin(distances + self.visits[rows, columns] * .2))
-            point = points[selected].tolist()
-            if region and math.dist(point, region["pose_m_rad"][:2]) > 3.:
-                continue
-            key = ":".join(str(int(math.floor(value / .5))) for value in point)
-            previous = self.frontier_attempts.get(key, {})
-            known = int(np.count_nonzero(self.evidence))
-            if previous.get("attempts", 0) >= 2 and known - previous.get("known_cells", known) < 25:
-                continue
-            result.append({"frontier_id": key, "position_m": point, "distance_m": float(distances[selected]),
-                "attempts": previous.get("attempts", 0), "region_scope": "within_3m_of_room_annotation" if region else "all_connected"})
+            headings = np.arctan2(points[:, 1] - pose[1], points[:, 0] - pose[0]) - pose[2]
+            turns = np.abs(np.arctan2(np.sin(headings), np.cos(headings)))
+            scores = np.abs(distances - 1.) + .4 * turns + self.visits[rows, columns] * .2
+            for selected in np.argsort(scores):
+                if distances[selected] <= .15 + self.resolution_m:
+                    continue
+                point = points[selected].tolist()
+                if region and math.dist(point, region["pose_m_rad"][:2]) > 3.:
+                    continue
+                key = ":".join(str(int(math.floor(value / .5))) for value in point)
+                if key in excluded:
+                    continue
+                previous = self.frontier_attempts.get(key, {})
+                if previous.get("attempts", 0) >= 2 and known - previous.get("known_cells", known) < 25:
+                    continue
+                result.append({"frontier_id": key, "position_m": point, "distance_m": float(distances[selected]),
+                    "attempts": previous.get("attempts", 0), "region_scope": "within_3m_of_room_annotation" if region else "all_connected"})
+                break
         return sorted(result, key=lambda item: item["distance_m"] + item["attempts"])[:20]
 
     def mark_frontier(self, identity):

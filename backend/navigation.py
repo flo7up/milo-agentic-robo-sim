@@ -342,7 +342,10 @@ class NavigationRuntime:
                         bullet.setJointMotorControl2(sim.robot, index, bullet.VELOCITY_CONTROL,
                                                     targetVelocity=speed, force=5, physicsClientId=sim.client)
                 prior = sim.path_length
+                revision = self.revision
                 sim._ticks(1, control)
+                if self.revision != revision or not self.buffer:
+                    return
                 self.travel += sim.path_length - prior
                 head = bullet.getJointState(sim.robot, sim.joints["head_yaw"], physicsClientId=sim.client)[0] + sim.odometry[2]
                 self.scan_min, self.scan_max = min(self.scan_min, head), max(self.scan_max, head)

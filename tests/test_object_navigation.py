@@ -262,3 +262,118 @@ async def test_object_arrival_receipt_is_current_and_json_serializable(change):
     worker.call = call
     state = json.loads(json.dumps(await worker.object_state()))
     assert state["arrival_valid"] == (change is None)
+
+
+@pytest.mark.parametrize("fault", [None, "free", "unknown_margin", "unknown_all", "occupied_inside",
+    "occupied_margin", "stale", "sensor_error", "stop", "task", "stop_dwell", "task_dwell", "shield"])
+def test_navigation_rest_masks_only_own_unknown_footprint(monkeypatch, fault):
+    import time
+    from threading import Event
+    from backend.navigation import NavigationRuntime
+    from backend.simulation import MotionError
+    from backend.spatial import ObservedMap
+    from backend.worker import SimulationWorker
+    mapped = ObservedMap("run", 1)
+    mapped.captured_at = time.monotonic()
+    mapped.cells[:] = 0
+    if fault != "free":
+        mapped.cells[77:84, 77:84] = -1
+    if fault == "unknown_margin":
+        mapped.cells[80, 89] = -1
+    elif fault == "unknown_all":
+        mapped.cells[:] = -1
+    elif fault == "occupied_inside":
+        mapped.cells[80, 80] = 100
+    elif fault == "occupied_margin":
+        mapped.cells[80, 89] = 100
+    elif fault == "stale":
+        mapped.captured_at -= 2.
+    worker = SimulationWorker.__new__(SimulationWorker)
+    worker.spatial_map, worker.spatial_error = mapped, "unavailable" if fault == "sensor_error" else None
+    worker.stop_revision, worker.task_revision = 2, 3
+    worker._sample_spatial = lambda: None
+    checks = []
+    sim = SimpleNamespace(odometry=np.array([.025, .025, 0.]), cancel=Event(), held=False, ticks=0,
+        hold_current=lambda: None, robot_footprint=lambda: {"radius_m": .4},
+        observe=lambda **kwargs: SimpleNamespace(grippers={}),
+        proximity_sensors=lambda: SimpleNamespace(collisions=[]))
+    worker.sim = sim
+    def tick(count):
+        sim.ticks += count
+        if fault == "stop_dwell":
+            sim.cancel.set()
+            worker.stop_revision += 1
+        elif fault == "task_dwell":
+            worker.task_revision += 1
+    sim._ticks = tick
+    def shield(runtime, current, linear, angular):
+        assert current is sim and linear == angular == 0.
+        checks.append("shield")
+        if fault == "shield":
+            raise MotionError("CLEARANCE_STOP", "Observed parking still requires the safety shield")
+    monkeypatch.setattr(NavigationRuntime, "check_clearance", shield)
+    if fault == "stop":
+        sim.cancel.set()
+    elif fault == "task":
+        worker.task_revision += 1
+    original_cells = mapped.cells.copy()
+    if fault in {None, "free"}:
+        worker._verify_navigation_rest(2, 3, lambda: checks.append("validate"))
+        assert sim.ticks == 120 and checks.count("shield") == 10 and checks.count("validate") == 11
+    else:
+        message = "authority" if fault in {"stop", "task", "stop_dwell", "task_dwell"} else (
+            "fresh observed" if fault in {"stale", "sensor_error"} else "safety shield" if fault == "shield" else "parking margin")
+        with pytest.raises((ValueError, MotionError), match=message):
+            worker._verify_navigation_rest(2, 3, lambda: checks.append("validate"))
+        assert sim.ticks == (12 if fault in {"stop_dwell", "task_dwell"} else 0)
+    np.testing.assert_array_equal(mapped.cells, original_cells)
+
+
+async def test_home_parking_redirect_clearance_evidence(tmp_path, monkeypatch, record_property):
+    import json
+    import time
+    from scipy.ndimage import distance_transform_edt
+    from backend.worker import SimulationWorker
+    from tests.test_mission import test_unified_visual_object_approach_and_automatic_return
+    original = SimulationWorker._verify_navigation_rest
+    snapshots = []
+
+    def inspect_rest(worker, stop_revision, task_revision, validate):
+        try:
+            return original(worker, stop_revision, task_revision, validate)
+        finally:
+            mapped, sim, home = worker.spatial_map, worker.sim, worker.home_mission
+            now = time.monotonic()
+            radius = sim.robot_footprint()["radius_m"]
+            rows, columns = np.indices(mapped.cells.shape)
+            positions = (np.stack((columns, rows), axis=-1) + mapped.origin + .5) * mapped.resolution_m
+            distances = np.linalg.norm(positions - sim.odometry[:2], axis=-1)
+            supported = (mapped.cells == 0) | (distances <= radius)
+            supported[mapped.cells == 100] = False
+            local_cell = mapped.cell_index(sim.odometry[:2])
+            home_cell = home.home.indices(home.pose[:2])
+            home_known = home.home.cells == 0
+            for obstacle in home.obstacles():
+                cell = home.home.indices(obstacle)
+                if home.home.inside(cell):
+                    home_known[cell[1], cell[0]] = False
+            def clearance(known, resolution, cell):
+                return float(distance_transform_edt(np.pad(known, 1))[1:-1, 1:-1][cell] * resolution)
+            snapshots.append({"evidence": "scripted_test", "pose": sim.odometry.tolist(),
+                "footprint": sim.robot_footprint(), "required_margin_m": radius + .08,
+                "rolling_age_s": now - mapped.captured_at, "rolling_sequence": mapped.sequence,
+                "rolling_clearance_m": clearance(mapped.cells == 0, mapped.resolution_m, local_cell),
+                "footprint_supported_clearance_m": clearance(supported, mapped.resolution_m, local_cell),
+                "home_clearance_m": clearance(home_known, home.home.resolution_m, (home_cell[1], home_cell[0])),
+                "home_pose": home.pose, "home_sample_age_s": now - home.sampled_at,
+                "home_validation_age_s": now - home.validated_at, "home_geometry_updated_at": home.home.updated_at,
+                "home_localization": home.localization, "proximity": sim.proximity_sensors().model_dump(),
+                "nearby_cells": [{"position_m": position.tolist(), "value": int(value)}
+                    for position, value in zip(positions[distances <= radius + .15], mapped.cells[distances <= radius + .15])]})
+
+    monkeypatch.setattr(SimulationWorker, "_verify_navigation_rest", inspect_rest)
+    try:
+        await test_unified_visual_object_approach_and_automatic_return(tmp_path, "redirect", record_property)
+    finally:
+        record_property("home_parking_clearance", json.dumps(snapshots))
+    assert snapshots

@@ -444,6 +444,7 @@ async def test_mapped_capture_continues_while_map_job_is_delayed(tmp_path):
             worker.spatial_pending_map = worker.spatial_map
             worker.spatial_capture_executor = SimpleNamespace(submit=lambda *args: submissions.append(args) or capture,
                 shutdown=lambda **kwargs: None)
+            worker.inference_owner = "delayed-capture-test"
             sim.rendering = "enhanced"
             worker.spatial_sampled_at = time.monotonic() - 1.
             worker._sample_spatial()
@@ -522,13 +523,83 @@ def test_named_graph_and_frontier_attempts_survive_reload(tmp_path):
     frontier = home.frontiers([0., 0., 0.], .3)[0]
     home.mark_frontier(frontier["frontier_id"])
     home.mark_frontier(frontier["frontier_id"])
-    assert home.frontiers([0., 0., 0.], .3) == []
+    remaining = home.frontiers([0., 0., 0.], .3)
+    assert remaining and all(item["frontier_id"] != frontier["frontier_id"] for item in remaining)
     store = MapStore(tmp_path / "map.sqlite3")
     store.save(home, "Home")
     restored = store.load(home.identity, "home")
     assert restored.frontier_attempts == home.frontier_attempts
     assert restored.edges == home.edges
-    assert restored.frontiers([0., 0., 0.], .3) == []
+    assert restored.frontiers([0., 0., 0.], .3) == remaining
+
+
+def test_frontier_selection_requires_new_reachable_motion_and_preserves_unknown():
+    home = HomeMap("home")
+    home.evidence[190:211, 190:211] = -2
+    before = home.cells.copy()
+    pose = [0., 0., 0.]
+    frontier = home.frontiers(pose, .3)[0]
+    assert frontier["distance_m"] > .15 + home.resolution_m
+    assert len(home.route(pose[:2], frontier["position_m"], .3)) >= 2
+    home.mark_frontier(frontier["frontier_id"])
+    home.mark_frontier(frontier["frontier_id"])
+    replacement = home.frontiers(pose, .3)[0]
+    assert replacement["frontier_id"] != frontier["frontier_id"]
+    assert len(home.route(pose[:2], replacement["position_m"], .3)) >= 2
+    assert home.frontiers(pose, .3, obstacles=[[0., 0.]]) == []
+    np.testing.assert_array_equal(home.cells, before)
+
+
+def test_frontier_ranking_prefers_useful_forward_progress_without_crossing_unknown():
+    home = HomeMap("home")
+    home.evidence[182:219, 182:219] = -2
+    pose = [0., 0., 0.]
+    frontier = home.frontiers(pose, .3)[0]
+    assert .7 <= frontier["distance_m"] <= 1.4
+    assert frontier["position_m"][0] > .7 and abs(frontier["position_m"][1]) < .3
+    path = home.route(pose[:2], frontier["position_m"], .3)
+    allowed = home.allowed(.3)
+    indices = home.indices(path)
+    assert allowed[indices[:, 1], indices[:, 0]].all()
+    alternatives = home.frontiers(pose, .3, excluded=[frontier["frontier_id"]])
+    assert alternatives and all(candidate["frontier_id"] != frontier["frontier_id"] for candidate in alternatives)
+    assert all(len(home.route(pose[:2], candidate["position_m"], .3)) >= 2 for candidate in alternatives)
+
+
+async def test_named_arrival_holds_measured_velocity_for_full_dwell(tmp_path):
+    from types import SimpleNamespace
+    import pybullet as bullet
+    import time
+    from backend.challenges import get_challenge
+    from backend.home_mission import HomeMission
+    from backend.simulation import BulletSimulation
+    sim = BulletSimulation(challenge=get_challenge("park"), width=160, height=120)
+    try:
+        worker = SimpleNamespace(sim=sim, challenge=get_challenge("park"), stop_revision=0, task_revision=0,
+            continuous=None, latest={})
+        home = HomeMission(worker, MapStore(tmp_path / "dwell.sqlite3"))
+        home.pose = sim.odometry.tolist()
+        home.sample = lambda **kwargs: None
+        home.require_localized = lambda: None
+        home.task = {"status": "running", "kind": "navigate", "target_m": home.pose[:2],
+            "deadline": time.monotonic() + 10., "guided_mapping": False}
+        original_ticks = sim._ticks
+        sampled = []
+
+        def ticks(count):
+            original_ticks(count)
+            if not sampled:
+                bullet.resetBaseVelocity(sim.robot, [0.03, 0., 0.], [0., 0., 0.], physicsClientId=sim.client)
+            velocity, angular = bullet.getBaseVelocity(sim.robot, physicsClientId=sim.client)
+            sampled.append((sim.ticks, math.hypot(*velocity[:2]), abs(angular[2])))
+
+        sim._ticks = ticks
+        home.tick()
+        assert home.task["status"] == "completed", home.task
+        last_unstable = max(tick for tick, speed, angular in sampled if speed > .025 or angular > .15)
+        assert sampled[-1][0] - last_unstable >= 132
+    finally:
+        sim.close()
 
 
 def test_scan_matching_uses_sensor_returns_and_rejects_missing_data():
@@ -735,7 +806,12 @@ async def test_explicit_local_exploration_builds_draft_without_model_or_saved_ma
         worker.stop()
         await worker.hold_stopped()
         state = await worker.home_state()
-        assert state["task"]["status"] == "cancelled"
+        if state["task"]["status"] == "completed":
+            assert state["task"]["reason"] == "No untried reachable frontiers; closed and unknown areas remain unexplored"
+            assert state["task"]["segments"] == 0
+        else:
+            assert state["task"]["status"] == "cancelled"
+        assert worker.latest["stopped"] and not worker.home_mission.active
         assert store.load(original.identity, original.environment_id).document() == before
         await worker.resume_manual()
         assert not worker.home_mission.active

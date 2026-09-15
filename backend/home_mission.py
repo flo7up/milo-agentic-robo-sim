@@ -451,8 +451,7 @@ class HomeMission:
             else:
                 if not self.allow_expansion:
                     raise ValueError("MAP_READ_ONLY: scenario evaluations cannot expand the frozen map")
-                if not self.home.frontiers(self.pose, radius, self.obstacles(), request.region_id):
-                    raise ValueError("NO_FRONTIERS: no untried reachable frontier in this region")
+                self.home.route(self.pose[:2], self.pose[:2], radius, self.obstacles())
                 self.home.saved = False
             self.room_verification = None
             if request.return_place_id:
@@ -463,6 +462,8 @@ class HomeMission:
             elif self.workflow and not (self.workflow["status"] == "returning" and request.place_id == self.workflow["return_place_id"]):
                 self.fail("Room workflow replaced by another task", "cancelled")
                 self.workflow = None
+            if worker.continuous and not worker.continuous.active and getattr(worker.continuous, "home_owned", False):
+                worker.continuous = None
             self.task = {"task_id": str(uuid4()), "kind": "navigate" if request.action in {"navigate_to", "guided_to"} else "explore",
                 "guided_mapping": request.action == "guided_to",
                 "status": "running", "reason": "Planning on observed map", "place_id": request.place_id,
@@ -563,20 +564,31 @@ class HomeMission:
                     if task["retries"] > 2:
                         raise ValueError("BLOCKED: bounded route retries exhausted; last route: " + worker.continuous.reason)
                     task["reason"] = "Replanning after " + worker.continuous.reason
+                    if task["kind"] == "explore" and not task.get("single_frontier") and task["frontier_id"]:
+                        task.setdefault("rejected_frontiers", []).append(task["frontier_id"])
+                        self.home.mark_frontier(task["frontier_id"])
+                        task["target_m"] = None
                 worker.continuous = None
             if task["target_m"] is not None and math.dist(self.pose[:2], task["target_m"]) <= .15:
                 sim.hold_current()
                 if task["kind"] == "navigate":
+                    import pybullet as bullet
                     before = sim.odometry.copy()
                     previous = before.copy()
                     stable_since = None
                     settle_started = sim.ticks
-                    while stable_since is None or sim.ticks - stable_since < 120:
+                    while stable_since is None or sim.ticks - stable_since < 132:
                         if time.monotonic() >= task["deadline"]:
                             self.fail("TIMEOUT: arrival inspection exceeded the task budget", "limited")
                             return
                         sim._ticks(12)
-                        settled = math.dist(sim.odometry[:2], previous[:2]) <= .025 * .05 and abs(sim.odometry[2] - previous[2]) <= .15 * .05
+                        linear, angular = bullet.getBaseVelocity(sim.robot, physicsClientId=sim.client)
+                        grounded = any(contact[2] != sim.robot and contact[7][2] > .8 and contact[9] > .01
+                            for contact in bullet.getContactPoints(bodyA=sim.robot, physicsClientId=sim.client))
+                        settled = (math.dist(sim.odometry[:2], previous[:2]) <= .025 * .05
+                            and abs(sim.odometry[2] - previous[2]) <= .15 * .05
+                            and math.hypot(*linear[:2]) <= .025 and abs(angular[2]) <= .15
+                            and grounded and not sim.proximity_sensors().collisions)
                         stable_since = (sim.ticks if stable_since is None else stable_since) if settled else None
                         previous = sim.odometry.copy()
                         if sim.ticks - settle_started >= 480:
@@ -608,7 +620,8 @@ class HomeMission:
                     return
             radius = sim.robot_footprint()["radius_m"]
             if task["target_m"] is None:
-                frontiers = self.home.frontiers(self.pose, radius, self.obstacles(), task["region_id"])
+                frontiers = self.home.frontiers(self.pose, radius, self.obstacles(), task["region_id"],
+                    excluded=task.get("rejected_frontiers", ()))
                 if not frontiers:
                     task.update(status="completed", reason="No untried reachable frontiers; closed and unknown areas remain unexplored", completion_verified=True)
                     self.stage = "review"
@@ -628,6 +641,7 @@ class HomeMission:
                 self.home.route(self.pose[:2], self.pose[:2], radius, self.obstacles())
                 if task["kind"] != "explore" or task.get("single_frontier") or task["retries"] >= 2:
                     raise
+                task.setdefault("rejected_frontiers", []).append(task["frontier_id"])
                 self.home.mark_frontier(task["frontier_id"])
                 task["target_m"] = None
                 task["retries"] += 1

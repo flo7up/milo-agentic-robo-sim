@@ -829,8 +829,13 @@ class SimulationWorker:
             mapped = self.spatial_map
             if mapped is None or self.spatial_error or mapped.public()["stale"]:
                 raise ValueError("Stopped verification requires fresh observed clearance")
-            clearance = distance_transform_edt(np.pad(mapped.cells == 0, 1, constant_values=False))[1:-1, 1:-1] * mapped.resolution_m
-            if clearance[mapped.cell_index(sim.odometry[:2])] < sim.robot_footprint()["radius_m"] + .08:
+            radius = sim.robot_footprint()["radius_m"]
+            rows, columns = np.indices(mapped.cells.shape)
+            positions = (np.stack((columns, rows), axis=-1) + mapped.origin + .5) * mapped.resolution_m
+            supported = (mapped.cells == 0) | (np.linalg.norm(positions - before[:2], axis=-1) <= radius)
+            supported[mapped.cells == 100] = False
+            clearance = distance_transform_edt(np.pad(supported, 1, constant_values=False))[1:-1, 1:-1] * mapped.resolution_m
+            if clearance[mapped.cell_index(sim.odometry[:2])] < radius + .08:
                 raise ValueError("Stopping footprint lacks observed parking margin; scan the surrounding floor")
             NavigationRuntime().check_clearance(sim, 0., 0.)
             validate()
@@ -889,23 +894,138 @@ class SimulationWorker:
                 home.home.places[:] = [place for place in home.home.places if place.get("mission_id") != mission_id]
         return await self.call(operation)
 
-    async def mission_feedback(self):
+    def _mission_read_authority(self, mission=None):
+        return (*(mission.authority if mission else (self.sim.run_id, self.epoch, self.stop_revision, self.task_revision)),
+            mission.identity if mission else getattr(self.home_mission, "mission_owner", None), self.inference_owner)
+
+    def _mission_read_guard(self, sim, expected, sensor=None):
+        current = (sim.run_id, sim.epoch, self.stop_revision, self.task_revision,
+            getattr(self.home_mission, "mission_owner", None), self.inference_owner)
+        if current != expected or sim.cancel.is_set() or self.closed or not self.powered:
+            raise ValueError("Mission observation authority changed")
+        home = self.home_mission
+        if ((home and home.active and (not expected[4] or home.task.get("mission_id") != expected[4]))
+                or self.renderer or (self.skill and self.skill.active) or (self.ros_navigation and self.ros_navigation.active)
+                or (self.navigation and self.navigation.status == "running"
+                    and not (home and home.active and self.continuous and getattr(self.continuous, "home_owned", False)))
+                or (self.continuous and self.continuous.active and not getattr(self.continuous, "home_owned", False))):
+            raise ValueError("Mission observation belongs to another motion owner")
+        if sensor is not None:
+            if ((sensor.run_id, sensor.episode_epoch) != expected[:2]
+                    or not 0 <= time.monotonic() - sensor.captured_at <= 1.
+                    or np.linalg.norm(np.asarray(sensor.odometry_m_rad[:2]) - sim.odometry[:2]) > .25
+                    or abs(sensor.odometry_m_rad[2] - sim.odometry[2]) > .35):
+                raise ValueError("Mission camera frame expired or capture pose moved too far")
+
+    async def mission_objective(self, mission, identity, *, decision=None, renew=False, end_reason=None):
+        from backend.home_mission import HomeRequest
+        expected = self._mission_read_authority(mission)
         def operation(sim):
+            home = self.home_mission
+            binding = getattr(self, "_mission_objective_binding", None)
+            if end_reason is not None:
+                if binding and binding["mission"] is mission and binding["identity"] == identity:
+                    if home is binding["home"] and home.mission_owner == mission.identity and home.task is binding["task"]:
+                        home.fail(end_reason, "paused")
+                    mission.objective.revoke(end_reason)
+                    if sim.on_tick is binding["guard"]:
+                        sim.on_tick = binding["previous"]
+                    self._mission_objective_binding = None
+                return home.state(compact=True)
+            self._mission_read_guard(sim, expected)
+            mission.check((sim.run_id, sim.epoch, self.stop_revision, self.task_revision))
+            if decision is not None and not renew:
+                if binding is not None or home.active:
+                    raise ValueError("A mission objective is already active")
+                mission.authorize_objective(identity, decision, expected[:4], sim.odometry)
+                remaining = mission.objective.expires_at - time.monotonic()
+                if remaining <= 0.:
+                    mission.objective.revoke("Objective expired before starting")
+                    raise ValueError("Objective expired before starting")
+                previous_task = home.task
+                try:
+                    home.command(HomeRequest(run_id=sim.run_id, episode_epoch=sim.epoch, action="explore",
+                        time_budget=max(1., remaining)), *expected[2:4])
+                    self._mission_read_guard(sim, expected)
+                    mission.check_objective(identity, expected[:4], sim.odometry)
+                except BaseException:
+                    mission.objective.revoke("Objective start interrupted")
+                    if home.task is not previous_task and home.mission_owner == mission.identity:
+                        home.fail("Objective start interrupted", "cancelled")
+                    raise
+                binding = {"mission": mission, "identity": identity, "home": home, "task": home.task,
+                    "previous": sim.on_tick}
+                def guard():
+                    try:
+                        self._mission_read_guard(sim, expected)
+                        mission.check_objective(identity, expected[:4], sim.odometry)
+                        if home.task is not binding["task"] or not home.active:
+                            mission.objective.revoke("Mapped task ended or was replaced")
+                    except (ValueError, TimeoutError) as error:
+                        mission.objective.revoke(str(error))
+                        if home.task is binding["task"] and home.mission_owner == mission.identity:
+                            home.fail(str(error), "limited")
+                    binding["previous"]()
+                binding["guard"] = guard
+                self._mission_objective_binding = binding
+                sim.on_tick = guard
+                home.task["deadline"] = mission.objective.expires_at
+            if not binding or binding["mission"] is not mission or binding["identity"] != identity or home.task is not binding["task"]:
+                raise ValueError("Mission objective task was replaced")
+            if home.active:
+                try:
+                    mission.check_objective(identity, expected[:4], sim.odometry)
+                    if renew:
+                        self._sample_spatial(force=True)
+                        sensor = next(reversed(self.spatial_frames.values()))[0]
+                        self._mission_read_guard(sim, expected, sensor)
+                        home.require_localized()
+                        if self.spatial_error or not self.spatial_enabled or self.spatial_map is None:
+                            raise ValueError("Mission renewal requires fresh observed clearance")
+                        mission.authorize_objective(identity, decision, expected[:4], sim.odometry, renew=True)
+                        home.task["deadline"] = mission.objective.expires_at
+                except (ValueError, TimeoutError) as error:
+                    home.fail(str(error), "limited")
+                    mission.objective.revoke(str(error))
+                    if renew:
+                        raise
+            else:
+                mission.objective.revoke(home.task["reason"])
+                if renew:
+                    raise ValueError("Ended objective cannot renew or restart")
+            return home.state(compact=True)
+        return await self.call(operation)
+
+    async def mission_feedback(self, mission=None):
+        expected = self._mission_read_authority(mission)
+        def operation(sim):
+            self._mission_read_guard(sim, expected)
             self._sample_spatial(force=True)
             if self.home_mission:
                 self.home_mission.sample()
+            if not self.spatial_enabled or self.spatial_error or not self.spatial_frames:
+                raise ValueError("Mission feedback requires fresh observed sensors")
             sensor, image, _ = next(reversed(self.spatial_frames.values()))
+            self._mission_read_guard(sim, expected, sensor)
             observation, _ = self._feedback(sim, image)
+            observation = observation.model_copy(update={"odometry_m_rad": list(sensor.odometry_m_rad),
+                "head_rad": list(sensor.head_rad), "simulated_time_s": sensor.simulated_time_s})
             return sensor, image, observation
         return await self.call(operation)
 
-    async def mission_map(self, sensor, observation, trail=(), overview=False):
+    async def mission_map(self, sensor, observation, trail=(), overview=False, mission=None):
         from backend.home_mapping import transform_pose
         from backend.map_context import observed_context
+        expected = self._mission_read_authority(mission)
         def operation(sim):
-            self._continuous_guard(sim, sensor, self.stop_revision)
-            if np.linalg.norm(np.asarray(sensor.odometry_m_rad)-sim.odometry) > .05:
-                raise ValueError("Map view pose changed since its camera frame")
+            self._mission_read_guard(sim, expected, sensor)
+            if ((observation.run_id, observation.episode_epoch) != expected[:2]
+                    or list(observation.odometry_m_rad) != list(sensor.odometry_m_rad)
+                    or list(observation.head_rad) != list(sensor.head_rad)
+                    or observation.simulated_time_s != sensor.simulated_time_s):
+                raise ValueError("Map view requires the camera's paired observation pose and time")
+            if not self.spatial_enabled or self.spatial_error or self.spatial_map is None:
+                raise ValueError("Map view requires fresh observed sensors")
             home = self.home_mission
             public = self.spatial_map.public()
             frame, identity, origin, resolution = "wheel_odometry", sim.run_id, public["origin_m"], public["resolution_m"]
@@ -938,6 +1058,7 @@ class SimulationWorker:
             if frame == "map":
                 context.geometry_source = "accumulated_sensor_map"
                 context.geometry_updated_unix_s = home.home.updated_at
+            self._mission_read_guard(sim, expected, sensor)
             return context
         return await self.call(operation)
 
