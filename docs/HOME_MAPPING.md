@@ -2,6 +2,38 @@
 
 Initial design: `persistent-home-map-v1`. Current mapped controller: `guided-waypoints-v1` / `0.4.0`. Guided safety and sensor-processing changes are tested; safe Kitchen/report/Home demonstration remains unmet. [Current evidence and blockers](../.runtime/guided-waypoints-review/summary.md). Prior measured motion design: [mapped-motion-refresh-v1 / 0.2.0](DESIGN_PERFORMANCE.md#mapped-motion-refresh).
 
+## Spatial Memory Milestone
+
+Status as of 2026-09-16: `spatial-memory-v1` profile/checkpoint workflow verified in isolation; development paused at the user's request. The full memory feature is not yet qualified or activated on the live backend. [Evidence and retained failures](DESIGN_PERFORMANCE.md#current-answer).
+
+The candidate extends the existing SQLite MapStore with versioned migrations (current `user_version=3`), opaque environment-instance IDs, layout fingerprints, knowledge profiles, observation events, current entity beliefs, evidence images and immutable checkpoints. Existing map documents remain byte-preserved during migration. Legacy room/object readers use compatibility views; operator reviews are separate from historical observations. Model labels remain tentative and uncalibrated. Objects with the same label are not automatically merged; explicit scoped associations update their current belief while retaining prior events.
+
+The configuration drawer includes Spatial memory: choose a profile, Start fresh knowledge, Save checkpoint, or Fork checkpoint. These operations do not move the robot. Selecting a profile reloads its map unlocalized and clears old local sensor history; fresh knowledge keeps older profiles intact. Forks have independent profile/map identities and retain their checkpoint's evidence and review state. Reset/startup and new-mission hooks are implemented, with restart persistence tested for the API fixture; broader lifecycle combinations still need validation. Saved knowledge never resumes an old route.
+
+Integration points:
+
+- [backend/spatial_memory.py](../backend/spatial_memory.py): migrations, typed scope/evidence, idempotent ingestion, beliefs, queries, frame invalidation and checkpoint forks.
+- [backend/memory_session.py](../backend/memory_session.py): bounded background persistence, active-context lifecycle, sensor-grounded ingestion, profile operations and observed-transition collection.
+- [backend/home_mapping.py](../backend/home_mapping.py) and [backend/home_mission.py](../backend/home_mission.py): existing maps, places, observations, visits and navigation targets remain the owning structures.
+- [backend/worker.py](../backend/worker.py): validated room/object writes, mission-boundary persistence and context changes; existing navigation and collision checks remain authoritative.
+- [backend/mission_supervisor.py](../backend/mission_supervisor.py): bounded lookup_room/find_object_sightings/get_search_history/get_exploration_summary actions, search reports and remembered object-viewpoint navigation followed by fresh reacquisition.
+- [backend/app.py](../backend/app.py): GET/POST /api/memory, session context validation and optional environment_instance_id on challenge loading.
+- [frontend/src/MemoryControls.tsx](../frontend/src/MemoryControls.tsx): profile/checkpoint operations and bounded memory inspection inside the existing configuration drawer.
+
+Current limits: layouts are fixed presets with no generator seed (reported as null); an explicit instance ID can distinguish otherwise identical flats. A changed layout fingerprint isolates a new revision, but compatibility/legacy-import behavior needs further review before production use. Frame invalidation marks beliefs for revalidation rather than silently transforming them; correction/reload integration remains a follow-up. Search reports retain viewpoint/surface/entrance scope and visibility limits; absence is not certified. Stored connection records describe sampled measured transitions, not guaranteed traversability or room identity. Queries and model summaries are bounded, but full persistence/summary cost under motion has not been profiled. No automatic pathway shortcut or motor-command replay was added.
+
+### Resume Checklist
+
+1. Audit scope and asynchronous boundaries: delayed writes and reads across Stop, takeover, reset, profile switch, same-profile reselection, and map/frame correction. Ensure old contexts cannot repopulate the new profile and cancellation cannot leak a persistence executor.
+2. Test unified object selection, successful approach and fresh reobservation with memory enabled. Verify evidence association, map-compatible viewpoint lookup, belief updates and fallback when metric depth is unavailable; do not infer identity from labels alone.
+3. Test successful pathway collection with distinct sensor-observed room locations and actual odometry; distinguish annotation points from room boundaries, clear incomplete paths on discontinuity/cancellation, and prove transient execution failures do not become environmental blockage. Existing fixture room labels are not autonomous perception evidence.
+4. Review map/legacy migration and frame lifecycle: migrated labels/visits/frontier attempts, incompatible revision isolation, missing anchors, correction/reload, and snapshot consistency. Keep the original and frozen benchmark databases unchanged.
+5. Verify that compact memory summaries and query results never expose spectator/evaluator data, including mutation-based tests rather than schema rejection alone. Check bounded query/copy work and remaining synchronous store access on worker paths.
+6. Run relevant worker, home-map, object, mission, API and browser regression slices. Then run the complete existing fixed household baseline series with a frozen candidate label and matched settings; preserve every failure. Use the existing camera-clear-fold-v1-20260916 series as the latest known baseline only after confirming its manifest and compatibility. Do not establish a new series to replace it.
+7. Update this guide and the performance ledger with actual outcomes and limitations. Activate only after qualification and explicit coordination to preserve the user's live scene. No paid real-model trial is scheduled or authorized by the pause request.
+
+The verified demonstration is two labelled fixture rooms -> save/reload -> room lookup into the existing navigation interface -> checkpoint/fork with independent progress -> environment isolation. The drawer/browser test does not drive between distinct rooms. [Backend fixture checks](../tests/test_spatial_memory.py), [API restart/fork fixture](../tests/test_api.py), [browser milestone](../.runtime/spatial-memory-v1/browser-milestone-first.xml).
+
 ## Compact Semantic Mission Contract
 
 `semantic-room-v2` is active following explicit restarts and bounded real-model retests. It extends the `semantic-mission-v1` compact brief with nonblocking moving reviews, stable selected destinations and explicit continued supervision. The latest complete fixed series passes 18 cases with three unchanged missing-room prerequisite blocks. The final real-model attempt still failed kitchen identification/arrival and retained one recovered buffer expiry; this is not fully qualified autonomous room finding. See the [performance ledger](DESIGN_PERFORMANCE.md) for all passes and preserved failures.
