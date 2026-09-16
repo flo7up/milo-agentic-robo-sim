@@ -16,6 +16,7 @@ from backend.continuous_navigation import ContinuousScan
 from backend.continuous_supervisor import circle_observed_object, execute_object_capability, rotate, wait_stationary
 from backend.home_mission import HomeRequest
 from backend.map_context import render_observed_map
+from backend.memory_session import lookup_memory, record_observation
 from backend.mission import MissionDecision, MissionFrontierSelection, MissionInferenceTimeout, MissionPlan, MissionTaskBrief
 from backend.simulation import MotionError
 
@@ -65,10 +66,21 @@ approach with circling. Inspect first when the object box is uncertain. A measur
     "explore": "Explore observed reachable space within the approved mission budget. Unknown or closed areas remain unverified.",
 }
 
+MEMORY_INSTRUCTIONS = """When observation.spatial.memory is available, lookup_room, find_object_sightings,
+get_search_history and get_exploration_summary query only the active knowledge profile. memory_query defaults to the mission target.
+These are historical observations, not current visibility, room identity, clearance or arrival proof. Use a returned compatible
+place_id with navigate_place to revisit a remembered room or object observation viewpoint, then reacquire from the current image.
+Never navigate records marked requires_revalidation. Old object locations require new select_object and verify_object evidence.
+report_observation may include search_target, search_result, inspection_scope and visibility_limits for the actual current view.
+Entering a room or not seeing the target does not mean the whole room was searched or that the object is absent.
+Avoid repeating a recently inspected unchanged viewpoint without a concrete new reason; transit and fresh views remain allowed.
+An explore reason mentioning a remembered target does not retarget generic exploration toward it."""
+
 
 def instructions_for(brief):
     plan = (brief.get("mission") or {}).get("plan")
-    return INSTRUCTIONS + "\n" + TASK_INSTRUCTIONS[plan["kind"] if plan else "plan"]
+    memory = (brief.get("observation") or {}).get("spatial", {}).get("memory")
+    return INSTRUCTIONS + "\n" + TASK_INSTRUCTIONS[plan["kind"] if plan else "plan"] + ("\n" + MEMORY_INSTRUCTIONS if memory else "")
 
 
 def tools(actions=None, frontier_ids=()):
@@ -80,7 +92,9 @@ def tools(actions=None, frontier_ids=()):
         "select_object": {"object_label", "object_bounds"}, "approach_object": {"object_goal_id", "approach_side"},
         "verify_object": {"object_goal_id", "object_bounds"}, "circle": {"object_label", "object_bounds", "circle_direction"},
         "navigate_place": {"place_id"}, "observe_room": {"place_id", "room_matches", "evidence_text"},
-        "report_observation": {"evidence_text", "room_label", "room_confidence"}, "look": {"yaw_rad", "pitch_rad"},
+        "report_observation": {"evidence_text", "room_label", "room_confidence", "search_target", "search_result", "inspection_scope", "visibility_limits"},
+        "lookup_room": {"memory_query"}, "find_object_sightings": {"memory_query"}, "get_search_history": {"memory_query"},
+        "get_exploration_summary": set(), "look": {"yaw_rad", "pitch_rad"},
         "turn": {"turn_rad"}, "wait": {"duration_s"}, "finish": set()}
     for action in selected:
         fields.update(parameters[action])
@@ -111,7 +125,7 @@ def execution_brief(result, mission_id):
     brief = {key: result[key] for key in ("status", "reason", "action", "discarded_action", "plan", "available_actions",
         "validation_errors", "identity_verified", "arrival_verified", "motion_authorized", "room_verification",
         "evidence_text", "observation_seq", "spatial_sequence", "source_frame", "source_run_id", "source_episode_epoch",
-        "source_captured_at", "source_pose_m_rad", "room_observation") if key in result}
+        "source_captured_at", "source_pose_m_rad", "room_observation", "records", "summary", "search_observation") if key in result}
     if "reason" in brief:
         brief["reason"] = brief["reason"][:500]
     task = task_brief(result.get("task"), mission_id)
@@ -146,6 +160,15 @@ def semantic_payload(observation, mission, object_state, last, actions, budget=N
         "room_observations": [{key: report[key] for key in ("place_id", "label", "evidence", "confidence", "review_status", "arrival_verified")
             if key in report} for report in spatial.get("room_observations", [])[-4:]]}
     observed_map = observation.get("observed_map")
+    memory = spatial.get("memory")
+    if memory:
+        scope = memory["scope"]
+        fields = ("entity_id", "place_id", "label", "status", "confidence", "last_observed_unix_s", "requires_revalidation", "evidence_id")
+        sensors["spatial"]["memory"] = {"profile_id": scope["profile_id"], "map_id": scope["map_id"], "frame_revision": scope["frame_revision"],
+            "counts": memory.get("counts", {}), "rooms": [{key: item[key] for key in fields if key in item} for item in memory.get("rooms", [])[:4]],
+            "recent_sightings": [{key: item[key] for key in fields if key in item} for item in memory.get("objects", [])[:3]],
+            "recent_inspections": [{key: item[key] for key in ("target", "result", "inspection_scope", "visibility_limits", "observed_unix_s", "observation_id") if key in item}
+                for item in memory.get("search_history", [])[:3]], "historical_only": True}
     sensors["observed_map"] = ({key: value for key, value in observed_map.items() if key not in {"cells", "trail_m", "route_m"}}
         if observed_map else None)
     state = mission.state()
@@ -174,10 +197,14 @@ def available_actions(mission, observation, object_state):
     if mission.plan is None:
         return ["plan"]
     actions = ["report_observation", "look", "turn", "wait", "explore"]
+    if (observation.spatial or {}).get("memory"):
+        actions.extend(["lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"])
     if not mission.operation and mission.plan.kind in {"room", "place", "explore"} and (observation.spatial or {}).get("frontiers"):
         actions.append("navigate_frontier")
     if mission.plan.kind == "object":
         actions.append("select_object")
+        if any(place.get("reachable") and place.get("source") == "object_observation_viewpoint" for place in (observation.spatial or {}).get("places", [])):
+            actions.append("navigate_place")
         if object_state:
             actions.extend(["approach_object", "verify_object"])
     elif mission.plan.kind == "circuit":
@@ -466,7 +493,12 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
             controller.navigation_reply(decision.reason, source="controller" if local_exploration else "model")
         overview = decision.map_view == "overview"
         try:
-            if requested_operation:
+            if decision.action in {"lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"}:
+                if decision.action not in payload["available_actions"]:
+                    raise ValueError("MEMORY_UNAVAILABLE: no active knowledge context")
+                last = await lookup_memory(worker, decision.action, decision.memory_query or (mission.plan.target if mission.plan else ""))
+                controller._check_live(worker, settings)
+            elif requested_operation:
                 current = await mapped.poll()
                 if (current["task"]["status"] != "running" or mission.objective.status != "active"):
                     last = await mapped.close(current["task"]["reason"], result=current)
@@ -507,6 +539,12 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
                     "identity_verified": False, "arrival_verified": False}
                 if decision.room_label is not None:
                     last["room_observation"] = await worker.record_mission_room(mission, sensor, image, observation, decision)
+                if decision.search_target is not None and worker.memory:
+                    last["search_observation"] = await record_observation(worker, context_id=worker.memory.scope.context_id,
+                        kind="entrance" if decision.inspection_scope == "entrance" else "search",
+                        target=decision.search_target, result=decision.search_result, description=decision.evidence_text,
+                        inspection_scope=decision.inspection_scope, visibility="partial", visibility_limits=decision.visibility_limits,
+                        selected_evidence=(sensor, image))
                 controller.navigation_reply(decision.evidence_text, source="model")
             elif decision.action == "navigate_frontier":
                 candidate = next((item for item in payload["observation"]["spatial"]["frontiers"]
@@ -560,18 +598,27 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
                     mission.receipts.pop("return", None)
                 token = mission.begin("navigating" if decision.action == "approach_object" else "inspecting", authority(worker))
                 guide = SimpleNamespace(**decision.model_dump(), standoff_m=.8)
-                last = await execute_object_capability(controller, worker, settings, guide, sensor, *mission.authority[2:])
+                last = await execute_object_capability(controller, worker, settings, guide, sensor, *mission.authority[2:], image=image)
                 receipt = "target" if last["status"] == "object_arrival_verified" else None
                 mission.target_id = last.get("goal_id", mission.target_id)
                 mission.end_operation(token, authority(worker), receipt)
             elif decision.action == "navigate_place":
-                if mission.plan.kind not in {"room", "place"}:
+                if mission.plan.kind not in {"room", "place", "object"}:
                     raise ValueError("Use the object approach contract for object missions")
                 if not 0 <= time.monotonic()-sensor.captured_at <= 15.:
                     raise ValueError("Named-place decision expired; inspect current evidence")
                 place = next((place for place in (observation.spatial or {}).get("places", []) if place["place_id"] == decision.place_id and place["reachable"]), None)
                 if place is None or (mission.plan.kind == "room" and place["kind"] != "room"):
                     raise ValueError("Select a currently reachable place of the requested kind")
+                if place.get("requires_revalidation"):
+                    raise ValueError("MEMORY_REVALIDATION_REQUIRED: inspect the remembered place in its current map frame")
+                if mission.plan.kind == "object":
+                    if place.get("source") != "object_observation_viewpoint":
+                        raise ValueError("Select a remembered object observation viewpoint")
+                    def clear_object_goal(sim):
+                        mission.check(authority(worker))
+                        worker.object_goal = None
+                    await worker.call(clear_object_goal)
                 last = await mapped_operation(controller, worker, settings, "navigate", place_id=decision.place_id)
                 mission.target_id = decision.place_id
                 if mission.plan.kind == "place":

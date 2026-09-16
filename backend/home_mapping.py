@@ -11,6 +11,8 @@ from scipy.ndimage import binary_dilation, distance_transform_edt, label
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 
+from backend.spatial_memory import ClosingConnection, SpatialMemoryStore
+
 
 class ObjectMemory(Protocol):
     def remember_object(self, observation: dict, image: bytes) -> None: ...
@@ -47,6 +49,9 @@ class HomeMap:
     def __init__(self, environment_id, map_id=None):
         self.identity = map_id or str(uuid4())
         self.environment_id = environment_id
+        self.memory_environment_id = environment_id
+        self.environment_revision = "legacy"
+        self.profile_id = None
         self.name = "Unsaved home"
         self.origin = np.array([-20., -20.])
         self.evidence = np.zeros((self.size, self.size), dtype=np.int16)
@@ -340,7 +345,7 @@ class HomeMap:
         return result
 
 
-class MapStore:
+class MapStore(SpatialMemoryStore):
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,53 +353,60 @@ class MapStore:
             connection.execute("CREATE TABLE IF NOT EXISTS maps (map_id TEXT PRIMARY KEY, environment_id TEXT UNIQUE, revision INTEGER, document TEXT)")
             connection.execute("CREATE TABLE IF NOT EXISTS object_observations (observation_id TEXT PRIMARY KEY, map_id TEXT, timestamp REAL, document TEXT, image BLOB)")
             connection.execute("CREATE TABLE IF NOT EXISTS room_observations (observation_id TEXT PRIMARY KEY, map_id TEXT, place_id TEXT, timestamp REAL, document TEXT, image BLOB)")
+        self.migrate_memory()
 
     def connect(self):
-        return sqlite3.connect(self.path, timeout=5.)
+        return sqlite3.connect(self.path, timeout=5., factory=ClosingConnection)
 
     def catalog(self):
         with self.connect() as connection:
-            return [{key: data[key] for key in ("map_id", "environment_id", "name", "revision", "updated_unix_s")}
-                for (document,) in connection.execute("SELECT document FROM maps ORDER BY environment_id")
+            return [{**{key: data[key] for key in ("map_id", "environment_id", "name", "revision", "updated_unix_s")},
+                    "profile_id": profile_id, "environment_revision": revision}
+                for document, profile_id, revision in connection.execute("SELECT document, profile_id, environment_revision FROM maps ORDER BY environment_id")
                 for data in [json.loads(document)]]
 
-    def save(self, home, name):
+    def save(self, home, name, *, scope=None):
         if not name.strip() or len(name) > 80 or not home.scan_count:
             raise ValueError("A name and observed map are required")
         data = home.document()
         data.update(name=name.strip(), revision=home.revision + 1, updated_unix_s=time.time())
+        profile_id = home.profile_id or self.selected_profile(home.memory_environment_id, home.environment_revision)["profile_id"]
+        home.profile_id = profile_id
+        self.bind_map(home, frame_revision=scope.frame_revision if scope else "1")
         with self.connect() as connection:
+            if scope:
+                self._check_scope(connection, scope)
+            self._profile(connection, home.memory_environment_id, home.environment_revision, profile_id)
             if home.revision:
-                changed = connection.execute("UPDATE maps SET revision=?, document=? WHERE map_id=? AND revision=?",
-                    (data["revision"], json.dumps(data, allow_nan=False), home.identity, home.revision)).rowcount
+                changed = connection.execute("UPDATE maps SET revision=?, document=? WHERE map_id=? AND revision=? AND environment_id=? AND environment_revision=? AND profile_id=?",
+                    (data["revision"], json.dumps(data, allow_nan=False), home.identity, home.revision, home.environment_id, home.environment_revision, profile_id)).rowcount
                 if changed != 1:
                     raise ValueError("MAP_CONFLICT: reload the current revision before saving")
             else:
                 try:
-                    connection.execute("INSERT INTO maps VALUES (?, ?, ?, ?)",
-                        (home.identity, home.environment_id, data["revision"], json.dumps(data, allow_nan=False)))
+                    connection.execute("INSERT INTO maps VALUES (?, ?, ?, ?, ?, ?)",
+                        (home.identity, home.environment_id, data["revision"], json.dumps(data, allow_nan=False), profile_id, home.environment_revision))
                 except sqlite3.IntegrityError as error:
                     raise ValueError("MAP_EXISTS: load the saved home instead of mapping this environment again") from error
         home.name, home.revision, home.updated_at, home.saved = data["name"], data["revision"], data["updated_unix_s"], True
         home.annotations_dirty = False
+        home.profile_id = profile_id
 
-    def load(self, map_id, environment_id):
+    def load(self, map_id, environment_id, *, profile_id=None, environment_revision="legacy"):
+        profile_id = profile_id or self.selected_profile(environment_id, environment_revision)["profile_id"]
         with self.connect() as connection:
-            row = connection.execute("SELECT document FROM maps WHERE map_id=? AND environment_id=?", (map_id, environment_id)).fetchone()
+            row = connection.execute("SELECT document FROM maps WHERE map_id=? AND environment_id=? AND environment_revision=? AND profile_id=?", (map_id, environment_id, environment_revision, profile_id)).fetchone()
         if row is None:
             raise ValueError("MAP_NOT_FOUND: map is unknown or belongs to another environment")
-        return HomeMap.restore(json.loads(row[0]))
+        home = HomeMap.restore(json.loads(row[0]))
+        home.profile_id, home.environment_revision = profile_id, environment_revision
+        with self.connect() as connection:
+            row = connection.execute("SELECT environment_id FROM memory_map_scopes WHERE map_id=?", (map_id,)).fetchone()
+        home.memory_environment_id = row[0] if row else home.environment_id
+        return home
 
     def remember_object(self, observation, image):
-        if len(image) > 1024 * 1024 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
-            raise ValueError("Object evidence requires a bounded PNG camera image")
-        with self.connect() as connection:
-            if connection.execute("SELECT 1 FROM maps WHERE map_id=?", (observation["map_id"],)).fetchone() is None:
-                raise ValueError("SAVE_REQUIRED: object memory requires a saved map")
-            connection.execute("INSERT INTO object_observations VALUES (?, ?, ?, ?, ?)",
-                (observation["observation_id"], observation["map_id"], observation["observed_unix_s"], json.dumps(observation, allow_nan=False), image))
-            connection.execute("DELETE FROM object_observations WHERE map_id=? AND observation_id NOT IN (SELECT observation_id FROM object_observations WHERE map_id=? ORDER BY timestamp DESC LIMIT 1000)",
-                (observation["map_id"], observation["map_id"]))
+        self.remember_legacy("object", observation, image)
 
     def object_observations(self, map_id):
         with self.connect() as connection:
@@ -408,16 +420,7 @@ class MapStore:
         return row[0]
 
     def remember_room(self, observation, image, *, allow_draft=False):
-        if len(image) > 1024 * 1024 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
-            raise ValueError("Room evidence requires a bounded PNG image")
-        with self.connect() as connection:
-            if not allow_draft and connection.execute("SELECT 1 FROM maps WHERE map_id=?", (observation["map_id"],)).fetchone() is None:
-                raise ValueError("SAVE_REQUIRED: room observations require a saved map")
-            connection.execute("INSERT INTO room_observations VALUES (?, ?, ?, ?, ?, ?)",
-                (observation["observation_id"], observation["map_id"], observation["place_id"], observation["observed_unix_s"],
-                    json.dumps(observation, allow_nan=False), image))
-            connection.execute("DELETE FROM room_observations WHERE map_id=? AND observation_id NOT IN (SELECT observation_id FROM room_observations WHERE map_id=? ORDER BY timestamp DESC LIMIT 1000)",
-                (observation["map_id"], observation["map_id"]))
+        self.remember_legacy("room", observation, image, allow_draft=allow_draft)
 
     def room_observations(self, map_id):
         with self.connect() as connection:
@@ -431,8 +434,9 @@ class MapStore:
                 raise ValueError("UNKNOWN_EVIDENCE: select recorded room evidence")
             record = json.loads(row[0])
             record.update(review_status="operator_confirmed", reviewed_unix_s=time.time())
-            connection.execute("UPDATE room_observations SET document=? WHERE observation_id=? AND map_id=?",
-                (json.dumps(record, allow_nan=False), observation_id, map_id))
+            patch = {"review_status": "operator_confirmed", "reviewed_unix_s": record["reviewed_unix_s"]}
+            connection.execute("INSERT INTO memory_reviews VALUES (?, ?) ON CONFLICT(event_id) DO UPDATE SET document=excluded.document",
+                (observation_id, json.dumps(patch)))
         return record
 
     def room_image(self, map_id, observation_id):

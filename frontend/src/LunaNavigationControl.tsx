@@ -6,6 +6,7 @@ import { MotionDiagnostics } from './MotionDiagnostics';
 import { LocalModelProgress } from './LocalModelProgress';
 import { usePreference, useSavePreferences } from './Preferences';
 import { RobotControlSlot } from './RobotControlSurface';
+import { MemoryControls } from './MemoryControls';
 import type { LiveState, Reasoning, SpatialTelemetry } from './types';
 
 function normalizedEndpoint(value: string) {
@@ -396,6 +397,8 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     {configurationHost && createPortal(<details className="run-options compact-disclosure" open={runSettingsOpen} onToggle={event => setRunSettingsOpen(event.currentTarget.open)}>
     <summary><ChevronRight className="disclosure-chevron" size={15} /><Settings2 size={15} /><strong>Run settings</strong></summary>
     <div id="panel-settings" role="tabpanel" aria-labelledby="inspector-settings">
+      <MemoryControls active={configurationOpen} locked={!connected || agent.active || state.busy || pending || configurationSaving}
+        runId={state.run_id} epoch={state.episode_epoch} request={request}/>
       <section className="recording-settings" aria-label="Test run recording">
         <div className="panel-header"><h4><CircleDot size={16}/> Recording</h4>
           <span className="tag" role="status" aria-label="Recording status">{!connected ? 'Disconnected' : !recording ? 'Backend update required'

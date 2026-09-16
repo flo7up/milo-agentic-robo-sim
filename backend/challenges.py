@@ -13,6 +13,7 @@ Vector3 = Annotated[list[float], Field(min_length=3, max_length=3)]
 
 class ChallengeLoad(StrictModel):
     challenge_id: ChallengeId
+    environment_instance_id: str | None = Field(default=None, min_length=1, max_length=80)
     reuse_saved_map: bool = True
     environment: Literal["standalone", "shared_apartment_v1"] = "standalone"
     orbit_target: Literal["table", "sofa", "chair", "floor lamp"] | None = None

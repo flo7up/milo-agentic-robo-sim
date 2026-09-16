@@ -114,6 +114,11 @@ class SimulationWorker:
         self.navigation_tick_at = 0.
         self.continuous = None
         self.object_goal = None
+        self.memory = None
+        self.memory_instance_id = None
+        self.memory_descriptor = None
+        self.memory_profile = None
+        self.memory_catalog = []
         self.proposed_goal_id = None
         self.ros_navigation = None
         self.ros_bridge = None
@@ -911,7 +916,7 @@ class SimulationWorker:
                 raise ValueError("A mapped operation is already active")
             home.stop_revision, home.task_revision = stop_revision, task_revision
             if home.home is None:
-                home.home = HomeMap(home.environment_id)
+                home.home = home.new_map()
                 home.transform = inverse_pose(sim.odometry.tolist())
                 home.last_odometry = sim.odometry.tolist()
                 home.stage = "mapping"
@@ -925,6 +930,7 @@ class SimulationWorker:
             if home.allow_expansion:
                 home.home.saved = False
             home.mission_owner = mission_id
+            home.memory_path, home.memory_origin = [], None
             self.mission_trail_owner = mission_id
             self.mission_trail = ObservedMotionTrail()
             self.mission_trail.record(sim.odometry, time.monotonic())
@@ -935,7 +941,11 @@ class SimulationWorker:
                 nearby = home.home.places[-1]
                 nearby.update(source="measured_mission_start", identity_status="odometry_reference", mission_id=mission_id)
             return nearby["place_id"]
-        return await self.call(operation)
+        result = await self.call(operation)
+        if self.memory:
+            from backend.memory_session import rotate_memory_context
+            await rotate_memory_context(self)
+        return result
 
     async def finish_mission(self, mission_id):
         def operation(sim):
@@ -943,8 +953,15 @@ class SimulationWorker:
             if home and home.mission_owner == mission_id:
                 home.fail("Mission ended", "cancelled")
                 home.mission_owner = None
+                home.memory_path, home.memory_origin = [], None
                 home.home.places[:] = [place for place in home.home.places if place.get("mission_id") != mission_id]
-        return await self.call(operation)
+        await self.call(operation)
+        if self.memory:
+            from backend.memory_session import persist_memory
+            try:
+                await persist_memory(self)
+            except (ValueError, OSError) as error:
+                self.memory.error = str(error)
 
     def _mission_read_authority(self, mission=None):
         return (*(mission.authority if mission else (self.sim.run_id, self.epoch, self.stop_revision, self.task_revision)),
@@ -1142,6 +1159,8 @@ class SimulationWorker:
                     "review_status": "tentative", "room_matches": None, "identity_verified": False,
                     "arrival_verified": False, "map_saved": home.home.saved,
                     "image_url": f"/api/home/{home.home.identity}/rooms/{identity}/image.png"}
+                if self.memory:
+                    return self.memory.observe_record("room", record, image)
                 home.store.remember_room(record, image, allow_draft=True)
             except Exception:
                 del home.home.places[before[0]:]
@@ -1150,7 +1169,12 @@ class SimulationWorker:
             home.room_records = home.store.room_observations(home.home.identity)
             return record
 
-        return await self.call(operation)
+        result = await self.call(operation)
+        if isinstance(result, Future):
+            result = await asyncio.wrap_future(result)
+            records = await asyncio.to_thread(self.home_mission.store.room_observations, result["map_id"])
+            await self.call(lambda sim: setattr(self.home_mission, "room_records", records) if self.memory and self.memory.scope.map_id == result["map_id"] else None)
+        return result
 
     async def mission_map(self, sensor, observation, trail=(), overview=False, mission=None):
         from backend.home_mapping import transform_pose
@@ -1233,7 +1257,7 @@ class SimulationWorker:
         return await self.call(operation)
 
     async def object_command(self, sensor, action, stop_revision, task_revision, *, goal_id=None,
-                             bounds=None, label="", standoff_m=.8, approach="front"):
+                             bounds=None, label="", standoff_m=.8, approach="front", evidence_image=None):
         from backend.object_navigation import ObservedObjectGoal
         def operation(sim):
             self._continuous_guard(sim, sensor, stop_revision)
@@ -1299,7 +1323,27 @@ class SimulationWorker:
             goal.verified_head = np.asarray(sim.observe(render=False).head_rad)
             return {"status": "object_arrival_verified", **goal.state(), **result, "stopped_dwell_s": .5,
                 "mission_success_verified": False}
-        return await self.call(operation)
+        result = await self.call(operation)
+        if self.memory and action in {"select", "verify"}:
+            from backend.memory_session import record_observation
+            goal = self.object_goal
+            paired = (sensor, evidence_image) if evidence_image is not None else None
+            if paired is None:
+                retained = self.spatial_frames.get(sensor.sequence)
+                paired = retained[:2] if retained else None
+            if paired:
+                try:
+                    record = await record_observation(self, context_id=self.memory.scope.context_id, kind="object",
+                        label=goal.label, description="Selected camera object" if action == "select" else "Fresh post-arrival depth association",
+                        bounds=bounds, selected_evidence=paired, entity_id=getattr(goal, "memory_entity_id", None),
+                        place_id=getattr(goal, "memory_place_id", None))
+                    if self.object_goal is goal:
+                        goal.memory_entity_id, goal.memory_place_id = record["entity_id"], record["place_id"]
+                    result["memory_observation"] = record
+                except (ValueError, OSError) as error:
+                    self.memory.error = str(error)
+                    result["memory_error"] = str(error)
+        return result
 
     async def verify_saved_place(self, place_id, stop_revision, task_revision):
         def operation(sim):
@@ -1994,7 +2038,19 @@ class SimulationWorker:
             if self.home_mission is None:
                 self.home_mission = HomeMission(self)
             return self.home_mission.command(request, stop_revision, task_revision, selected_evidence, operator_review)
-        return await self.call(operation)
+        result = await self.call(operation)
+        if self.memory and request.action in {"save_map", "observe_room", "remember_object", "review_room", "add_place"}:
+            from backend.memory_session import persist_memory
+            await persist_memory(self)
+            rooms = await asyncio.to_thread(self.home_mission.store.room_observations, self.memory.scope.map_id)
+            objects = await asyncio.to_thread(self.home_mission.store.object_observations, self.memory.scope.map_id)
+            def refresh(sim):
+                self.home_mission.room_records, self.home_mission.object_records = rooms, objects
+                if request.action == "save_map":
+                    self.home_mission.home.saved = True
+                return self.home_mission.state()
+            result = await self.call(refresh)
+        return result
 
     async def home_state(self, compact=False):
         from backend.home_mission import HomeMission
@@ -2436,7 +2492,15 @@ class SimulationWorker:
     async def close(self):
         if self.closed:
             return
-        self.closed = True
         self.stop()
+        if self.memory:
+            from backend.memory_session import persist_memory
+            try:
+                await persist_memory(self)
+            except (ValueError, OSError, RuntimeError) as error:
+                self.memory.error = str(error)
+            finally:
+                await self.memory.close()
+        self.closed = True
         self.queue.put(None)
         await asyncio.to_thread(self.thread.join)

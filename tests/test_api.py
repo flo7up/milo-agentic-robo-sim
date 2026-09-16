@@ -46,6 +46,48 @@ def test_workspace_preferences_restore_scene_stopped_without_commands(challenge_
         assert preferences["challenge_selection"]["challenge_id"] == "tidy"
 
 
+def test_knowledge_profiles_checkpoint_restart_and_obsolete_api_context():
+    with TestClient(app) as client, client.websocket_connect("/api/live") as socket:
+        initial = socket.receive_json()
+        memory = client.get("/api/memory").json()
+        def command(action, state=memory, **values):
+            scope = state["scope"]
+            return client.post("/api/memory", json={"run_id": scope["run_id"], "episode_epoch": scope["episode_epoch"],
+                "context_id": scope["context_id"], "action": action, **values})
+        assert memory["enabled"] and memory["scope"]["environment_id"] != "standalone:bench"
+        profile_id = memory["scope"]["profile_id"]
+        fresh = command("fresh_profile", name="Isolated fixture knowledge")
+        assert fresh.status_code == 200
+        fresh = fresh.json()
+        assert fresh["scope"]["profile_id"] != profile_id and not fresh["rooms"]
+        assert command("fresh_profile", name="Delayed").status_code == 409
+        scope = fresh["scope"]
+        identity = {"run_id": scope["run_id"], "episode_epoch": scope["episode_epoch"]}
+        assert client.post("/api/home", json={**identity, "action": "start_mapping"}).status_code == 200
+        assert client.post("/api/home", json={**identity, "action": "save_map", "name": "API fixture map"}).status_code == 200
+        for label in ("Fixture kitchen", "Fixture hall"):
+            report = command("record_observation", fresh, kind="room", label=label, description="Operator-supplied fixture label on current sensor evidence")
+            assert report.status_code == 200, report.text
+        recorded = client.get("/api/memory").json()
+        assert len(recorded["rooms"]) == 2
+        snapshot = command("checkpoint", fresh, name="Two fixture rooms")
+        assert snapshot.status_code == 200, snapshot.text
+        checkpoint_id = snapshot.json()["snapshots"][0]["snapshot_id"]
+        fork = command("fork_checkpoint", fresh, snapshot_id=checkpoint_id, name="Fixture fork")
+        assert fork.status_code == 200, fork.text
+        fork = fork.json()
+        assert fork["scope"]["profile_id"] != fresh["scope"]["profile_id"] and len(fork["rooms"]) == 2
+        assert client.get("/api/state").json()["snapshot"] == initial["snapshot"]
+        persisted_profile = fork["scope"]["profile_id"]
+        persisted_map = fork["scope"]["map_id"]
+    with TestClient(app) as client:
+        restored = client.get("/api/memory").json()
+        assert restored["scope"]["profile_id"] == persisted_profile
+        assert restored["scope"]["map_id"] == persisted_map and len(restored["rooms"]) == 2
+        assert restored["scope"]["context_id"] != fork["scope"]["context_id"]
+        assert client.get("/api/home").json()["localization"]["status"] == "unlocalized"
+
+
 def test_robot_power_preserves_scene_blocks_work_and_resumes_only_to_idle():
     with TestClient(app) as client:
         initial = client.get("/api/state").json()

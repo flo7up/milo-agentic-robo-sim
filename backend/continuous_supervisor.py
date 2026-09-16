@@ -765,14 +765,14 @@ async def execute_home_capability(controller, worker, settings, guide, sensor, s
     return await worker.home_state(compact=True)
 
 
-async def execute_object_capability(controller, worker, settings, guide, sensor, stop_revision, task_revision):
+async def execute_object_capability(controller, worker, settings, guide, sensor, stop_revision, task_revision, image=None):
     controller._check_live(worker, settings)
     if settings.navigation_backend != "builtin":
         raise ValueError("Object approach requires the explicitly selected Built-in controller")
     actions = {"select_object": "select", "approach_object": "approach", "verify_object": "verify"}
     result = await worker.object_command(sensor, actions[guide.action], stop_revision, task_revision,
         goal_id=guide.object_goal_id, bounds=guide.object_bounds, label=guide.object_label,
-        standoff_m=guide.standoff_m, approach=guide.approach_side)
+        standoff_m=guide.standoff_m, approach=guide.approach_side, **({"evidence_image": image} if image is not None else {}))
     if guide.action == "approach_object":
         while result["motion_started"] and worker.continuous and worker.continuous.active:
             controller._check_live(worker, settings)

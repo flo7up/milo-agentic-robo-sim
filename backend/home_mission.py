@@ -83,6 +83,17 @@ class HomeMission:
         self.room_report_deadline = 0.
         self.allow_expansion = True
         self.mission_owner = None
+        self.memory_path = []
+        self.memory_origin = None
+        self.memory_departed_at = 0.
+
+    def new_map(self):
+        session = getattr(self.worker, "memory", None)
+        home = HomeMap(self.environment_id, session.scope.map_id if session else None)
+        if session:
+            home.profile_id, home.environment_revision = session.scope.profile_id, session.scope.environment_revision
+            home.memory_environment_id = session.scope.environment_id
+        return home
 
     @property
     def active(self):
@@ -105,6 +116,7 @@ class HomeMission:
 
     def invalidate(self, reason):
         self.fail(reason, "cancelled")
+        self.memory_path, self.memory_origin = [], None
         self.room_verification = None
         self.room_evidence_after = time.monotonic()
         self.transform = None
@@ -189,6 +201,9 @@ class HomeMission:
             self.observe_depth(sensor)
         self.localization["status"] = "localized"
         self.allowed_cache = None
+        if getattr(self.worker, "memory", None):
+            from backend.memory_session import track_memory_travel
+            track_memory_travel(self)
 
     @timed("map.observe_depth")
     def observe_depth(self, sensor):
@@ -248,7 +263,7 @@ class HomeMission:
             if not self.allow_expansion:
                 raise ValueError("MAP_READ_ONLY: exploration cannot change this frozen map")
             if self.home is None:
-                self.home = HomeMap(self.environment_id)
+                self.home = self.new_map()
                 self.transform = inverse_pose(sim.odometry.tolist())
                 self.last_odometry = sim.odometry.tolist()
                 self.stage = "mapping"
@@ -259,11 +274,13 @@ class HomeMission:
             self.task["model_calls"] = 0
             return self.state()
         if request.action == "start_mapping":
-            existing = next((item for item in self.store.catalog() if item["environment_id"] == self.environment_id), None)
+            session = getattr(worker, "memory", None)
+            existing = next((item for item in self.store.catalog() if item["environment_id"] == self.environment_id
+                and (not session or item["profile_id"] == session.scope.profile_id)), None)
             if existing:
                 raise ValueError("MAP_EXISTS: load " + existing["map_id"] + "; this home is already mapped")
             if self.home is None:
-                self.home = HomeMap(self.environment_id)
+                self.home = self.new_map()
                 self.transform = inverse_pose(sim.odometry.tolist())
                 self.last_odometry = sim.odometry.tolist()
             elif self.transform is None:
@@ -272,7 +289,9 @@ class HomeMission:
             self.enable_sensing()
             self.sample(force=True)
         elif request.action == "load_map":
-            self.home = self.store.load(request.map_id, self.environment_id)
+            session = getattr(worker, "memory", None)
+            self.home = self.store.load(request.map_id, self.environment_id, **({"profile_id": session.scope.profile_id,
+                "environment_revision": session.scope.environment_revision} if session else {}))
             self.workflow = None
             self.object_records = self.store.object_observations(self.home.identity)
             self.room_records = self.store.room_observations(self.home.identity)
@@ -310,7 +329,10 @@ class HomeMission:
             self.home.saved = False
             self.stage = "mapping"
         elif request.action == "save_map":
-            self.store.save(self.home, request.name or self.home.name)
+            if getattr(worker, "memory", None):
+                self.home.name = request.name or self.home.name
+            else:
+                self.store.save(self.home, request.name or self.home.name)
             self.stage = "loaded"
         elif request.action == "add_place":
             self.sample(force=True)
@@ -363,7 +385,10 @@ class HomeMission:
                 "task_id": self.task["task_id"] if request.room_matches is not None else None,
                 "image_url": f"/api/home/{self.home.identity}/rooms/{identity}/image.png"}
             try:
-                self.store.remember_room(record, paired[1])
+                if getattr(worker, "memory", None):
+                    worker.memory.observe_record("room", record, paired[1])
+                else:
+                    self.store.remember_room(record, paired[1])
             except (OSError, ValueError, RuntimeError):
                 del self.home.places[places_before:]
                 del self.home.edges[edges_before:]
@@ -414,12 +439,16 @@ class HomeMission:
             identity = str(uuid4())
             record = {"observation_id": identity, "map_id": self.home.identity, "frame": "map", "units": "m",
                 "label": request.object_label.strip(), "position_m": position, "confidence": request.confidence,
+                "pose_m_rad": transform_pose(paired[0].odometry_m_rad, self.transform),
                 "observed_unix_s": time.time() - (time.monotonic() - paired[0].captured_at),
                 "run_id": sim.run_id, "episode_epoch": sim.epoch, "spatial_sequence": paired[0].sequence,
                 "head_rad": paired[0].head_rad, "object_bounds": request.object_bounds,
                 "source": "unverified_semantic_annotation_on_measured_surface", "identity_verified": False,
                 "supporting_images": [f"/api/home/{self.home.identity}/objects/{identity}/image.png"]}
-            self.store.remember_object(record, paired[1])
+            if getattr(worker, "memory", None):
+                worker.memory.observe_record("object", record, paired[1])
+            else:
+                self.store.remember_object(record, paired[1])
             self.object_records = self.store.object_observations(self.home.identity)
         elif request.action in {"navigate_to", "guided_to", "explore", "explore_frontier"}:
             if not self.home.revision and request.action not in {"guided_to", "explore"} and not self.mission_owner:
@@ -767,6 +796,9 @@ class HomeMission:
             "task": {key: value for key, value in self.task.items() if key not in {"deadline", "started_at", "arrived_at"}} if self.task else None,
             "places": [], "coverage": None}
         result["room_workflow"] = {key: value for key, value in self.workflow.items() if key != "deadline"} if self.workflow else None
+        session = getattr(self.worker, "memory", None)
+        if session:
+            result["memory"] = session.summary
         if lightweight:
             from copy import deepcopy
             result.pop("environment_id", None)
@@ -825,7 +857,7 @@ class HomeMission:
                     edges=home.edges, live_obstacles_m=self.obstacles(), route_m=self.route,
                     frontier_attempts=home.frontier_attempts, dirty=not home.saved or home.annotations_dirty)
         if not compact:
-            result["maps"] = self.store.catalog()
+            result["maps"] = self.worker.memory_catalog if session else self.store.catalog()
         else:
             result.pop("environment_id", None)
         return result

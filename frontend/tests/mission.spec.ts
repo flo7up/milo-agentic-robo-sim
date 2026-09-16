@@ -11,6 +11,73 @@ test.beforeEach(async ({request}) => {
     {id:'luna',label:'Scripted Luna',deployment:'scripted',reasoning_efforts:['low','medium','high']}]}});
 });
 
+test('spatial memory drawer creates checkpoints and independent profiles without motion', async ({page,request}) => {
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  const errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));
+  await page.goto('/');
+  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  const panel=page.getByRole('region',{name:'Spatial memory',exact:true});
+  const profile=panel.getByRole('combobox',{name:'Knowledge profile',exact:true});
+  const name=panel.getByRole('textbox',{name:'Knowledge name',exact:true});
+  await expect(profile).toBeEnabled();
+  await name.fill('Browser fixture knowledge');
+  await panel.getByRole('button',{name:'Start fresh knowledge',exact:true}).click();
+  await expect(panel.getByRole('status')).toHaveText('Browser fixture knowledge');
+  const parent=await(await request.get('/api/memory')).json();
+  const identity={run_id:initial.run_id,episode_epoch:initial.episode_epoch};
+  expect((await request.post('/api/home',{data:{...identity,action:'start_mapping'}})).ok()).toBe(true);
+  expect((await request.post('/api/home',{data:{...identity,action:'save_map',name:'Browser fixture map'}})).ok()).toBe(true);
+  for(const label of ['Fixture kitchen','Fixture hall']) {
+    const result=await request.post('/api/memory',{data:{...identity,context_id:parent.scope.context_id,
+      action:'record_observation',kind:'room',label,description:'Scripted semantic fixture on the current camera; no autonomous room recognition claim.'}});
+    expect(result.ok(),await result.text()).toBe(true);
+  }
+  await name.fill('Two fixture rooms');
+  await panel.getByRole('button',{name:'Save checkpoint',exact:true}).click();
+  await expect(panel.getByRole('combobox',{name:'Knowledge checkpoint',exact:true})).toBeVisible();
+  await expect(panel).toContainText('2 rooms / 0 objects / 0 pathways');
+  await panel.getByText('Remembered rooms and objects',{exact:true}).click();
+  await expect(panel.getByText('Fixture kitchen',{exact:true})).toBeVisible();
+  for(const width of [1440,390,320]) {
+    await page.setViewportSize({width,height:1000});
+    await panel.scrollIntoViewIfNeeded();
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    const dialog=page.getByRole('dialog',{name:'Robot configuration',exact:true});
+    expect(await dialog.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+    await expect(dialog.getByRole('button',{name:'Stop',exact:true})).toBeInViewport();
+    await expect(dialog.getByRole('button',{name:'Reset episode',exact:true})).toBeInViewport();
+    await page.screenshot({path:`../.runtime/spatial-memory-v1/memory-${width}.png`});
+  }
+  await name.fill('Independent browser fork');
+  await panel.getByRole('button',{name:'Fork checkpoint',exact:true}).click();
+  await expect(panel.getByRole('status')).toHaveText('Independent browser fork');
+  const fork=await(await request.get('/api/memory')).json();
+  expect(fork.scope.profile_id).not.toBe(parent.scope.profile_id);
+  expect(fork.scope.map_id).not.toBe(parent.scope.map_id);
+  expect((await request.post('/api/memory',{data:{...identity,context_id:fork.scope.context_id,
+    action:'record_observation',kind:'room',label:'Fixture extra view',description:'Unlocalized fork fixture; viewing pose only.'}})).ok()).toBe(true);
+  await expect(panel).toContainText('3 rooms / 0 objects / 0 pathways');
+  await profile.selectOption(parent.scope.profile_id);
+  await expect(panel.getByRole('status')).toHaveText('Browser fixture knowledge');
+  await expect(panel).toContainText('2 rooms / 0 objects / 0 pathways');
+  expect((await request.post('/api/memory',{data:{...identity,context_id:fork.scope.context_id,action:'fresh_profile',name:'Obsolete'}})).status()).toBe(409);
+  await page.getByRole('button',{name:'Save configuration',exact:true}).click();
+  await expect(page.getByRole('dialog',{name:'Robot configuration',exact:true})).toBeHidden();
+  expect((await(await request.get('/api/state')).json()).snapshot).toEqual(initial.snapshot);
+  await page.reload();await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await expect(profile).toHaveValue(parent.scope.profile_id);
+  await expect(panel).toContainText('2 rooms / 0 objects / 0 pathways');
+  const switched=await request.post('/api/challenges/load',{data:{challenge_id:'park',reuse_saved_map:true,environment_instance_id:'isolated-browser-flat'}});
+  expect(switched.ok()).toBe(true);
+  const isolated=await(await request.get('/api/memory')).json();
+  expect(isolated.scope.environment_id).not.toBe(parent.scope.environment_id);
+  expect(isolated.rooms).toEqual([]);
+  const foreign=await request.post('/api/memory',{data:{run_id:isolated.scope.run_id,episode_epoch:isolated.scope.episode_epoch,
+    context_id:isolated.scope.context_id,action:'select_profile',profile_id:parent.scope.profile_id}});
+  expect(foreign.status()).toBe(409);
+  expect(errors).toEqual([]);
+});
+
 test('configuration drawer saves then collapses and retains failures beside permanent reset', async ({page,request}) => {
   const initial:LiveState=await(await request.get('/api/state')).json();
   const errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));

@@ -16,6 +16,7 @@ from backend.challenges import ChallengeLoad, PRESETS, furniture_circuit, get_ch
 from backend.contracts import Command, ManualPlacement, SpatialSettings, StrictModel, tool_schemas
 from backend.continuous_navigation import ContinuousScan, ContinuousTarget
 from backend.local_progress import read_navigation_progress
+from backend.memory_session import MemoryRequest, configure_memory, memory_command, memory_state
 from backend.local_navigation import ResidentNavigationModel
 from backend.robot import calibration
 from backend.materials import TEXTURE_NAMES, TEXTURE_ROOT
@@ -41,6 +42,7 @@ class Lab:
         self.voice_factory = FoundryRealtime
         self.challenge_id = "bench"
         self.environment = "standalone"
+        self.environment_instance_id = None
         self.orbit_target = "table"
         self.orbit_direction = "clockwise"
         self.interaction_mode = "chat"
@@ -65,6 +67,8 @@ class Lab:
         mission = self.worker.home_mission
         home = mission.home if mission else None
         return {**self.worker.latest, "power": self.worker.power_state(), "agent": self.agent.public(), "realtime": self.realtime_config.public(),
+            "memory": {"scope": self.worker.memory.scope.model_dump(), "profile": self.worker.memory_profile,
+                "error": self.worker.memory.error} if self.worker.memory else None,
             "recording": self.recording_status(),
             "preference_error": self.preference_error,
             "map_setup": {"reuse_saved_map": self.reuse_saved_map, "map_id": home.identity if home else None,
@@ -91,7 +95,7 @@ class Lab:
         self.agent.record_sessions = self.recording_enabled
         self.agent.recording_root = self.recording_root
 
-    async def reset(self, challenge_id=None, orbit_target=None, orbit_direction=None, environment=None, reuse_saved_map=None):
+    async def reset(self, challenge_id=None, orbit_target=None, orbit_direction=None, environment=None, reuse_saved_map=None, environment_instance_id=None):
         async with self.lock:
             await self.agent.halt("Episode reset")
             await self.finish_home_recording("episode_reset")
@@ -103,6 +107,7 @@ class Lab:
             target = self.orbit_target if challenge_id is None else orbit_target or "table"
             direction = self.orbit_direction if challenge_id is None else orbit_direction or "clockwise"
             layout = self.environment if challenge_id is None else environment or "standalone"
+            instance_id = self.environment_instance_id if challenge_id is None else environment_instance_id
             reuse_map = self.reuse_saved_map if reuse_saved_map is None else reuse_saved_map
             rendering = os.environ.get("MILO_RENDERER", "enhanced")
             if rendering == "enhanced":
@@ -118,10 +123,12 @@ class Lab:
                 rendering=rendering, render_resources=self.render_resources if rendering == "enhanced" else None)
             await asyncio.wrap_future(replacement.ready)
             home_state = await replacement.home_state()
-            saved_home = next((item for item in home_state["maps"] if item["environment_id"] == home_state["environment_id"]), None)
+            saved_home = next((item for item in home_state["maps"] if item["environment_id"] == home_state["environment_id"]
+                and item["environment_revision"] == "legacy"), None)
             if saved_home and reuse_map:
                 await replacement.home_command(HomeRequest(run_id=replacement.latest["run_id"], episode_epoch=self.epoch,
                     action="load_map", map_id=saved_home["map_id"]))
+            await configure_memory(replacement, instance_id=instance_id, fresh=not reuse_map, name="Fresh exploration" if not reuse_map else "Default knowledge", reuse=reuse_map)
             if spatial_enabled:
                 await replacement.configure_spatial(SpatialSettings(run_id=replacement.latest["run_id"],
                     episode_epoch=self.epoch, enabled=True))
@@ -130,6 +137,7 @@ class Lab:
             self.worker = replacement
             self.challenge_id = selected
             self.environment = layout
+            self.environment_instance_id = instance_id
             self.reuse_saved_map = reuse_map
             self.orbit_target, self.orbit_direction = target, direction
             recording_evidence = self.agent.recording_evidence
@@ -170,7 +178,7 @@ async def lifespan(app):
         lab.preference_error = "Saved preferences are unavailable; the original store was left unchanged."
     selection = ChallengeLoad.model_validate(saved_scene or {"challenge_id": "bench"})
     await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction,
-        selection.environment, selection.reuse_saved_map)
+        selection.environment, selection.reuse_saved_map, selection.environment_instance_id)
     if saved_scene is not None:
         lab.worker.stop()
         await lab.worker.hold_stopped()
@@ -206,7 +214,7 @@ async def local_origin_guard(request: Request, call_next):
         return Response("Same-origin access required", status_code=403)
     if request.method == "POST" and lab.worker and not lab.worker.powered and request.url.path not in {
             "/api/power", "/api/stop", "/api/command", "/api/reset", "/api/challenges/load", "/api/preferences",
-            "/api/agent/config", "/api/voice/config"}:
+            "/api/agent/config", "/api/voice/config", "/api/memory"}:
         return JSONResponse({"detail": "Turn the robot on before starting work"}, status_code=409)
     ros = getattr(lab.worker, "ros_navigation", None)
     if request.method == "POST" and ros and ros.active and request.url.path not in {
@@ -342,6 +350,26 @@ async def home_state(compact: bool = False):
         return JSONResponse(await lab.worker.home_state(compact=compact), headers={"Cache-Control": "no-store"})
     except RuntimeError as error:
         raise HTTPException(409, "Home map episode changed") from error
+
+
+@app.get("/api/memory")
+async def get_memory():
+    try:
+        return JSONResponse(await memory_state(lab.worker), headers={"Cache-Control": "no-store"})
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/api/memory")
+async def change_memory(request: MemoryRequest):
+    worker = lab.worker
+    if lab.lock.locked() or lab.agent.active or worker.latest.get("busy") or not lab.connections:
+        raise HTTPException(409, "Keep the operator connected and stop the active task before changing knowledge")
+    async with lab.lock:
+        try:
+            return await memory_command(worker, request)
+        except (ValueError, RuntimeError, OSError, sqlite3.Error) as error:
+            raise HTTPException(409, str(error)) from error
 
 
 @app.post("/api/home")
@@ -685,7 +713,7 @@ async def challenges(environment: Literal["standalone", "shared_apartment_v1"] =
 async def load_challenge(selection: ChallengeLoad):
     lab.worker.stop()
     await lab.agent.halt("Challenge changed")
-    await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction, selection.environment, selection.reuse_saved_map)
+    await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction, selection.environment, selection.reuse_saved_map, selection.environment_instance_id)
     try:
         await asyncio.to_thread(PreferenceStore().save_scene, selection)
         lab.preference_error = None

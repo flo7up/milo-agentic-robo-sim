@@ -18,7 +18,7 @@ class MissionPlan(StrictModel):
 
 
 class MissionDecision(StrictModel):
-    action: Literal["plan", "explore", "navigate_frontier", "circle", "select_object", "approach_object", "verify_object", "navigate_place", "observe_room", "report_observation", "look", "turn", "wait", "finish"]
+    action: Literal["plan", "explore", "navigate_frontier", "circle", "select_object", "approach_object", "verify_object", "navigate_place", "observe_room", "report_observation", "look", "turn", "wait", "finish", "lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"]
     plan: MissionPlan | None = None
     object_goal_id: str | None = None
     object_label: str = Field(default="", max_length=60)
@@ -31,6 +31,11 @@ class MissionDecision(StrictModel):
     evidence_text: str = Field(default="", max_length=500)
     room_label: str | None = Field(default=None, min_length=1, max_length=60)
     room_confidence: float | None = Field(default=None, ge=0., le=1., allow_inf_nan=False)
+    memory_query: str = Field(default="", max_length=160)
+    search_target: str | None = Field(default=None, min_length=1, max_length=160)
+    search_result: Literal["seen", "not_seen", "inconclusive"] = "inconclusive"
+    inspection_scope: Literal["viewpoint", "surface", "entrance"] = "viewpoint"
+    visibility_limits: str = Field(default="", max_length=500)
     yaw_rad: float = Field(default=0, ge=-1.5, le=1.5)
     pitch_rad: float = Field(default=.2, ge=-.7, le=1.15)
     turn_rad: float = Field(default=0, ge=-3.15, le=3.15)
@@ -62,6 +67,8 @@ class MissionDecision(StrictModel):
             raise ValueError("Select an exact currently supplied frontier identity")
         if self.action == "report_observation" and not self.evidence_text.strip():
             raise ValueError("Observation reporting requires current visual evidence")
+        if self.search_target is not None and self.action != "report_observation":
+            raise ValueError("Search evidence belongs to a current observation report")
         if self.room_label is not None or self.room_confidence is not None:
             if self.action != "report_observation" or not self.room_label or not self.room_label.strip() or self.room_confidence is None:
                 raise ValueError("A room hypothesis requires report_observation, room_label and room_confidence")
