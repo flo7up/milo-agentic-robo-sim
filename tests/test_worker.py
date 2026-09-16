@@ -93,6 +93,10 @@ async def test_motion_zones_are_opt_in_observed_only_and_never_authorize_motion(
             result = worker.spatial_state(include_motion_zones=True)["motion_zones"]
             assert result["source"] == ("home_map" if home_source else "rolling_depth_map")
             assert not result["motion_authorized"] and len(result["sectors"]) == 48
+            base = next(pose for pose in sim.snapshot()["poses"] if pose["key"] == f"{sim.robot}:-1")
+            assert result["display_pose"]["frame"] == "world"
+            assert result["display_pose"]["position_m"] == base["position"][:2]
+            assert result["display_pose"]["yaw_rad"] == pytest.approx(0., abs=.01)
             assert all(sector["status"] == "clear" for sector in result["sectors"])
             assert result["beam_stop_distance_m"] == .18
             assert result["speed_basis"] == "idle_reference"

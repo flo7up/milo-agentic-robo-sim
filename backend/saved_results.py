@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 import statistics
 import time
 from datetime import datetime, timezone
@@ -14,6 +15,32 @@ from backend.recording import read_recording_json
 RESULTS_ROOT = Path(__file__).resolve().parents[1] / ".runtime"
 MAX_FILE_BYTES = 8_000_000
 MAX_TRAJECTORY_BYTES = 64_000_000
+
+
+def archive_roots():
+    from backend.preferences import PreferenceStore
+    try:
+        configured = PreferenceStore().recording_directories()
+    except (OSError, sqlite3.Error, ValueError):
+        configured = []
+    return list(dict.fromkeys([RESULTS_ROOT.absolute(), *(Path(value).absolute() for value in configured)]))
+
+
+def recording_identifier(directory, legacy_root=None):
+    path = directory.relative_to(legacy_root) if legacy_root is not None else (
+        directory.relative_to(RESULTS_ROOT) if directory.is_relative_to(RESULTS_ROOT) else directory.absolute())
+    return hashlib.sha256(path.as_posix().encode()).hexdigest()[:20]
+
+
+def recording_archive_root(batch_id, root=None):
+    if root is not None:
+        return Path(root)
+    if not re.fullmatch(r"[a-f0-9]{20}", batch_id):
+        raise ValueError("Unknown recorded trial")
+    for candidate in archive_roots():
+        if any(recording_identifier(directory) == batch_id for directory in result_directories(candidate)):
+            return candidate
+    raise ValueError("Unknown recorded trial")
 
 
 def local_file(path, root):
@@ -200,10 +227,17 @@ def benchmark_comparability(manifest, trials):
 
 
 def saved_results(root=None):
-    root = root or RESULTS_ROOT
+    registered = archive_roots()
+    roots = [Path(root)] if root is not None else registered
+    legacy_root = Path(root) if root is not None and Path(root).absolute() not in registered else None
     batches, skipped = [], 0
-    directories = result_directories(root)
-    for directory in directories[:500]:
+    directories = {}
+    for candidate in roots:
+        for directory in result_directories(candidate):
+            directories.setdefault(directory, candidate)
+    ordered = sorted(directories, key=lambda directory: (directory / "experiment.json").stat().st_mtime, reverse=True)
+    for directory in ordered[:500]:
+        root = directories[directory]
         try:
             manifest = read_json(directory / "experiment.json", root)
             if not isinstance(manifest, dict) or manifest.get("stage", "challenges") not in {"challenges", "spatial_workflow"}:
@@ -225,7 +259,7 @@ def saved_results(root=None):
             if not isinstance(cases, list) or not cases or not all(isinstance(case, dict) for case in cases):
                 continue
             by_case = {result.get("case_id", result.get("challenge")): result for result in results if isinstance(result, dict)}
-            identifier = hashlib.sha256(directory.relative_to(root).as_posix().encode()).hexdigest()[:20]
+            identifier = recording_identifier(directory, legacy_root)
             design = manifest.get("design") if isinstance(manifest.get("design"), dict) else {}
             evidence = text(manifest.get("evidence"), "scripted_reference" if manifest.get("mode") == "reference" else
                             "real_model" if results and all(isinstance(result, dict) and result.get("real_luna") is True for result in results) else "unknown")
@@ -361,7 +395,7 @@ def trajectory_scene(directory, challenge_id, root, environment="standalone"):
 
 
 def recorded_trajectory(batch_id, trial_index, root=None):
-    root = root or RESULTS_ROOT
+    root = recording_archive_root(batch_id, root)
     batch = next((batch for batch in saved_results(root)["batches"] if batch["id"] == batch_id), None)
     if batch is None or not 0 <= trial_index < len(batch["trials"]) or not batch["trials"][trial_index]["trajectory_url"]:
         raise ValueError("Saved trajectory unavailable")
@@ -409,7 +443,7 @@ def recorded_trajectory(batch_id, trial_index, root=None):
 
 
 def terminal_image(batch_id, trial_index, root=None):
-    root = root or RESULTS_ROOT
+    root = recording_archive_root(batch_id, root)
     catalog = saved_results(root)
     batch = next((batch for batch in catalog["batches"] if batch["id"] == batch_id), None)
     if batch is None or not 0 <= trial_index < len(batch["trials"]) or not batch["trials"][trial_index]["image_url"]:
@@ -422,8 +456,9 @@ def terminal_image(batch_id, trial_index, root=None):
 
 @lru_cache(maxsize=128)
 def replay_batch_directory(batch_id, root):
+    legacy_root = root if root.absolute() not in archive_roots() else None
     directory = next((directory for directory in result_directories(root)
-        if hashlib.sha256(directory.relative_to(root).as_posix().encode()).hexdigest()[:20] == batch_id), None)
+        if recording_identifier(directory, legacy_root) == batch_id), None)
     if directory is None:
         raise ValueError("Unknown recorded trial")
     return directory
@@ -481,7 +516,7 @@ def replay_media_names(sample):
 
 
 def recorded_replay(batch_id, trial_index, root=None):
-    root = root or RESULTS_ROOT
+    root = recording_archive_root(batch_id, root)
     directory, path, trial = replay_directory(batch_id, trial_index, root)
     frames, events, last_key, last_time, count = [], [], None, -1., 0
     previous_sample = None
@@ -541,7 +576,7 @@ def recorded_replay(batch_id, trial_index, root=None):
 def recorded_replay_media(batch_id, trial_index, name, root=None):
     import base64
     import zlib
-    root = root or RESULTS_ROOT
+    root = recording_archive_root(batch_id, root)
     if not re.fullmatch(r"[a-z]+-[0-9]+(?:-depth)?\.(?:png|json)", name):
         raise ValueError("Invalid replay media name")
     directory, trajectory, _ = replay_directory(batch_id, trial_index, root)

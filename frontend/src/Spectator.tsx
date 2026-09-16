@@ -2,14 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { MousePointer2 } from 'lucide-react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import type { LiveState, ManualPlacement, SpatialTelemetry } from './types';
 import { MovementZoneOverlay } from './movementZones';
+import { TravelledPath } from './travelledPath';
 import { detailRobotVisual, enhancedLighting, visualGeometry, visualMaterial, type GraphicsQuality } from './sceneGraphics';
 import { usePreference } from './Preferences';
 
-export function Spectator({ state, axes, enabled, onPlace, showZones = false, telemetry, connected = true }: {
+export function Spectator({ state, axes, enabled, onPlace, showZones = false, showTrail = true, telemetry, connected = true }: {
   state: LiveState; axes: boolean; enabled: boolean; onPlace: (placement: ManualPlacement) => Promise<void>;
-  showZones?:boolean;telemetry?:SpatialTelemetry | null;connected?:boolean;
+  showZones?:boolean;showTrail?:boolean;telemetry?:SpatialTelemetry | null;connected?:boolean;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const current = useRef(state);
@@ -18,7 +22,12 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, te
   const zoneOptions=useRef({showZones,telemetry,connected});
   zoneOptions.current={showZones,telemetry,connected};
   const [zoneStatus,setZoneStatus]=useState('Unavailable');
+  const [beamStatus,setBeamStatus]=useState('Unavailable');
   const [zoneHint,setZoneHint]=useState('');
+  const travelledPath = useRef(new TravelledPath());
+  const trailVisible = useRef(showTrail);
+  trailVisible.current = showTrail;
+  useEffect(() => {travelledPath.current.sample(state,connected);}, [state,connected]);
   const interaction = useRef({ select: () => {}, cancel: () => {} });
   const [selected, setSelected] = useState(false);
   const [preview, setPreview] = useState<[number, number] | null>(null);
@@ -77,7 +86,8 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, te
     controls.enableDamping = true;
     controls.minDistance = .45;
     controls.maxDistance = facility ? 45 : apartment ? 12 : 8;
-    let cameraAdjusted = false;
+    const initialCameraOffset = camera.position.clone().sub(controls.target);
+    let cameraAdjusted = savedView.current?.run === state.run_id;
     controls.addEventListener('start', () => { cameraAdjusted = true; });
     controls.maxPolarAngle = Math.PI / 2 - .02;
     const hemisphere = new THREE.HemisphereLight(0xffffff, 0x777777, 2);
@@ -102,6 +112,19 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, te
     world.add(robotRoot);
     const movementZones=new MovementZoneOverlay();
     world.add(movementZones.group);
+    const trailGeometry = new LineSegmentsGeometry();
+    const trailPositions = new Float32Array(TravelledPath.maximumSegments*6);
+    trailGeometry.setPositions(trailPositions);
+    const trailBuffer = (trailGeometry.getAttribute('instanceStart') as THREE.InterleavedBufferAttribute).data;
+    trailBuffer.setUsage(THREE.DynamicDrawUsage);
+    trailGeometry.instanceCount = 0;
+    const trailMaterial = new LineMaterial({color:new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue('--cp-link').trim()).getHex(),
+      linewidth:3,transparent:true,opacity:.9,depthWrite:false});
+    const trail = new LineSegments2(trailGeometry,trailMaterial);
+    trail.frustumCulled = false;
+    trail.visible = false;
+    world.add(trail);
+    let trailRevision = -1;
     const axisHelper = new THREE.AxesHelper(.7);
     world.add(axisHelper);
     const links = new Map<string, THREE.Group>();
@@ -274,15 +297,20 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, te
           const distance = Math.max((floorDepth / 2 + 1) / tangent, (floorWidth / 2 + .35) / (tangent * camera.aspect)) + floorDepth * .2;
           camera.position.copy(controls.target).add(new THREE.Vector3(0, 1, .42).normalize().multiplyScalar(distance));
           camera.lookAt(controls.target);
+        } else if (!cameraAdjusted) {
+          camera.position.copy(controls.target).add(initialCameraOffset.clone().multiplyScalar(1 / Math.min(1, camera.aspect)));
+          camera.lookAt(controls.target);
         }
         camera.updateProjectionMatrix();
         renderer.setSize(width, height);
+        trailMaterial.resolution.set(width,height);
       }
     });
     resize.observe(element);
     let frameId = 0;
     let placements = current.current.manual_placements;
     let previousZoneState='';
+    let previousBeamState='';
     const animate = () => {
       if (drag && (!options.current.enabled || drag.source.observation_seq !== current.current.observation.seq)) cancel();
       const positioned = placements !== current.current.manual_placements;
@@ -296,10 +324,27 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, te
         }
       }
       axisHelper.visible = axesVisible.current;
+      const history = travelledPath.current;
+      if (trailRevision !== history.revision) {
+        trailRevision = history.revision;
+        trailPositions.set(history.positions);
+        trailBuffer.needsUpdate = true;
+        trailGeometry.instanceCount = history.positions.length/6;
+      }
+      trail.visible = trailVisible.current && history.positions.length > 0;
+      renderer.domElement.dataset.trailSegments = String(history.positions.length/6);
+      renderer.domElement.dataset.trailVisible = String(trail.visible);
+      renderer.domElement.dataset.trailEnd = JSON.stringify(history.positions.slice(-3));
       const zoneState=movementZones.update(current.current,zoneOptions.current.telemetry,zoneOptions.current.showZones && !drag,zoneOptions.current.connected);
       if(previousZoneState!==zoneState) {previousZoneState=zoneState;setZoneStatus(zoneState);}
+      if(previousBeamState!==movementZones.beamStatus) {previousBeamState=movementZones.beamStatus;setBeamStatus(movementZones.beamStatus);}
       renderer.domElement.dataset.zoneState=zoneState;
-      renderer.domElement.dataset.zoneCount=String(movementZones.group.visible ? movementZones.meshes.size : 0);
+      renderer.domElement.dataset.zoneCount=String(movementZones.group.visible && movementZones.sampledAreas.visible ? movementZones.meshes.size : 0);
+      renderer.domElement.dataset.zoneOrigin=JSON.stringify([...movementZones.sampledAreas.position.toArray().slice(0,2),movementZones.sampledAreas.rotation.z]);
+      renderer.domElement.dataset.beamState=movementZones.beamStatus;
+      renderer.domElement.dataset.beamOrigin=JSON.stringify([...movementZones.liveSensors.position.toArray().slice(0,2),movementZones.liveSensors.rotation.z]);
+      renderer.domElement.dataset.coloredZones=String(movementZones.group.visible && movementZones.sampledAreas.visible
+        ? [...movementZones.meshes.values()].filter(mesh=>['clear','restricted'].includes(mesh.userData.level)).length : 0);
       outline.visible = isSelected;
       if (isSelected) outline.update();
       if (!drag) controls.update();
@@ -322,6 +367,8 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, te
       resize.disconnect();
       controls.dispose();
       movementZones.dispose();
+      trailGeometry.dispose();
+      trailMaterial.dispose();
       outline.geometry.dispose();
       (outline.material as THREE.Material).dispose();
       robotDetails.forEach(dispose => dispose());
@@ -342,7 +389,9 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, te
     <div className="spectator" ref={host} />
     {showZones && <div className="movement-zone-legend" aria-label="Movement zone legend">
       <div>{[['clear','Map-clear'],['restricted','Restricted'],['unknown','Unknown'],['unavailable','Unavailable']].map(([kind,label])=><span key={kind}><i data-zone={kind}/>{label}</span>)}</div>
-      <strong>{zoneStatus} / geometry only</strong>
+      <strong>Areas: {zoneStatus} / geometry only</strong>
+      <span>Beams: {beamStatus} / red hit, blue no return</span>
+      {telemetry?.motion_zones?.display_pose && <span>Areas and stop ticks at sampled pose</span>}
       {telemetry?.motion_zones && <span>Map radius {(telemetry.motion_zones.planning_radius_m+(telemetry.motion_zones.map_margin_m ?? 0)).toFixed(2)} m / includes footprint margin</span>}
       <span>{telemetry?.motion_zones ? `Footprint ${telemetry.motion_zones.footprint.radius_m.toFixed(2)} m / beam stop ${telemetry.motion_zones.beam_stop_distance_m.toFixed(2)} m at ${telemetry.motion_zones.preview_speed_mps.toFixed(2)} m/s${telemetry.motion_zones.speed_basis==='idle_reference' ? ' reference' : ''}` : 'Zone telemetry unavailable'}</span>
       {state.navigation?.diagnostics?.stop && <span>Stop: {state.navigation.diagnostics.stop.reason.split(':')[0]}</span>}

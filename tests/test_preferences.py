@@ -22,6 +22,25 @@ def test_preferences_survive_new_store_and_merge_without_scene_commands(tmp_path
     path.unlink()
 
 
+def test_recording_preferences_retain_previous_folders_and_default_choice(tmp_path):
+    store = PreferenceStore(tmp_path / "preferences.sqlite3")
+    assert store.recording_directories() == []
+    first = str(tmp_path / "First recordings")
+    second = str(tmp_path / "Second recordings")
+    store.update(PreferencesPatch(recording_enabled=True, recording_directory=first))
+    store.update(PreferencesPatch(recording_enabled=False, recording_directory=second))
+    assert store.read()["preferences"] == {"recording_enabled": False, "recording_directory": second}
+    assert store.recording_directories() == [second, first]
+    store.update(PreferencesPatch(recording_directory=""))
+    assert store.read()["preferences"]["recording_directory"] == ""
+    assert store.recording_directories() == [second, first]
+    assert not (tmp_path / "First recordings").exists()
+    assert not (tmp_path / "Second recordings").exists()
+    for value in ("https://example.com/recordings", "\\\\server\\share", "//server/share", "folder\x00name"):
+        with pytest.raises(ValidationError):
+            PreferencesPatch(recording_directory=value)
+
+
 def test_loaded_scene_is_separate_from_picker_draft(tmp_path):
     store = PreferenceStore(tmp_path / "preferences.sqlite3")
     store.save_scene(ChallengeLoad(challenge_id="bench"))

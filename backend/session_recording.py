@@ -2,7 +2,9 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 import time
 from uuid import uuid4
 
@@ -12,6 +14,24 @@ from backend.experiment_variants import variant_snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
 SESSION_RESULTS_ROOT = ROOT / ".runtime/performance"
+
+
+def recording_root(value=None):
+    path = Path(value).expanduser() if value else SESSION_RESULTS_ROOT
+    path = (ROOT / path if not path.is_absolute() else path).resolve()
+    if str(path).startswith(("\\\\", "//")):
+        raise ValueError("Choose a local recording folder")
+    return path
+
+
+def check_recording_directory(value):
+    path = recording_root(value)
+    path.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path, prefix=".milo-write-check-", suffix=".tmp") as stream:
+        stream.write(b"Milo recording folder check\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return path
 
 
 def map_provenance(worker):
@@ -26,10 +46,10 @@ def map_provenance(worker):
 
 
 class HomeSessionRecording:
-    def __init__(self, worker, request, evidence="operator_session", directory=None):
+    def __init__(self, worker, request, evidence="operator_session", directory=None, root=None):
         self.worker = worker
         self.request = request
-        self.directory = Path(directory) if directory else SESSION_RESULTS_ROOT / f"home-session-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+        self.directory = Path(directory) if directory else recording_root(root) / f"home-session-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
         self.case_id = worker.challenge.id if worker.challenge else "bench"
         self.recorder = RunRecorder(self.directory / self.case_id / "recording")
         self.done = asyncio.Event()
@@ -162,7 +182,8 @@ def create_session(controller, worker, settings, profile):
         evidence = "unknown"
     if getattr(settings, "mission_local_only", False):
         evidence = "scripted_test"
-    directory = SESSION_RESULTS_ROOT / f"browser-session-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+    root = Path(getattr(controller, "recording_root", None) or SESSION_RESULTS_ROOT)
+    directory = root / f"browser-session-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
     challenge = worker.challenge
     case_id = challenge.id if challenge else "bench"
     case = {"case_id": case_id, "challenge": case_id, "environment": challenge.environment if challenge else "standalone",
@@ -222,6 +243,7 @@ async def run_recorded_session(controller, worker, settings, profile, stop_revis
     initial_status = (worker.latest.get("challenge") or {}).get("status")
     try:
         directory, recorder, manifest = create_session(controller, worker, settings, profile)
+        controller.recording_directory = recorder.directory
 
         def attach(sim):
             manifest["home_map"] = map_provenance(worker)

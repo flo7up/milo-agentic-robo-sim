@@ -18,6 +18,8 @@ class PreferencesPatch(BaseModel):
     turns: int | None = Field(default=None, ge=1, le=80)
     max_model_requests: int | None = Field(default=None, ge=1, le=200)
     max_model_tokens: int | None = Field(default=None, ge=1, le=2000000)
+    recording_enabled: bool | None = None
+    recording_directory: str | None = Field(default=None, max_length=1024)
     reasoning: Literal["none", "low", "medium", "high"] | None = None
     luna_endpoint: str | None = Field(default=None, max_length=2048)
     luna_deployment: str | None = Field(default=None, max_length=128, pattern=r"^[\w.-]*$")
@@ -57,6 +59,19 @@ class PreferencesPatch(BaseModel):
             raise ValueError("Joint targets must stay within the manual control limits")
         return value
 
+    @field_validator("recording_directory")
+    @classmethod
+    def local_recording_directory(cls, value):
+        if value is None:
+            return value
+        value = value.strip()
+        if any(ord(character) < 32 for character in value) or value.startswith(("\\\\", "//")) or "://" in value:
+            raise ValueError("Choose a local folder path, not a network path or URL")
+        path = Path(value).expanduser()
+        if path.drive and not path.is_absolute():
+            raise ValueError("Use an absolute drive path or a workspace-relative folder")
+        return value
+
     @field_validator("luna_endpoint")
     @classmethod
     def credential_free_endpoint(cls, value):
@@ -89,11 +104,26 @@ class PreferenceStore:
     def save_scene(self, selection: ChallengeLoad):
         self._write({"loaded_scene": selection.model_dump(mode="json")})
 
+    def recording_directories(self):
+        if not self.path.exists():
+            return []
+        with closing(sqlite3.connect(f"file:{self.path.resolve().as_posix()}?mode=ro", uri=True, timeout=5)) as connection:
+            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recording_directories'").fetchone()
+            return [row[0] for row in connection.execute("SELECT path FROM recording_directories ORDER BY rowid DESC LIMIT 100")] if exists else []
+
     def _write(self, changes):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.path, timeout=5)) as connection, connection:
             connection.execute("CREATE TABLE IF NOT EXISTS preferences (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
             connection.execute("BEGIN IMMEDIATE")
+            if changes.get("recording_directory"):
+                directory = Path(changes["recording_directory"]).expanduser()
+                if not directory.is_absolute():
+                    directory = Path(__file__).resolve().parents[1] / directory
+                directory = directory.resolve()
+                changes["recording_directory"] = str(directory)
+                connection.execute("CREATE TABLE IF NOT EXISTS recording_directories (path TEXT PRIMARY KEY)")
+                connection.execute("INSERT OR IGNORE INTO recording_directories(path) VALUES (?)", (str(directory),))
             if "goals" in changes:
                 previous = connection.execute("SELECT value FROM preferences WHERE name = 'goals'").fetchone()
                 changes["goals"] = {**(json.loads(previous[0]) if previous else {}), **changes["goals"]}

@@ -223,6 +223,23 @@ test('test view navigation keeps styled accessible tabs across desktop and mobil
       if (active === 'Test archive') await current.click();
       await expect(current).toHaveAttribute('aria-current','page');
       await expect(navigation).toHaveCSS('display','flex');
+      const headerLayout = await navigation.evaluate(element => {
+        const header = element.closest('header')!;
+        const bounds = header.getBoundingClientRect();
+        const brand = header.querySelector('.brand')!.getBoundingClientRect();
+        const menu = element.getBoundingClientRect();
+        return {rightGap:bounds.right - menu.right - parseFloat(getComputedStyle(header).paddingRight),
+          overlap:brand.left < menu.right && menu.left < brand.right && brand.top < menu.bottom && menu.top < brand.bottom,
+          centerDifference:Math.abs(brand.top + brand.height / 2 - menu.top - menu.height / 2),
+          height:bounds.height,overflow:document.documentElement.scrollWidth > innerWidth};
+      });
+      expect(Math.abs(headerLayout.rightGap)).toBeLessThan(2);
+      expect(headerLayout.overlap).toBe(false);
+      expect(headerLayout.overflow).toBe(false);
+      if (width >= 768) {
+        expect(headerLayout.centerDifference).toBeLessThan(2);
+        expect(headerLayout.height).toBeLessThan(80);
+      }
       const links = navigation.getByRole('link');
       for (const link of await links.all()) {
         await expect(link).toHaveCSS('display','flex');
@@ -248,10 +265,11 @@ test('test view navigation keeps styled accessible tabs across desktop and mobil
       expect(await current.boundingBox()).toEqual(beforeHover);
       if (width === 1440 || width === 320) {
         await navigation.screenshot({path:test.info().outputPath(`navigation-${active.replace(' ','-')}-${width}.png`)});
+        await navigation.locator('..').screenshot({path:`../.runtime/unified-header-v1/${active.replace(' ','-')}-${width}.png`});
       }
     }
     await page.getByRole('navigation',{name:'Test views'}).getByRole('link',{name:'Test cockpit',exact:true}).click();
-    await expect(page).toHaveURL(/\/$/);
+    await expect(page).toHaveURL(url => url.pathname === '/' && !url.searchParams.has('view') && url.searchParams.get('diagnostics') === 'legacy');
   }
   expect(context.pages()).toHaveLength(pages);
   expect(await page.evaluate(async () => (await (await fetch('/api/state')).json()).run_id)).toBe(initial);
@@ -773,6 +791,8 @@ test('continuous local navigation tracks a camera destination without model call
   await request.post('/api/challenges/load', {data:{challenge_id:'park'}});
   await page.setViewportSize({width:1440,height:1100});
   await page.goto('/');
+  await page.getByRole('switch',{name:'Sensors and areas',exact:true}).check();
+  await page.getByRole('tab',{name:'Telemetry',exact:true}).click();
   await page.locator('.spatial-section summary').click();
   await page.getByRole('checkbox',{name:'Fold arms during floor scan',exact:true}).check();
   const scan = page.waitForResponse(response=>response.url().endsWith('/api/continuous/scan'));
@@ -788,11 +808,16 @@ test('continuous local navigation tracks a camera destination without model call
   const response = await start;
   expect(response.ok(), await response.text()).toBe(true);
   await expect(page.getByLabel('Continuous navigation status')).toHaveAttribute('data-status','running');
-  await expect(page.getByRole('button',{name:'Start LLM control',exact:true})).toBeHidden();
+  await expect(page.getByRole('button',{name:'Start LLM control',exact:true})).toBeDisabled();
   await expect(page.getByRole('button',{name:'Drive forward',exact:true})).toBeHidden();
   await expect(page.getByRole('button',{name:'Stop',exact:true})).toBeVisible();
   const during: LiveState = await (await request.get('/api/state')).json();
   const initialFrame = during.camera.seq;
+  const overlay = page.locator('.spectator canvas');
+  await expect(overlay).toHaveAttribute('data-beam-state','Live');
+  await expect(overlay).toHaveAttribute('data-zone-state','Observed');
+  const firstAreaPose = await overlay.getAttribute('data-zone-origin');
+  await expect.poll(()=>overlay.getAttribute('data-zone-origin')).not.toBe(firstAreaPose);
   await expect.poll(async()=>((await (await request.get('/api/state')).json()) as LiveState).camera.seq).toBeGreaterThan(initialFrame);
   await expect(page.getByLabel('Continuous navigation status')).toHaveAttribute('data-status','arrived',{timeout:30000});
   const sensor = await (await request.get('/api/spatial')).json();
@@ -804,6 +829,19 @@ test('continuous local navigation tracks a camera destination without model call
   expect(after.agent.input_tokens+after.agent.output_tokens).toBe(0);
   expect(after.agent.active).toBe(false);
   expect(after.proximity.collisions).toHaveLength(0);
+  await expect(overlay).toHaveAttribute('data-trail-visible','true');
+  await expect.poll(async()=>Number(await overlay.getAttribute('data-trail-segments'))).toBeGreaterThan(10);
+  const actualBase=after.snapshot.poses.find(pose=>pose.key===`${after.robot_body_id}:-1`)!;
+  await expect.poll(async()=>{
+    const endpoint=JSON.parse((await overlay.getAttribute('data-trail-end'))!);
+    return Math.hypot(endpoint[0]-actualBase.position[0],endpoint[1]-actualBase.position[1]);
+  }).toBeLessThan(.04);
+  await writeFile('../.runtime/ground-trail-v1/physics-route.json',JSON.stringify({evidence:'scripted_camera_destination_real_physics',
+    continuous:sensor.continuous,first_area_pose:firstAreaPose,final_area_pose:await overlay.getAttribute('data-zone-origin'),
+    trail_segments:Number(await overlay.getAttribute('data-trail-segments')),trail_end:JSON.parse((await overlay.getAttribute('data-trail-end'))!),
+    actual_base_position:actualBase.position,
+    input_tokens:after.agent.input_tokens,output_tokens:after.agent.output_tokens,contacts:after.proximity.collisions},null,2));
+  await page.locator('.world-panel').screenshot({path:'../.runtime/ground-trail-v1/physics-route.png'});
   for(const width of [1440,390,320]) {
     await page.setViewportSize({width,height:1000});
     await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);

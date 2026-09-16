@@ -45,6 +45,8 @@ class Lab:
         self.orbit_direction = "clockwise"
         self.interaction_mode = "chat"
         self.home_recording = None
+        self.recording_enabled = True
+        self.recording_root = None
         self.reuse_saved_map = True
         self.preference_error = None
         self.power_off_pending = False
@@ -54,6 +56,8 @@ class Lab:
         recording = self.home_recording
         if recording:
             await asyncio.shield(recording.finish(reason))
+            self.agent.recording_directory = recording.recorder.directory
+            self.agent.recording_error = recording.error
             if self.home_recording is recording:
                 self.home_recording = None
 
@@ -61,11 +65,31 @@ class Lab:
         mission = self.worker.home_mission
         home = mission.home if mission else None
         return {**self.worker.latest, "power": self.worker.power_state(), "agent": self.agent.public(), "realtime": self.realtime_config.public(),
+            "recording": self.recording_status(),
             "preference_error": self.preference_error,
             "map_setup": {"reuse_saved_map": self.reuse_saved_map, "map_id": home.identity if home else None,
                 "name": home.name if home else None, "revision": home.revision if home else None,
                 "localization": mission.localization["status"] if mission else "unlocalized"},
             "interaction_mode": self.interaction_mode, "local_navigation_model": self.local_navigation.public()}
+
+    def recording_status(self):
+        from backend.session_recording import SESSION_RESULTS_ROOT
+        recorder = self.worker.recorder if self.worker else None
+        home = self.home_recording
+        active = self.agent.recording_active or bool(home and not home.finished)
+        directory = recorder.directory if recorder else home.recorder.directory if home else self.agent.recording_directory
+        return {"enabled": self.recording_enabled, "directory": str(self.recording_root or SESSION_RESULTS_ROOT),
+            "active": active, "status": "recording" if recorder else "finalizing" if active else "ready" if self.recording_enabled else "off",
+            "run_directory": str(directory) if directory else None,
+            "samples": recorder.sample_sequence if recorder else None,
+            "error": (home.error if home else None) or self.agent.recording_error or (self.worker.latest.get("recording_error") if self.worker else None)}
+
+    def configure_recording(self, preferences):
+        from backend.session_recording import recording_root
+        self.recording_enabled = preferences.get("recording_enabled", True)
+        self.recording_root = recording_root(preferences["recording_directory"]) if preferences.get("recording_directory") else None
+        self.agent.record_sessions = self.recording_enabled
+        self.agent.recording_root = self.recording_root
 
     async def reset(self, challenge_id=None, orbit_target=None, orbit_direction=None, environment=None, reuse_saved_map=None):
         async with self.lock:
@@ -112,7 +136,8 @@ class Lab:
             self.agent = AgentController(self.agent.config, self.agent.model_factory, policy_factory=self.agent.policy_factory,
                 local_navigation_factory=self.agent.local_navigation_factory)
             from backend.agent import ConfiguredModel
-            self.agent.record_sessions = True
+            self.agent.record_sessions = self.recording_enabled
+            self.agent.recording_root = self.recording_root
             self.agent.recording_evidence = "real_model" if self.agent.model_factory is ConfiguredModel else (
                 "scripted_test" if recording_evidence == "scripted_test" else "unknown")
             self.interaction_mode = "chat"
@@ -136,9 +161,12 @@ async def lifespan(app):
         configuration_error = "Invalid Foundry configuration. Check the endpoint and model profiles."
     lab.preference_error = None
     try:
-        saved_scene = (await asyncio.to_thread(PreferenceStore().read))["scene"]
+        saved = await asyncio.to_thread(PreferenceStore().read)
+        saved_scene = saved["scene"]
+        lab.configure_recording(saved["preferences"])
     except (OSError, sqlite3.Error, ValueError):
         saved_scene = None
+        lab.configure_recording({})
         lab.preference_error = "Saved preferences are unavailable; the original store was left unchanged."
     selection = ChallengeLoad.model_validate(saved_scene or {"challenge_id": "bench"})
     await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction,
@@ -206,10 +234,28 @@ async def read_preferences():
 
 @app.post("/api/preferences")
 async def save_preferences(patch: PreferencesPatch):
+    if patch.model_fields_set & {"recording_enabled", "recording_directory"}:
+        if lab.lock.locked() or lab.agent.active or lab.agent.recording_active or lab.worker.latest.get("busy") or lab.worker.recorder:
+            raise HTTPException(409, "Wait for the current run and recording to finish before changing recording settings")
+        async with lab.lock:
+            try:
+                from backend.session_recording import check_recording_directory
+                if patch.recording_directory is not None:
+                    await asyncio.to_thread(check_recording_directory, patch.recording_directory)
+                saved = await asyncio.to_thread(PreferenceStore().update, patch)
+                lab.configure_recording(saved["preferences"])
+                return saved
+            except (OSError, sqlite3.Error, ValueError):
+                raise HTTPException(400, "Recording folder could not be saved. Choose a writable local folder.") from None
     try:
         return await asyncio.to_thread(PreferenceStore().update, patch)
     except (OSError, sqlite3.Error, ValueError):
         raise HTTPException(503, "Preferences could not be saved.") from None
+
+
+@app.get("/api/recording")
+async def recording_status():
+    return JSONResponse(lab.recording_status(), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/test-variant")
@@ -319,10 +365,10 @@ async def home_operation(request: HomeRequest):
             await lab.finish_home_recording("workflow_transition")
         if lab.home_recording and lab.home_recording.finished:
             lab.home_recording = None
-        if starts and lab.home_recording is None:
+        if starts and lab.home_recording is None and lab.recording_enabled:
             evidence = "scripted_test" if lab.agent.recording_evidence == "scripted_test" else "operator_session"
-            lab.home_recording = HomeSessionRecording(worker, request, evidence)
             try:
+                lab.home_recording = HomeSessionRecording(worker, request, evidence, root=lab.recording_root)
                 await lab.home_recording.start()
             except (OSError, ValueError, RuntimeError) as error:
                 lab.home_recording = None

@@ -274,6 +274,61 @@ def test_travel_posture_reduces_footprint_through_real_joint_motion():
             sim.close()
 
 
+@pytest.mark.parametrize("rendering,pitch", [("tiny", 0.), ("tiny", .2), ("tiny", .45), ("enhanced", .45)])
+def test_folded_arms_stay_outside_forward_navigation_camera(rendering, pitch, tmp_path, record_property):
+    from PIL import Image
+    from backend.robot import NEUTRAL, TRAVEL
+    sim = BulletSimulation(width=160, height=120, rendering=rendering)
+    try:
+        if rendering == "enhanced":
+            for side in ("left", "right"):
+                result = command(sim, "set_arm_joints", arm=side, joint_positions_rad=[0., -1.3, 2.6, 0., -1.3, 0.], duration_s=2)
+                assert result.status == "ok", result.message
+        before = sim.robot_footprint()
+        for side in ("left", "right"):
+            result = command(sim, "set_arm_joints", arm=side, joint_positions_rad=TRAVEL, duration_s=2)
+            assert result.status == "ok", result.message
+        assert command(sim, "set_head", yaw_rad=0., pitch_rad=pitch, duration_s=1).status == "ok"
+        eye, rotation = sim.camera_pose()
+        rendered = bullet.getCameraImage(640, 480,
+            bullet.computeViewMatrix(eye, eye + rotation[:, 0], rotation[:, 2]),
+            bullet.computeProjectionMatrixFOV(65, 640 / 480, .015, 12),
+            renderer=bullet.ER_TINY_RENDERER, flags=bullet.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX,
+            physicsClientId=sim.client)
+        segmentation = np.asarray(rendered[4], dtype=np.int64).reshape(480, 640)
+        robot_pixels = (segmentation >= 0) & ((segmentation & ((1 << 24) - 1)) == sim.robot)
+        link_indices = (segmentation >> 24) - 1
+        arm_links = {joint: bullet.getJointInfo(sim.robot, joint, physicsClientId=sim.client)[12].decode()
+            for joint in range(bullet.getNumJoints(sim.robot, physicsClientId=sim.client))}
+        visible = {name: int(np.count_nonzero(robot_pixels & (link_indices == joint)))
+            for joint, name in arm_links.items() if name.startswith(("left_", "right_")) and "wheel" not in name}
+        image_path = tmp_path / f"folded-camera-{pitch}.png"
+        Image.fromarray(np.asarray(rendered[2], dtype=np.uint8).reshape(480, 640, 4)[:, :, :3]).save(image_path)
+        sim.width, sim.height = 640, 480
+        actual_path = tmp_path / f"{rendering}-camera-{pitch}.png"
+        actual_path.write_bytes(sim.capture())
+        record_property("arm_pixels", str(visible))
+        record_property("camera_image", str(image_path))
+        record_property("actual_camera_image", str(actual_path))
+        record_property("footprint_before", str(before))
+        record_property("footprint_after", str(sim.robot_footprint()))
+        assert sum(visible.values()) == 0, visible
+        assert not sim.proximity_sensors().collisions
+        for side, opposite in (("left", "right"), ("right", "left")):
+            fixed_links = [-1, sim.joints["torso_fixed"], sim.joints["head_yaw"], sim.joints["head_pitch"],
+                *sim.arms[opposite], sim.palms[opposite], *sim.fingers[opposite]]
+            for hand_link in [sim.palms[side], *sim.fingers[side]]:
+                for other in fixed_links:
+                    assert not bullet.getClosestPoints(sim.robot, sim.robot, distance=0., linkIndexA=hand_link,
+                        linkIndexB=other, physicsClientId=sim.client), (side, hand_link, other)
+        sim.width, sim.height = 160, 120
+        for side in ("left", "right"):
+            result = command(sim, "set_arm_joints", arm=side, joint_positions_rad=NEUTRAL, duration_s=2)
+            assert result.status == "ok", result.message
+    finally:
+        sim.close()
+
+
 def test_robot_footprint_does_not_grow_when_only_base_heading_changes():
     from backend.robot import TRAVEL
     sim = BulletSimulation(width=160, height=120)

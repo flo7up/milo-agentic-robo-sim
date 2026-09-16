@@ -1282,6 +1282,7 @@ if __name__ == "__main__":
         if path.exists():
             with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute("DELETE FROM preferences")
+            lab.configure_recording({})
         return {"reset": True}
 
     app.router.routes.insert(0, app.router.routes.pop())

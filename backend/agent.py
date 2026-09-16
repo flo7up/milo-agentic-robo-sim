@@ -547,6 +547,9 @@ class AgentController:
         self.local_navigation_factory = local_navigation_factory
         self.evaluation_budget = evaluation_budget
         self.record_sessions = False
+        self.recording_root = None
+        self.recording_directory = None
+        self.recording_error = None
         self.recording_active = False
         self.recording_finished = asyncio.Event()
         self.recording_finished.set()
@@ -1080,6 +1083,8 @@ class AgentController:
         if not self.record_sessions or worker.recorder is not None:
             return await self._run_controller(worker, settings, profile, stop_revision)
         from backend.session_recording import run_recorded_session
+        self.recording_directory = None
+        self.recording_error = None
         self.recording_active = True
         self.recording_finished.clear()
         try:
@@ -1091,6 +1096,7 @@ class AgentController:
             worker.stop()
             self.active = False
             self.state.update(phase="error", error=f"Recording failed ({type(error).__name__})")
+            self.recording_error = self.state["error"]
             self._set_outcome("error", self.state["error"])
         finally:
             self.recording_active = False

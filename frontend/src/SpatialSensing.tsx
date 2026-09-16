@@ -113,6 +113,7 @@ export function SpatialSensing({ runId, epoch, connected, busy, request, hudHost
       }
     }
     async function poll() {
+      const requestedAt = performance.now();
       try {
         const response = await fetch('/api/spatial', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
           headers:showMotionZones ? {'X-Milo-Motion-Zones':'1'} : undefined });
@@ -120,10 +121,13 @@ export function SpatialSensing({ runId, epoch, connected, busy, request, hudHost
         const data: SpatialState = await response.json();
         if (!active) return;
         setState(data);
-        pollInterval = data.power?.mode === 'off' ? 5000 : data.power?.mode === 'idle' ? 2000 : 750;
         const received = performance.now();
+        const requestDuration = received - requestedAt;
+        pollInterval = data.power?.mode === 'off' ? 5000 : data.power?.mode === 'idle' ? 2000
+          : showMotionZones ? Math.max(250, requestDuration * 4) : 750;
         setReceivedAt(received);
-        telemetry = {run_id:runId,episode_epoch:epoch,received_at_ms:received,enabled:data.enabled,paused:data.paused,error:data.error,motion_zones:data.motion_zones,
+        telemetry = {run_id:runId,episode_epoch:epoch,received_at_ms:received,request_duration_ms:requestDuration,
+          enabled:data.enabled,paused:data.paused,error:data.error,motion_zones:data.motion_zones,
           frame:data.frame ? {sequence:data.frame.sequence,simulated_time_s:data.frame.simulated_time_s} : null,
           map:data.map ? {age_s:data.map.age_s,stale:data.map.stale,observed_floor_cells:data.map.observed_floor_cells,obstacle_cells:data.map.obstacle_cells} : null};
         onTelemetry?.(telemetry);
@@ -288,13 +292,13 @@ export function SpatialSensing({ runId, epoch, connected, busy, request, hudHost
         <div className="viewport-map-meta"><span role="status" data-state={mapStatus.toLowerCase()}>{mapStatus}</span><span title="Sensor-observed local map in the wheel-odometry frame">8 x 8 m</span></div>
       </div>
     </section>, hudHost)}
-    <dialog ref={dialog} className="spatial-map-dialog" aria-label="Spatial map" onClose={() => setExpanded(false)}>
+    {createPortal(<dialog ref={dialog} className="spatial-map-dialog" aria-label="Spatial map" onClose={() => setExpanded(false)}>
       <RobotControlSlot active={expanded} />
       <div className="robot-camera-toolbar"><h3>Observed spatial map</h3><span role="status">{mapStatus} / wheel odometry</span>
         <button className="icon-button" type="button" aria-label="Close spatial map" title="Close spatial map" onClick={() => setExpanded(false)}><X size={19} /></button></div>
       {expanded && mapFigure}
       <div className="spatial-legend"><span><i className="spatial-floor" />Observed floor</span><span><i className="spatial-obstacle" />Obstacles</span><span><i className="spatial-unknown" />Unknown</span></div>
-    </dialog>
+    </dialog>, document.body)}
     <details className="spatial-section" ref={details}>
     <summary><Scan size={17} /> Spatial sensing</summary>
     <div className="panel-header">

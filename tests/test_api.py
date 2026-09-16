@@ -69,6 +69,38 @@ def test_robot_power_preserves_scene_blocks_work_and_resumes_only_to_idle():
         assert client.post("/api/power", json={"run_id":reset["run_id"], "episode_epoch":reset["episode_epoch"], "on":True}).json()["power"]["mode"] == "idle"
 
 
+def test_recording_folder_settings_are_checked_persisted_and_idle_only(tmp_path):
+    from backend.app import lab
+    from backend.preferences import PreferenceStore
+    directory = tmp_path / "Recorded runs"
+    with TestClient(app) as client:
+        initial = client.get("/api/state").json()
+        assert client.get("/api/recording").json()["enabled"]
+        response = client.post("/api/preferences", json={"recording_enabled": False, "recording_directory": str(directory)})
+        assert response.status_code == 200, response.text
+        assert directory.is_dir() and not list(directory.iterdir())
+        status = client.get("/api/recording").json()
+        assert status["directory"] == str(directory) and status["status"] == "off" and not status["active"]
+        assert not lab.agent.record_sessions and lab.agent.recording_root == directory
+        assert client.get("/api/state").json()["snapshot"] == initial["snapshot"]
+        blocked = tmp_path / "not-a-folder"
+        blocked.write_text("preserve")
+        assert client.post("/api/preferences", json={"recording_directory": str(blocked)}).status_code == 400
+        assert client.get("/api/recording").json()["directory"] == str(directory)
+        lab.agent.recording_active = True
+        try:
+            assert client.post("/api/preferences", json={"recording_enabled": True}).status_code == 409
+        finally:
+            lab.agent.recording_active = False
+        assert client.post("/api/preferences", json={"recording_directory": "//server/share"}).status_code == 422
+        assert client.post("/api/preferences", json={"recording_enabled": True}, headers={"Origin":"https://other.example"}).status_code == 403
+        assert PreferenceStore().recording_directories() == [str(directory)]
+    with TestClient(app) as client:
+        status = client.get("/api/recording").json()
+        assert not status["enabled"] and status["directory"] == str(directory)
+        assert not lab.agent.record_sessions
+
+
 def test_corrupt_preferences_do_not_replace_store_or_prevent_startup(tmp_path):
     path = tmp_path / "preferences.sqlite3"
     path.write_bytes(b"retained invalid preferences")

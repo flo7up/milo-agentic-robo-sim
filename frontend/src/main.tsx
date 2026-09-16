@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
-import { Activity, ArrowDown, ArrowUp, Battery, BatteryCharging, Camera, Check, CircleStop, Crosshair, Eye, Hand, LoaderCircle, Map, MessageSquare, Mic, Minus, Move3D, Pause, Play, Power, RotateCcw, RotateCw, Settings2, Timer, TriangleAlert, Volume2, Wifi, WifiOff } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, Battery, BatteryCharging, Camera, Check, CircleStop, Crosshair, Eye, Hand, LoaderCircle, Map, MessageSquare, Mic, Minus, Move3D, Pause, Play, Power, Radar, RotateCcw, RotateCw, Route, Settings2, Timer, TriangleAlert, Volume2, Wifi, WifiOff } from 'lucide-react';
 import { Spectator } from './Spectator';
 import { HeadCamera } from './HeadCamera';
 import { SpatialSensing } from './SpatialSensing';
@@ -116,10 +116,27 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
   const [sceneLoading, setSceneLoading] = useState(false);
   const [spatialHud, setSpatialHud] = useState<HTMLDivElement | null>(null);
   const [cameraMinimized, setCameraMinimized] = useState(true);
+  const [liveReadoutsOpen, setLiveReadoutsOpen] = useState(true);
   const [spatialTelemetry, setSpatialTelemetry] = useState<SpatialTelemetry | null>(null);
-  const [showMotionZones,setShowMotionZones]=useState(false);
+  const [showMotionZones,setShowMotionZones]=useState(() => {
+    try { return sessionStorage.getItem('milo-sensors-and-areas') === 'true'; }
+    catch { return false; }
+  });
+  useEffect(() => {
+    try { sessionStorage.setItem('milo-sensors-and-areas', String(showMotionZones)); }
+    catch {}
+  }, [showMotionZones]);
+  const [showTravelledPath,setShowTravelledPath]=useState(() => {
+    try { return sessionStorage.getItem('milo-travelled-path') !== 'false'; }
+    catch { return true; }
+  });
+  useEffect(() => {
+    try { sessionStorage.setItem('milo-travelled-path', String(showTravelledPath)); }
+    catch {}
+  }, [showTravelledPath]);
   const [powerPending, setPowerPending] = useState(false);
   const [commandHost, setCommandHost] = useState<HTMLDivElement | null>(null);
+  const [settingsHost, setSettingsHost] = useState<HTMLDivElement | null>(null);
   const [controlSurface, setControlSurface] = useState<HTMLElement | null>(null);
   const [manualOpen, setManualOpen] = usePreference('manual_open', false);
   const [axes, setAxes] = usePreference('axes', false);
@@ -194,6 +211,27 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
   const observation = state?.observation;
   const inferenceBudget = state?.agent.inference_budget;
   const reportedTokens = (state?.agent.input_tokens ?? 0) + (state?.agent.output_tokens ?? 0);
+  const telemetryContent = <>
+    <details className="sensor-panel compact-disclosure">
+      <summary><Activity size={16} />Robot sensors</summary>
+      <div className="sensors">
+        <div className="sensor-row"><span>Head yaw / pitch</span><strong>{observation?.head_rad.map(value => value.toFixed(2)).join(' / ') ?? '-'} rad</strong></div>
+        <div className="sensor-row"><span>Encoder odometry</span><strong>{observation?.odometry_m_rad.slice(0, 2).map(value => value.toFixed(2)).join(', ') ?? '-'} m</strong></div>
+        {['left', 'right'].map(side => <div className="gripper-reading" key={side}><span>{side} gripper</span><strong>{((observation?.grippers[side].aperture_m ?? 0) * 1000).toFixed(0)} mm</strong><span>{observation?.grippers[side].load_n.toFixed(2) ?? '-'} N</span><span title="Inner and outer finger contact" className="contacts">{observation?.grippers[side].contact.map((value, index) => <i key={index} className={value ? 'on' : ''} />)}</span></div>)}
+        {state?.proximity && <ProximityPanel sensors={state.proximity} />}
+        {observation?.battery && <div className={`battery-reading ${observation.battery.low ? 'battery-low' : ''}`} aria-label="Battery status">
+          <span>{observation.battery.charging ? <BatteryCharging size={16} /> : <Battery size={16} />} Battery</span>
+          <meter aria-label="Battery level" min={0} max={100} low={35} high={90} optimum={100} value={observation.battery.charge_pct} />
+          <strong>{observation.battery.charge_pct.toFixed(1)}%</strong>
+          <small>{observation.battery.charging ? 'Charging' : observation.battery.charge_pct === 0 ? 'Battery empty' : observation.battery.low ? 'Low battery / return to charger' : 'Battery ready'}</small>
+        </div>}
+      </div>
+    </details>
+    <div id="map">{state && <><HomeMapping key={`home-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
+      connected={connected} busy={sceneLoading || state.busy || state.agent.active} stopped={state.stopped} request={api} />
+      <SpatialSensing key={`spatial-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
+      connected={connected} busy={sceneLoading || state.busy || state.agent.active} request={api} hudHost={spatialHud} onTelemetry={setSpatialTelemetry} showMotionZones={showMotionZones} /></>}</div>
+  </>;
   const commandBar = <section className="command-bar" aria-label="Robot controls">
     <RobotActivity state={state} connected={connected} />
     <div className="run-actions">{state?.power && <div className="robot-power-control">
@@ -202,9 +240,11 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
         onClick={() => void togglePower()}><Power size={19} /></button></div>}
       <div ref={setCommandHost} className="mission-start" />
       <button className="stop-button" disabled={!connected} onClick={() => control('stop')}><CircleStop size={18} /> Stop</button>
-      <details className="robot-options"><summary title="Robot options" aria-label="Robot options"><Settings2 size={19} /></summary><div>
+      <div ref={setSettingsHost} className="mission-settings" />
+      <button className="icon-button" type="button" title="Reset scene" aria-label="Reset episode"
+        disabled={!connected || sceneLoading || powerPending} onClick={() => control('reset')}><RotateCcw size={18} /></button>
+      <details className="robot-options"><summary title="Manual control options" aria-label="Robot options"><Hand size={19} /></summary><div>
         <button disabled={!connected || !powered || (!state?.stopped && !state?.agent.active)} onClick={() => control(state?.agent.active ? 'agent/takeover' : 'resume')}><Hand size={16} />{state?.agent.active ? 'Take manual control' : 'Enable manual control'}</button>
-        <button disabled={!connected || sceneLoading || powerPending} onClick={() => control('reset')}><RotateCcw size={16} />Reset episode</button>
       </div></details></div>
     {inferenceBudget && <div className="command-budget" role="group" aria-label="Luna usage and limits"
       data-limit-reached={reportedTokens >= inferenceBudget.max_tokens}
@@ -216,15 +256,15 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
     </div>}
   </section>;
   return <RobotControlSurface.Provider value={setControlSurface}>
-    <header className="topbar cockpit-header">
+    <header className="topbar cockpit-header unified-header">
       <div className="brand"><span className="brand-mark"><Move3D size={26} /></span><div><h1>Milo <span>/ Robot observatory</span></h1></div></div>
+      <ViewNavigation current="cockpit" onNavigate={onNavigate} />
     </header>
-    <ViewNavigation current="cockpit" onNavigate={onNavigate} />
     <main className="observatory">
       <section className="runbar">
-        <div className="run-context"><div><span className="eyebrow">LIVE ENVIRONMENT</span><h2>{state?.challenge?.title ?? 'Practice bench'}</h2></div>
+        <div className="run-context"><div><h2>{state?.challenge?.title ?? 'Practice bench'}</h2></div>
           {state && <ChallengePicker state={state} connected={connected} request={api} onLoadingChange={setSceneLoading} />}</div>
-        <nav className="workspace-nav" aria-label="Workspace"><a href="#setup"><Settings2 size={15} />Setup</a><a href="#observe"><Eye size={15} />Observe</a><a href="#interact"><MessageSquare size={15} />Luna</a><a href="#map"><Map size={15} />Map</a><a href="#controls" onClick={() => setManualOpen(true)}><Hand size={15} />Controls</a></nav>
+        <nav className="workspace-nav" aria-label="Workspace"><a href="#observe"><Eye size={15} />World</a><a href="#interact"><MessageSquare size={15} />Luna</a><a href="#controls" onClick={() => setManualOpen(true)}><Hand size={15} />Controls</a></nav>
       </section>
       {controlSurface ? createPortal(commandBar, controlSurface) : commandBar}
       {error && <div className="error" role="alert">{error}</div>}
@@ -233,11 +273,21 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
       <div className="observation-column" id="observe">
       <section className="view-grid">
         <div className="world-panel">
-          <div className="panel-header world-options"><h3><Move3D size={16} /> World view <span className="tag">Operator only</span></h3>
-            <label className="toggle"><input type="checkbox" checked={showMotionZones} onChange={event=>setShowMotionZones(event.target.checked)}/>Movement zones</label>
+          <div className="panel-header world-options"><div className="world-title-controls">
+            <h3><Move3D size={16} /> World view <span className="tag">Operator only</span></h3>
+            <label className="toggle sensor-overlay-toggle" title="Show sensor beams, robot footprint and observed clearance areas. Display only; does not enable sensing or authorize motion.">
+              <Radar size={16} aria-hidden="true" />Sensors &amp; areas
+              <input type="checkbox" role="switch" aria-label="Sensors and areas" checked={showMotionZones}
+                onChange={event=>setShowMotionZones(event.target.checked)} />
+            </label>
+            <label className="toggle sensor-overlay-toggle" title="Blue ground trail of recent travel sampled in this browser view, not a planned route. Gaps mark missing observations or manual placement; resets with the scene or page reload.">
+              <Route size={16} aria-hidden="true" />Travelled path
+              <input type="checkbox" role="switch" aria-label="Travelled path" checked={showTravelledPath}
+                onChange={event=>setShowTravelledPath(event.target.checked)} />
+            </label></div>
             <label className="toggle"><input type="checkbox" checked={axes} onChange={event => setAxes(event.target.checked)} /> Axes</label></div>
           <div className="world-viewport">
-            {state ? <Spectator state={state} axes={axes} enabled={!disabled} onPlace={placeRobot} showZones={showMotionZones} telemetry={spatialTelemetry} connected={connected} /> : <div className="loading">Connecting to physics worker...</div>}
+            {state ? <Spectator state={state} axes={axes} enabled={!disabled} onPlace={placeRobot} showZones={showMotionZones} showTrail={showTravelledPath} telemetry={spatialTelemetry} connected={connected} /> : <div className="loading">Connecting to physics worker...</div>}
             <aside className="viewport-hud" aria-label="Robot sensor HUD">
               <section className="viewport-widget" aria-label="Head camera HUD" data-minimized={cameraMinimized}>
                 <div className="viewport-widget-heading"><h3><Camera size={14} /> Head camera</h3></div>
@@ -253,29 +303,20 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
           </div>
           <div className="viewport-footer"><span>{state?.manual_placements ? `Manual placements: ${state.manual_placements}` : 'MILO-01'}</span><span>Epoch {state?.episode_epoch ?? '-'}</span></div>
         </div>
-        <div className="sensor-panel">
-          <div className="sensors">
-            <h3>Proprioception</h3>
-            <div className="sensor-row"><span>Head yaw / pitch</span><strong>{observation?.head_rad.map(value => value.toFixed(2)).join(' / ') ?? '-'} rad</strong></div>
-            <div className="sensor-row"><span>Encoder odometry</span><strong>{observation?.odometry_m_rad.slice(0, 2).map(value => value.toFixed(2)).join(', ') ?? '-'} m</strong></div>
-            {['left', 'right'].map(side => <div className="gripper-reading" key={side}><span>{side} gripper</span><strong>{((observation?.grippers[side].aperture_m ?? 0) * 1000).toFixed(0)} mm</strong><span>{observation?.grippers[side].load_n.toFixed(2) ?? '-'} N</span><span title="Inner and outer finger contact" className="contacts">{observation?.grippers[side].contact.map((value, index) => <i key={index} className={value ? 'on' : ''} />)}</span></div>)}
-            {state?.proximity && <ProximityPanel sensors={state.proximity} />}
-            {observation?.battery && <div className={`battery-reading ${observation.battery.low ? 'battery-low' : ''}`} aria-label="Battery status">
-              <span>{observation.battery.charging ? <BatteryCharging size={16} /> : <Battery size={16} />} Battery</span>
-              <meter aria-label="Battery level" min={0} max={100} low={35} high={90} optimum={100} value={observation.battery.charge_pct} />
-              <strong>{observation.battery.charge_pct.toFixed(1)}%</strong>
-              <small>{observation.battery.charging ? 'Charging' : observation.battery.charge_pct === 0 ? 'Battery empty' : observation.battery.low ? 'Low battery / return to charger' : 'Battery ready'}</small>
-            </div>}
-          </div>
-        </div>
       </section>
-      <div id="map">{state && <><HomeMapping key={`home-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
-        connected={connected} busy={sceneLoading || state.busy || state.agent.active} stopped={state.stopped} request={api} />
-        <SpatialSensing key={`spatial-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
-        connected={connected} busy={sceneLoading || state.busy || state.agent.active} request={api} hudHost={spatialHud} onTelemetry={setSpatialTelemetry} showMotionZones={showMotionZones} /></>}</div>
+      <details className="live-telemetry" open={liveReadoutsOpen} onToggle={event=>setLiveReadoutsOpen(event.currentTarget.open)}>
+        <summary><Activity size={15} />Live telemetry <span>{!connected ? 'Disconnected / last received' : 'Latest received'}</span></summary>
+        <dl aria-label="Live telemetry summary">
+          <div><dt>Encoder position</dt><dd>{observation?.odometry_m_rad.slice(0,2).map(value=>value.toFixed(2)).join(', ') ?? '-'} m</dd></div>
+          <div><dt>Motion buffer</dt><dd>{state?.navigation?.status ?? 'Idle'}</dd></div>
+          <div><dt>Contacts</dt><dd>{state?.proximity?.collisions.length ?? '-'} <span>/ {state?.proximity?.simulated_time_s.toFixed(2) ?? '-'} s sim</span></dd></div>
+          <div><dt>Battery</dt><dd>{observation?.battery ? `${observation.battery.charge_pct.toFixed(0)}%` : 'Not reported'}</dd></div>
+        </dl>
+      </details>
       </div>
       <aside className="interaction-column" id="interact" aria-label="Robot interaction">
         {state && <AgentControl key={state.run_id} state={state} connected={connected && !sceneLoading && !powerPending} request={api} commandHost={commandHost}
+          settingsHost={settingsHost} telemetryContent={telemetryContent}
           spatialTelemetry={spatialTelemetry?.run_id === state.run_id && spatialTelemetry.episode_epoch === state.episode_epoch ? spatialTelemetry : null} />}
       </aside>
       </div>

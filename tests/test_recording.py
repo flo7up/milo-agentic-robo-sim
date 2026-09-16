@@ -82,7 +82,8 @@ def test_scripted_physics_recordings_are_visible_and_preserve_failures(tmp_path)
 
 
 @pytest.mark.parametrize("stopped", [False, True])
-async def test_browser_control_sessions_save_replays_on_completion_and_stop(tmp_path, monkeypatch, stopped):
+@pytest.mark.parametrize("custom_folder", [False, True])
+async def test_browser_control_sessions_save_replays_on_completion_and_stop(tmp_path, monkeypatch, stopped, custom_folder):
     from backend import session_recording
     from backend.challenges import get_challenge
     from backend.saved_results import saved_results, recorded_trajectory
@@ -93,6 +94,10 @@ async def test_browser_control_sessions_save_replays_on_completion_and_stop(tmp_
     controller = controller_for(model)
     controller.record_sessions = True
     controller.recording_evidence = "scripted_test"
+    if custom_folder:
+        from backend.preferences import PreferenceStore, PreferencesPatch
+        controller.recording_root = tmp_path / "Custom recordings"
+        PreferenceStore().update(PreferencesPatch(recording_directory=str(controller.recording_root)))
     worker = SimulationWorker(challenge=get_challenge("park"), pace=False)
     try:
         await asyncio.wrap_future(worker.ready)
@@ -105,14 +110,58 @@ async def test_browser_control_sessions_save_replays_on_completion_and_stop(tmp_
         else:
             await asyncio.wait_for(controller.task, 10)
         assert worker.recorder is None and not controller.active
-        data = saved_results(tmp_path)["batches"]
+        data = saved_results(controller.recording_root if custom_folder else tmp_path)["batches"]
         assert len(data) == 1 and data[0]["evidence"] == "scripted_test"
         assert data[0]["trials"][0]["recording_complete"]
-        route = recorded_trajectory(data[0]["id"], 0, tmp_path)
+        route = recorded_trajectory(data[0]["id"], 0, controller.recording_root if custom_folder else tmp_path)
         assert route["scene"]["source"] == "recorded_initial"
         assert route["points"][-1]["x"] > route["points"][0]["x"] + .02
         if stopped:
             assert data[0]["trials"][0]["termination"] == "interrupted"
+        if custom_folder:
+            from backend.saved_results import recorded_replay, recorded_replay_media, terminal_image
+            assert controller.recording_directory.is_relative_to(controller.recording_root)
+            assert not (tmp_path / "performance").exists()
+            PreferenceStore().update(PreferencesPatch(recording_directory=str(tmp_path / "Next recordings")))
+            assert any(batch["id"] == data[0]["id"] for batch in saved_results()["batches"])
+            assert recorded_trajectory(data[0]["id"], 0)["points"] == route["points"]
+            replay = recorded_replay(data[0]["id"], 0)
+            assert replay["recording_complete"] and replay["sample_count"] > 0
+            image_name = next(frame["camera_url"].rsplit("/", 1)[1] for frame in replay["frames"] if frame["camera_url"])
+            assert recorded_replay_media(data[0]["id"], 0, image_name)[0].startswith(b"\x89PNG")
+            assert terminal_image(data[0]["id"], 0).is_file()
+            with pytest.raises(ValueError):
+                recorded_replay_media(data[0]["id"], 0, "../private.json")
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_recording_disabled_or_unwritable_destination_never_silently_falls_back(tmp_path, monkeypatch, enabled):
+    from backend import session_recording
+    from backend.worker import SimulationWorker
+    from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
+    monkeypatch.setattr(session_recording, "SESSION_RESULTS_ROOT", tmp_path / "default")
+    target = tmp_path / "not-a-folder"
+    target.write_text("preserve")
+    model = ScriptedModel([model_response(name="wait", arguments=json.dumps({"duration_s": .1}))])
+    controller = controller_for(model)
+    controller.record_sessions = enabled
+    controller.recording_root = target
+    worker = SimulationWorker(pace=False)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        ticks = worker.sim.ticks
+        controller.start(worker, start_settings(worker, max_turns=1))
+        await asyncio.wait_for(controller.task, 10)
+        assert worker.recorder is None and not controller.recording_active
+        assert target.read_text() == "preserve" and not (tmp_path / "default").exists()
+        if enabled:
+            assert controller.recording_error and worker.sim.cancel.is_set()
+            assert worker.sim.ticks == ticks and controller.state["turns"] == 0
+        else:
+            assert controller.recording_error is None and controller.state["turns"] == 1
     finally:
         await controller.halt()
         await worker.close()
@@ -137,6 +186,7 @@ async def test_browser_recording_write_failure_brakes_and_detaches(tmp_path, mon
         assert worker.recorder is None and worker.latest["stopped"]
         assert not controller.active and not controller.recording_active
         assert controller.state["phase"] == "error" and "Recording failed" in controller.state["error"]
+        assert controller.recording_error == controller.state["error"]
     finally:
         await controller.halt()
         await worker.close()
@@ -438,6 +488,8 @@ def test_operator_home_sessions_record_all_endings(tmp_path, monkeypatch, ending
     monkeypatch.setattr(saved_results, "RESULTS_ROOT", tmp_path)
     monkeypatch.setattr(home_mission, "DEFAULT_MAP_PATH", tmp_path / "maps.sqlite3")
     with TestClient(app) as client:
+        if ending == "stop":
+            assert client.post("/api/preferences", json={"recording_directory": str(tmp_path / "Custom map recordings")}).status_code == 200
         state = client.get("/api/state").json()
         identity = {"run_id": state["run_id"], "episode_epoch": state["episode_epoch"]}
         with client.websocket_connect("/api/live") as socket:
@@ -449,6 +501,11 @@ def test_operator_home_sessions_record_all_endings(tmp_path, monkeypatch, ending
             elif ending in {"stop", "reset", "agent/takeover"}:
                 assert client.post("/api/" + ending).status_code == 200
         assert lab.worker.recorder is None
+        if ending == "stop":
+            status = client.get("/api/recording").json()
+            assert not status["active"] and status["run_directory"].startswith(str(tmp_path / "Custom map recordings"))
+            assert not (tmp_path / "performance").exists()
+            assert client.post("/api/preferences", json={"recording_directory": ""}).status_code == 200
         batches = client.get("/api/test-results").json()["batches"]
         assert len(batches) == 1 and batches[0]["evidence"] == "operator_session"
         trial = batches[0]["trials"][0]

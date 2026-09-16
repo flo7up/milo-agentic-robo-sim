@@ -2,6 +2,7 @@ import math
 import time
 
 import numpy as np
+import pybullet as bullet
 
 from backend.navigation import distance_stop_threshold
 
@@ -115,8 +116,11 @@ def observed_motion_zones(worker, footprint, now=None):
         if abs(candidate) > .001:
             checked_directions.update(("front", "front_left", "front_right") if candidate > 0 else ("rear", "rear_left", "rear_right"))
     stop = navigation.diagnostic_state().get("stop") if navigation is not None else None
+    position, orientation = bullet.getBasePositionAndOrientation(sim.robot, physicsClientId=sim.client)
+    rotation = bullet.getMatrixFromQuaternion(orientation)
     return {"run_id": sim.run_id, "episode_epoch": sim.epoch, "frame": "robot_base", "clock": "monotonic",
         "captured_at_s": now, "sensor_age_s": age, "stale": stale, "source": source, "reason": reason,
+        "display_pose": {"frame": "world", "position_m": list(position[:2]), "yaw_rad": math.atan2(rotation[3], rotation[0])},
         "odometry_m_rad": sim.odometry.tolist(), "maximum_sensor_age_s": maximum_age, "valid_for_s": valid_for,
         "motion_authorized": False, "footprint": footprint, "planning_radius_m": planning_radius, "map_margin_m": margin, "sectors": sectors,
         "preview_speed_mps": speed, "speed_basis": "current_command_and_velocity" if executing else "idle_reference",

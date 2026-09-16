@@ -87,14 +87,15 @@ function cached(): Values {
   } catch { return {}; }
 }
 
-const Context = createContext<{values: Values; update: (patch: Values) => void}>({values: {}, update: () => {}});
+const Context = createContext<{values: Values; update: (patch: Values) => void; save: () => Promise<void>}>(
+  {values: {}, update: () => {}, save: async () => {}});
 
 export function PreferencesProvider({children}: {children: ReactNode}) {
   const [values, setValues] = useState<Values>({});
   const current = useRef<Values>({});
   const pending = useRef<Values>({});
   const inFlight = useRef<Values>({});
-  const writing = useRef(false);
+  const writing = useRef<Promise<void> | null>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
   function saveJournal() {
@@ -108,25 +109,31 @@ export function PreferencesProvider({children}: {children: ReactNode}) {
     pending.current = merge(pending.current, safe);
     try { localStorage.setItem(cacheKey, JSON.stringify(validated(current.current))); } catch {}
     saveJournal();
-    void flush();
+    void flush().catch(() => {});
   }
-  async function flush() {
-    if (writing.current || !Object.keys(pending.current).length) return;
-    writing.current = true;
-    const patch = pending.current;
-    inFlight.current = patch;
-    pending.current = {};
-    try {
-      const response = await fetch('/api/preferences', {method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(patch), keepalive: true, signal: AbortSignal.timeout(8000)});
-      if (!response.ok) throw new Error('Preferences could not be saved.');
-      setError('');
-    } catch {
-      pending.current = merge(patch, pending.current);
-      setError('Preferences are not saved to this workspace.');
-      return;
-    } finally { writing.current = false; inFlight.current = {}; saveJournal(); }
-    void flush();
+  async function flush(): Promise<void> {
+    if (writing.current) {
+      await writing.current;
+      return flush();
+    }
+    if (!Object.keys(pending.current).length) return;
+    writing.current = (async () => {
+      const patch = pending.current;
+      inFlight.current = patch;
+      pending.current = {};
+      try {
+        const response = await fetch('/api/preferences', {method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(patch), keepalive: true, signal: AbortSignal.timeout(8000)});
+        if (!response.ok) throw new Error('Preferences could not be saved.');
+        setError('');
+      } catch {
+        pending.current = merge(patch, pending.current);
+        setError('Preferences are not saved to this workspace.');
+        throw new Error('Configuration could not be saved. Please retry.');
+      } finally { writing.current = null; inFlight.current = {}; saveJournal(); }
+    })();
+    await writing.current;
+    return flush();
   }
   useEffect(() => {
     let active = true;
@@ -156,7 +163,7 @@ export function PreferencesProvider({children}: {children: ReactNode}) {
   }, []);
   useEffect(() => {
     if (!ready) return;
-    void flush();
+    void flush().catch(() => {});
     const savePending = () => {
       if (!Object.keys(pending.current).length) return;
       void fetch('/api/preferences', {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -166,10 +173,14 @@ export function PreferencesProvider({children}: {children: ReactNode}) {
     return () => window.removeEventListener('pagehide', savePending);
   }, [ready]);
   if (!ready) return <div className="loading" role="status">Loading saved settings...</div>;
-  return <Context.Provider value={{values, update}}>
-    {error && <div className="error" role="alert">{error} <button type="button" title="Retry saving preferences" aria-label="Retry saving preferences" onClick={() => void flush()}><RotateCcw size={16}/></button></div>}
+  return <Context.Provider value={{values, update, save: flush}}>
+    {error && <div className="error" role="alert">{error} <button type="button" title="Retry saving preferences" aria-label="Retry saving preferences" onClick={() => void flush().catch(() => {})}><RotateCcw size={16}/></button></div>}
     {children}
   </Context.Provider>;
+}
+
+export function useSavePreferences() {
+  return useContext(Context).save;
 }
 
 export function usePreference<Key extends keyof Preferences>(key: Key, fallback: Preferences[Key]) {

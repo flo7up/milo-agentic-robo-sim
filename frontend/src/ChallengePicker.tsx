@@ -106,8 +106,8 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
   }
 
   return <div className="challenge-menu" id="setup">
-    <button type="button" aria-label="Choose challenge" aria-haspopup="dialog" aria-controls={menuId} aria-expanded={menuOpen}
-      onClick={() => { dialog.current?.showModal(); setMenuOpen(true); }}><FolderOpen size={16} />Challenges</button>
+    <button type="button" className="icon-button" aria-label="Choose challenge" title="Choose challenge" aria-haspopup="dialog" aria-controls={menuId} aria-expanded={menuOpen}
+      onClick={() => { dialog.current?.showModal(); setMenuOpen(true); }}><FolderOpen size={16} aria-hidden="true" /></button>
     {createPortal(<dialog ref={dialog} id={menuId} className="challenge-menu-dialog" aria-labelledby={`${menuId}-title`}
       onClose={() => setMenuOpen(false)} onCancel={event => { if (loading) event.preventDefault(); }}>
       <div className="challenge-menu-heading">

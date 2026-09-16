@@ -7,11 +7,13 @@ export type ProximitySensors = { simulated_time_s: number; max_range_m: number;
   collisions: { direction: string; force_n: number }[] };
 export type CameraFrame = { seq: number; frame_ref: string; simulated_time_s: number; url: string };
 export type MotionZones = {run_id:string;episode_epoch:number;frame:'robot_base';clock:'monotonic';captured_at_s:number;
+  display_pose?:{frame:'world';position_m:number[];yaw_rad:number};
   sensor_age_s:number | null;maximum_sensor_age_s:number;valid_for_s:number;odometry_m_rad:number[];stale:boolean;source:string;reason:string;motion_authorized:false;
   footprint:{lower_xy_m:number[];upper_xy_m:number[];radius_m:number};planning_radius_m:number;map_margin_m:number | null;
   sectors:{sector:number;inner_m:number;outer_m:number;start_rad:number;end_rad:number;status:'clear'|'restricted'|'unknown'|'unavailable';reason:string}[];
   preview_speed_mps:number;speed_basis:string;beam_stop_distance_m:number;beam_checked_directions:string[];controller_stop:NavigationDiagnostics['stop']};
 export type SpatialTelemetry = {run_id:string;episode_epoch:number;received_at_ms:number | null;enabled:boolean | null;paused:boolean;error:string | null;
+  request_duration_ms?:number;
   motion_zones?:MotionZones | null;
   frame:{sequence:number;simulated_time_s:number} | null;
   map:{age_s:number | null;stale:boolean;observed_floor_cells:number;obstacle_cells:number} | null};
@@ -124,6 +126,8 @@ export type AgentState = {
   configuration: { provider: string; endpoint: string; ollama_endpoint: string; default_model_id: string; models: ModelProfile[] };
 };
 export type LiveState = {
+  recording?: {enabled:boolean;directory:string;active:boolean;status:'off'|'ready'|'recording'|'finalizing';
+    run_directory:string | null;samples:number | null;error:string | null};
   power?: {on: boolean; mode: 'off' | 'idle' | 'working'; revision: number; idle_sensor_interval_s: number};
   preference_error?: string | null;
   map_setup?: { reuse_saved_map: boolean; map_id: string | null; name: string | null; revision: number | null; localization: string };

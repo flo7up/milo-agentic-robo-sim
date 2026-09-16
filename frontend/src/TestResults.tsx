@@ -242,9 +242,8 @@ export function TestResults({onNavigate, liveState, onStop}: {onNavigate?: (view
     } catch { setDownloadError('Download failed. Please retry.'); }
   }
   return <>
-    <header className="topbar results-header"><div className="brand"><span className="brand-mark"><FlaskConical size={24}/></span><h1>Milo <span>/ Test results</span></h1></div>
-      <span className="tag">Robot test archive</span></header>
-    <ViewNavigation current="archive" onNavigate={onNavigate} />
+    <header className="topbar results-header unified-header"><div className="brand"><span className="brand-mark"><FlaskConical size={24}/></span><h1>Milo <span>/ Test results</span></h1></div>
+      <ViewNavigation current="archive" onNavigate={onNavigate} /></header>
     <main className="results-page">
       <div className="archive-views" role="group" aria-label="Archive view"><button aria-pressed={showProgress} onClick={() => setArchiveView('progress')}>Progress</button><button aria-pressed={!showProgress} onClick={() => setArchiveView('history')}>Run History</button>
         <button className="icon-button" aria-label="Refresh progress" title="Refresh progress" disabled={loading} onClick={() => setRevision(value => value + 1)}>{loading ? <LoaderCircle size={17} className="loading-icon"/> : <RefreshCw size={17}/>}</button></div>

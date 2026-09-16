@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import type { RenderPacket } from '../src/gpuCamera';
+import { TravelledPath } from '../src/travelledPath';
 
 type VisualSample = { frame: string; time: number; camera: string; spectator: string };
 type VisualProbe = Window & { visualSamples: VisualSample[]; visualTimer: number };
@@ -27,6 +28,120 @@ test.beforeEach(async ({ request }) => {
     { id: 'luna', label: 'GPT-5.6 Luna', deployment: '' },
   ] } });
   await request.post('/api/voice/config', { data: { endpoint: '', deployment: '' } });
+});
+
+test('travelled path sampling stays bounded and breaks at observation discontinuities', async ({request}) => {
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  const base=initial.snapshot.poses.find(pose=>pose.key===`${initial.robot_body_id}:-1`)!;
+  const at=(horizontal:number,lateral:number,time:number,extra:Partial<LiveState>={}):LiveState=>({...initial,...extra,
+    snapshot:{...initial.snapshot,simulated_time_s:time,poses:[{...base,position:[horizontal,lateral,base.position[2]]}]}});
+  const history=new TravelledPath();
+  history.sample(at(0,0,0),true,0);
+  history.sample(at(.01,0,.05),true,50);
+  expect(history.positions).toEqual([]);
+  history.sample(at(.03,0,.1),true,100);
+  expect(history.positions).toEqual([0,0,.035,.03,0,.035]);
+  history.sample(at(.03,0,.1),true,125);
+  expect(history.positions).toHaveLength(6);
+  const cases=[
+    {name:'placement',state:at(.1,0,.2,{manual_placements:initial.manual_placements+1}),received:200},
+    {name:'jump',state:at(1,0,.2),received:200},
+    {name:'simulation gap',state:at(.1,0,1),received:200},
+    {name:'wall gap',state:at(.1,0,.2),received:2000},
+    {name:'clock reversal',state:at(.1,0,.05),received:200},
+    {name:'same-time move',state:at(.04,0,.1),received:200},
+    {name:'nonfinite',state:at(NaN,0,.2),received:200},
+    {name:'off',state:at(.1,0,.2,{power:{...initial.power!,on:false,mode:'off'}}),received:200},
+  ];
+  for(const scenario of cases) {
+    const candidate=new TravelledPath();
+    candidate.sample(at(0,0,0),true,0);candidate.sample(at(.03,0,.1),true,100);
+    candidate.sample(scenario.state,true,scenario.received);
+    expect(candidate.positions,scenario.name).toEqual([0,0,.035,.03,0,.035]);
+  }
+  history.sample(at(.03,0,.1),false,150);
+  history.sample(at(.7,0,.2),true,200);
+  expect(history.positions).toHaveLength(6);
+  history.sample(at(.73,0,.3),true,300);
+  expect(history.positions.slice(-6)).toEqual([.7,0,.035,.73,0,.035]);
+  history.sample(at(0,0,0,{episode_epoch:initial.episode_epoch+1}),true,400);
+  expect(history.positions).toEqual([]);
+  for(let index=1;index<=TravelledPath.maximumSegments+10;index++) history.sample(at(index*.03,0,index*.1,
+    {episode_epoch:initial.episode_epoch+1}),true,400+index*100);
+  expect(history.positions).toHaveLength(TravelledPath.maximumSegments*6);
+  expect(history.positions[0]).toBeCloseTo(.3);
+  history.sample(at(0,0,0,{run_id:'new-path-episode'}),true,500000);
+  expect(history.positions).toEqual([]);
+});
+
+test('travelled path projects live motion onto the ground without changing physics or camera', async ({page,request}) => {
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  const cameraBefore=await(await request.get(initial.camera.url)).body();
+  let live=initial;
+  let publish:(value:LiveState)=>void=()=>{};
+  await page.routeWebSocket('**/api/live',socket=>{publish=value=>{live=value;socket.send(JSON.stringify(value));};publish(live);});
+  const commands:string[]=[],errors:string[]=[];
+  page.on('request',message=>{if(message.method()==='POST'&&!message.url().endsWith('/api/preferences'))commands.push(message.url());});
+  page.on('pageerror',error=>errors.push(error.message));
+  await page.goto('/');
+  const canvas=page.locator('.spectator canvas');
+  const toggle=page.getByRole('switch',{name:'Travelled path',exact:true});
+  await expect(toggle).toBeChecked();await expect(canvas).toHaveAttribute('data-trail-segments','0');
+  const move=(horizontal:number,lateral:number,placement=false)=>publish({...live,manual_placements:live.manual_placements+(placement?1:0),
+    snapshot:{...live.snapshot,simulated_time_s:live.snapshot.simulated_time_s+.1,poses:live.snapshot.poses.map(pose=>
+      pose.key.startsWith(`${live.robot_body_id}:`) ? {...pose,position:[pose.position[0]+horizontal,pose.position[1]+lateral,pose.position[2]]} : pose)}});
+  for(let index=0;index<36;index++) {
+    move(index<12?-.05:index>=24?.05:0,index>=12&&index<24?-.05:0);
+    await expect(canvas).toHaveAttribute('data-trail-segments',String(index+1));
+  }
+  const endpoint=JSON.parse((await canvas.getAttribute('data-trail-end'))!);
+  const base=live.snapshot.poses.find(pose=>pose.key===`${live.robot_body_id}:-1`)!;
+  expect(endpoint).toEqual([base.position[0],base.position[1],.035]);
+  const bluePixels=()=>canvas.evaluate((element:HTMLCanvasElement)=>{
+    const context=element.getContext('webgl2')!;
+    const pixels=new Uint8Array(element.width*element.height*4);
+    context.readPixels(0,0,element.width,element.height,context.RGBA,context.UNSIGNED_BYTE,pixels);
+    let count=0;
+    for(let offset=0;offset<pixels.length;offset+=4) if(pixels[offset+2]>pixels[offset]+50 && pixels[offset+2]>pixels[offset+1]+30) count++;
+    return count;
+  });
+  const measurements:{width:number;additional_blue_pixels:number}[]=[];
+  for(const width of [1440,390,320]) {
+    await page.setViewportSize({width,height:1000});await page.locator('.world-panel').scrollIntoViewIfNeeded();
+    await expect.poll(async()=>(await spectatorPixels(page)).colors).toBeGreaterThan(30);
+    await toggle.uncheck();await expect(canvas).toHaveAttribute('data-trail-visible','false');
+    const without=await bluePixels();
+    await toggle.check();await expect(canvas).toHaveAttribute('data-trail-visible','true');
+    await expect.poll(async()=>await bluePixels()-without).toBeGreaterThan(20);
+    measurements.push({width,additional_blue_pixels:await bluePixels()-without});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    expect(await toggle.locator('..').evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+    await page.locator('.world-panel').screenshot({path:`../.runtime/ground-trail-v1/trail-${width}.png`});
+  }
+  await writeFile('../.runtime/ground-trail-v1/pixels.json',JSON.stringify({evidence:'scripted_display_positions',measurements},null,2));
+  move(0,0);
+  await expect(page.getByLabel('Simulation time')).toContainText(live.snapshot.simulated_time_s.toFixed(2));
+  await toggle.uncheck();move(.05,0);
+  await expect(canvas).toHaveAttribute('data-trail-segments','37');
+  await expect(canvas).toHaveAttribute('data-trail-visible','false');
+  await toggle.check();await expect(canvas).toHaveAttribute('data-trail-segments','37');
+  move(.5,.5,true);await expect(canvas).toHaveAttribute('data-trail-segments','37');
+  move(.05,0);await expect(canvas).toHaveAttribute('data-trail-segments','38');
+  publish({...live,rendering:'tiny'});
+  await page.getByRole('group',{name:'Spectator graphics',exact:true}).getByRole('button',{name:'Enhanced',exact:true}).click();
+  await expect(canvas).toHaveAttribute('data-trail-segments','38');
+  const beforeOrbit=(await spectatorPixels(page)).signature;
+  await canvas.hover({position:{x:80,y:150}});await page.mouse.wheel(0,120);
+  await expect.poll(async()=>(await spectatorPixels(page)).signature).not.toBe(beforeOrbit);
+  publish({...live,episode_epoch:live.episode_epoch+1});
+  await expect(canvas).toHaveAttribute('data-trail-segments','0');
+  await expect(canvas).toHaveAttribute('data-trail-visible','false');
+  await toggle.uncheck();await page.reload();await expect(toggle).not.toBeChecked();
+  await expect(canvas).toHaveAttribute('data-trail-segments','0');
+  expect(commands).toEqual([]);expect(errors).toEqual([]);
+  const after:LiveState=await(await request.get('/api/state')).json();
+  expect(after.snapshot).toEqual(initial.snapshot);
+  expect(await(await request.get(after.camera.url)).body()).toEqual(cameraBefore);
 });
 
 for (const imageFailure of ['expired', 'stalled']) {
@@ -83,6 +198,7 @@ test('movement zones render sampled clearance without changing camera or motion'
     const preview=route.request().headers()['x-milo-motion-zones']==='1';
     previewRequests.push(preview ? 'zones' : 'plain');
     const zones:MotionZones={...original,source:'scripted_display_fixture',stale:mode==='stale',sensor_age_s:mode==='stale'?2:.05,valid_for_s:.95,
+      display_pose:mode==='moved' ? undefined : original.display_pose,
       odometry_m_rad:mode==='moved'?[initial.observation.odometry_m_rad[0]+1,0,0]:initial.observation.odometry_m_rad,
       run_id:mode==='other-episode'?'other-episode':initial.run_id,
       sectors:original.sectors.map((sector,index)=>({...sector,status:index%3===0?'clear':index%3===1?'restricted':'unknown',reason:'Scripted observed-mask region'}))};
@@ -95,7 +211,10 @@ test('movement zones render sampled clearance without changing camera or motion'
   page.on('pageerror',error=>errors.push(error.message));
   await page.goto('/');
   const canvas=page.locator('.spectator canvas');
-  const toggle=page.getByRole('checkbox',{name:'Movement zones',exact:true});
+  const toggle=page.getByRole('switch',{name:'Sensors and areas',exact:true});
+  await expect(page.locator('.world-title-controls').getByRole('heading',{name:'World view',exact:false})).toBeVisible();
+  await expect(page.locator('.world-title-controls').getByRole('switch',{name:'Sensors and areas',exact:true})).toBeVisible();
+  await expect(toggle.locator('..')).toHaveAttribute('title', /Display only/);
   await expect(toggle).not.toBeChecked();
   await expect(canvas).toHaveAttribute('data-zone-count','0');
   const before=await spectatorPixels(page);
@@ -104,12 +223,20 @@ test('movement zones render sampled clearance without changing camera or motion'
   await expect(canvas).toHaveAttribute('data-zone-count','48');
   await expect.poll(async()=>(await spectatorPixels(page)).signature!==before.signature).toBe(true);
   await expect(page.getByLabel('Movement zone legend')).toContainText('geometry only');
+  await page.getByRole('button',{name:'Minimize Luna console',exact:true}).click();
+  await expect(canvas).toHaveAttribute('data-zone-count','48');
+  await expect.poll(()=>page.evaluate(()=>sessionStorage.getItem('milo-sensors-and-areas'))).toBe('true');
+  await page.reload();
+  await expect(toggle).toBeChecked();
+  await expect(canvas).toHaveAttribute('data-zone-count','48');
   for(const width of [1440,1024,390,320]){
     await page.setViewportSize({width,height:1000});
-    await page.locator('.world-viewport').scrollIntoViewIfNeeded();
+    await page.locator('.world-panel').scrollIntoViewIfNeeded();
+    await expect(toggle).toBeVisible();
+    expect(await toggle.locator('..').evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
     await expect.poll(async()=>(await spectatorPixels(page)).colors).toBeGreaterThan(30);
     expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
-    await page.locator('.world-viewport').screenshot({path:`../.runtime/policy-clearance-v1/zones-${width}.png`});
+    await page.locator('.world-panel').screenshot({path:`../.runtime/sensor-overlay-switch-v1/zones-${width}.png`});
   }
   await page.getByText('Zone readings / center travel',{exact:true}).click();
   await expect(page.locator('.movement-zone-readings tbody tr')).toHaveCount(16);
@@ -128,6 +255,11 @@ test('movement zones render sampled clearance without changing camera or motion'
   await toggle.uncheck();
   await expect(canvas).toHaveAttribute('data-zone-state','Hidden');
   await expect.poll(()=>previewRequests.at(-1)).toBe('plain');
+  await expect(page.getByLabel('Movement zone legend')).toHaveCount(0);
+  await expect.poll(()=>page.evaluate(()=>sessionStorage.getItem('milo-sensors-and-areas'))).toBe('false');
+  await page.reload();
+  await expect(toggle).not.toBeChecked();
+  await expect(canvas).toHaveAttribute('data-zone-count','0');
   const after:LiveState=await(await request.get('/api/state')).json();
   expect(after.snapshot).toEqual(initial.snapshot);
   expect(after.agent.active).toBe(false);
@@ -137,6 +269,90 @@ test('movement zones render sampled clearance without changing camera or motion'
   expect((await request.post('/api/spatial',{data:{run_id:initial.run_id,episode_epoch:initial.episode_epoch,enabled:false}})).ok()).toBe(true);
   await page.close();
   await expect.poll(async()=>((await(await request.get('/api/state')).json()) as LiveState).stopped).toBe(true);
+});
+
+test('moving sensor display anchors fresh areas and keeps beams independent of map staleness', async ({page,request}) => {
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  const cameraBefore=await(await request.get(initial.camera.url)).body();
+  let live=initial;
+  let publish:(value:LiveState)=>void=()=>{};
+  let mode='fresh';
+  let releaseTelemetry:(()=>void) | undefined;
+  const base=initial.snapshot.poses.find(pose=>pose.key===`${initial.robot_body_id}:-1`)!;
+  let display={frame:'world' as const,position_m:base.position.slice(0,2),yaw_rad:0};
+  const areas=Array.from({length:16},(_,sector)=>({sector,inner_m:0,outer_m:1,start_rad:sector*Math.PI/8,end_rad:(sector+1)*Math.PI/8,
+    status:sector%2?'restricted' as const:'clear' as const,reason:'Scripted observed corridor'}));
+  await page.routeWebSocket('**/api/live',socket=>{publish=value=>{live=value;socket.send(JSON.stringify(value));};publish(initial);});
+  await page.clock.install();
+  await page.route('**/api/spatial',async route=>{
+    if(mode==='transport') await new Promise<void>(resolve=>{releaseTelemetry=resolve;});
+    await route.fulfill({json:{power:{on:true,mode:'working'},enabled:true,paused:false,error:null,frame:null,map:null,
+    motion_zones:route.request().headers()['x-milo-motion-zones'] ? {
+      run_id:initial.run_id,episode_epoch:initial.episode_epoch,frame:'robot_base',clock:'monotonic',captured_at_s:1,
+      display_pose:mode==='legacy'?undefined:display,odometry_m_rad:initial.observation.odometry_m_rad,
+      sensor_age_s:mode==='stale'?2:.05,maximum_sensor_age_s:1,valid_for_s:mode==='stale'?0:.95,stale:mode==='stale',
+      source:'scripted_moving_display',reason:'Test snapshot',motion_authorized:false,
+      footprint:{lower_xy_m:[-.2,-.2],upper_xy_m:[.2,.2],radius_m:.3},planning_radius_m:.3,map_margin_m:.05,
+      sectors:areas,preview_speed_mps:.2,speed_basis:'current_command_and_velocity',beam_stop_distance_m:.18,beam_checked_directions:['front'],controller_stop:null
+    }:undefined}});
+  });
+  const commands:string[]=[],errors:string[]=[];
+  page.on('request',message=>{if(message.method()==='POST'&&!message.url().endsWith('/api/preferences'))commands.push(message.url());});
+  page.on('pageerror',error=>errors.push(error.message));
+  await page.goto('/');
+  await page.getByRole('switch',{name:'Sensors and areas',exact:true}).check();
+  const canvas=page.locator('.spectator canvas');
+  await expect(canvas).toHaveAttribute('data-zone-state','Observed');
+  await expect(canvas).toHaveAttribute('data-colored-zones','16');
+  const sampledOrigin=await canvas.getAttribute('data-zone-origin');
+  const angle=.5,cosine=Math.cos(angle),sine=Math.sin(angle),halfCos=Math.cos(angle/2),halfSin=Math.sin(angle/2);
+  const moved:LiveState={...initial,snapshot:{...initial.snapshot,simulated_time_s:.05,poses:initial.snapshot.poses.map(pose=>{
+    if(!pose.key.startsWith(`${initial.robot_body_id}:`))return pose;
+    const [horizontal,lateral]=[pose.position[0]-base.position[0],pose.position[1]-base.position[1]];
+    const [qx,qy,qz,qw]=pose.quaternion;
+    return {...pose,position:[base.position[0]+.25+horizontal*cosine-lateral*sine,base.position[1]+horizontal*sine+lateral*cosine,pose.position[2]],
+      quaternion:[halfCos*qx-halfSin*qy,halfCos*qy+halfSin*qx,halfCos*qz+halfSin*qw,halfCos*qw-halfSin*qz]};
+  })},observation:{...initial.observation,odometry_m_rad:[initial.observation.odometry_m_rad[0]+.25,initial.observation.odometry_m_rad[1],angle]},
+    proximity:{...initial.proximity,simulated_time_s:.05}};
+  publish(moved);
+  await expect(canvas).toHaveAttribute('data-beam-state','Live');
+  await expect(canvas).toHaveAttribute('data-zone-state','Observed');
+  await expect(canvas).toHaveAttribute('data-colored-zones','16');
+  expect(await canvas.getAttribute('data-zone-origin')).toBe(sampledOrigin);
+  expect(await canvas.getAttribute('data-beam-origin')).not.toBe(sampledOrigin);
+  for(const width of [1440,390]) {
+    await page.setViewportSize({width,height:900});
+    await page.locator('.world-panel').scrollIntoViewIfNeeded();
+    await expect.poll(async()=>(await spectatorPixels(page)).colors).toBeGreaterThan(30);
+    await page.locator('.world-panel').screenshot({path:`../.runtime/moving-overlay-v1/moving-${width}.png`});
+  }
+  mode='stale';
+  await expect(canvas).toHaveAttribute('data-zone-state','Stale');
+  publish({...live,proximity:{...live.proximity}});
+  await expect(canvas).toHaveAttribute('data-beam-state','Live');
+  await expect(canvas).toHaveAttribute('data-colored-zones','0');
+  await expect(page.getByLabel('Movement zone legend')).toContainText('Beams: Live');
+  mode='legacy';
+  await expect(canvas).toHaveAttribute('data-zone-state','Pose changed');
+  await expect(canvas).toHaveAttribute('data-colored-zones','0');
+  display={...display,position_m:[base.position[0]+.25,base.position[1]],yaw_rad:angle};
+  mode='fresh';
+  await expect(canvas).toHaveAttribute('data-zone-state','Observed');
+  await expect(canvas).toHaveAttribute('data-zone-origin',JSON.stringify([...display.position_m,angle]));
+  mode='transport';
+  await expect.poll(()=>!!releaseTelemetry).toBe(true);
+  await page.clock.fastForward(1200);
+  releaseTelemetry!();
+  await expect(canvas).toHaveAttribute('data-zone-state','Stale');
+  await expect(canvas).toHaveAttribute('data-colored-zones','0');
+  publish({...live,proximity:{...live.proximity}});
+  await expect(canvas).toHaveAttribute('data-beam-state','Live');
+  await page.getByRole('switch',{name:'Sensors and areas',exact:true}).uncheck();
+  await expect(canvas).toHaveAttribute('data-zone-count','0');
+  expect(commands).toEqual([]);expect(errors).toEqual([]);
+  const after:LiveState=await(await request.get('/api/state')).json();
+  expect(after.snapshot).toEqual(initial.snapshot);
+  expect(await(await request.get(after.camera.url)).body()).toEqual(cameraBefore);
 });
 
 test('camera and spatial map stay in the right-side 3D HUD across viewports', async ({ page, request }) => {
@@ -1016,6 +1232,7 @@ test('token tracker shows exact run totals and retains stale readings until reco
     liveSocket!.send(JSON.stringify(current));
   }
   await page.goto('/');
+  await page.getByRole('tab', { name: 'Telemetry', exact: true }).click();
   const tracker = page.getByRole('group', { name: 'Token usage', exact: true });
   await expect(tracker).toHaveCount(0);
   expect(await page.locator('.activity-summary .token-tracker').count()).toBe(0);
