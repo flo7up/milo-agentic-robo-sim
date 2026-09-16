@@ -2,6 +2,37 @@ import asyncio
 from uuid import uuid4
 
 import pytest
+
+
+@pytest.mark.parametrize("speed,expected", [(0., .18), (.15, .18), (.35, .3016666667), (.5, .5216666667)])
+def test_distance_stop_threshold_matches_calibrated_braking_distance(speed, expected):
+    from backend.navigation import distance_stop_threshold
+    assert distance_stop_threshold(speed) == pytest.approx(expected)
+    assert distance_stop_threshold(-speed) == pytest.approx(expected)
+
+
+def test_clearance_sectors_follow_observed_mask_and_robot_heading():
+    import numpy as np
+    from backend.home_mapping import HomeMap
+    from backend.motion_zones import clearance_sectors
+    mapped = HomeMap("test")
+    mapped.evidence[:] = -1
+    pose = np.array([0.05, 0.05, 0.])
+    def zones():
+        return clearance_sectors(mapped.cells, mapped.allowed(.3), mapped.indices, mapped.inside, pose, mapped.resolution_m)
+    assert len(zones()) == 48
+    assert all(zone["status"] == "clear" for zone in zones())
+    column, row = mapped.indices([.65, .05])
+    mapped.evidence[row, column] = 20
+    front = next(zone for zone in zones() if zone["sector"] == 0 and zone["outer_m"] == 1.)
+    assert front["status"] == "restricted"
+    pose[2] = np.pi / 2
+    right = next(zone for zone in zones() if zone["sector"] == 12 and zone["outer_m"] == 1.)
+    assert right["status"] == "restricted"
+    mapped.evidence[:] = 0
+    assert all(zone["status"] == "unknown" for zone in zones())
+
+
 @pytest.mark.parametrize("recover_clearance", [False, True])
 @pytest.mark.parametrize("speed", [.15, .35, .5])
 def test_crossing_pedestrian_stops_buffered_navigation_before_contact(recover_clearance, speed):
@@ -155,6 +186,58 @@ def test_motion_lease_expiry_brakes_without_reviving_authority(recover, phase):
         if sim.cancel.is_set():
             with pytest.raises(MotionError):
                 apply(runtime, sim, "begin_local_subgoal", {"goal": "Cannot override Stop"})
+    finally:
+        sim.close()
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("Objective duration or travel authorization expired", "watchdog"),
+    ("CLEARANCE_STOP: predicted collision", "collision_monitor"),
+    ("SPATIAL_STALE: missing depth", "watchdog"),
+    ("Luna requested stopped evidence for look", "supervisor"),
+    ("CANCELLED: task authority changed", "external_stop"),
+    ("OBSERVED_PATH_BLOCKED: inspect corridor", "controller")])
+def test_stop_diagnostics_distinguish_initiating_layers(reason, expected):
+    from backend.navigation import NavigationRuntime
+    assert NavigationRuntime.stop_initiator(reason) == expected
+
+
+def test_motion_diagnostics_trace_acceptance_rejection_tick_gap_and_expiry():
+    from backend.challenges import get_challenge
+    from backend.contracts import NavigationFeedback
+    from backend.navigation import NavigationRuntime
+    from backend.simulation import BulletSimulation, MotionError
+    from scripts.navigation_policy import apply
+    now = [10.]
+    runtime = NavigationRuntime(clock=lambda: now[0], clock_type="test")
+    sim = BulletSimulation(challenge=get_challenge("park"), width=160, height=120, rendering="tiny")
+    try:
+        apply(runtime, sim, "begin_local_subgoal", {"goal": "Trace one frontier buffer"})
+        runtime.diagnostics.task_id = "frontier-attempt"
+        runtime.command_sensor = {"kind": "observed_depth", "clock": "test", "captured_at_s": 9.8, "age_s": .2}
+        buffer = {"segments": [{"kind": "drive", "linear_mps": .1, "angular_radps": 0., "duration_s": 1.}]}
+        apply(runtime, sim, "replace_motion_buffer", buffer)
+        identity = runtime.diagnostics.authorization_id
+        runtime.tick(sim)
+        now[0] = 10.2
+        apply(runtime, sim, "replace_motion_buffer", buffer)
+        runtime.tick(sim)
+        now[0] = 12.
+        runtime.tick(sim)
+        with pytest.raises(MotionError):
+            apply(runtime, sim, "replace_motion_buffer", buffer)
+        diagnostic = NavigationFeedback.model_validate(runtime.state()).diagnostics
+        assert diagnostic.clock == "test" and diagnostic.authorization_id == identity
+        assert diagnostic.issued_at_s == 10. and diagnostic.renewed_at_s == 10.2
+        assert diagnostic.expires_at_s == 11.7
+        assert diagnostic.last_renewal["result"] == "rejected" and diagnostic.last_renewal["rejection_reason"]
+        assert diagnostic.last_controller_tick_at_s == 12.
+        assert diagnostic.maximum_recent_tick_gap_s == pytest.approx(1.8)
+        assert diagnostic.sensor_at_last_command["age_s"] == .2
+        assert diagnostic.stop["initiator"] == "watchdog"
+        assert not runtime.buffer and not runtime.velocity.any()
+        now[0] = 100.
+        assert runtime.diagnostic_state()["maximum_recent_tick_gap_s"] == pytest.approx(1.8)
     finally:
         sim.close()
 
@@ -3495,6 +3578,310 @@ def test_observed_path_planner_rejects_unknown_and_inflates_obstacles():
     assert not observed.contains_path(traversable, [[.58, 0]])
     with pytest.raises(ValueError):
         observed.plan([0, 0], [3, 3], .25)
+
+
+@pytest.fixture
+def continuous_policy():
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import numpy as np
+    from backend.continuous_navigation import ContinuousNavigation
+
+    now = [0.]
+    sim = SimpleNamespace(odometry=np.zeros(3), cancel=threading.Event(),
+        observe=Mock(return_value=SimpleNamespace(seq=17)),
+        proximity_sensors=Mock(return_value=SimpleNamespace(distances=[])))
+    runtime = SimpleNamespace(status="running", reason="", revision=4, buffer=[object()],
+        expires_at=.5, skill_deadline=60., recover_deadline=False, travel=0., velocity=np.zeros(2),
+        observe=Mock(), apply=Mock(), cancel=Mock(), brake=Mock(), expire_skill=Mock())
+    return SimpleNamespace(now=now, sim=sim, runtime=runtime,
+        observed=SimpleNamespace(captured_at=-.2, max_frame_age_s=1.),
+        controller=ContinuousNavigation([[0., 0.], [1.2, 0.]], clock=lambda: now[0]),
+        path_valid=Mock(return_value=True))
+
+
+@pytest.mark.parametrize("direction,status,distance,expected", [
+    ("front", "clear", None, .5), ("front", "occluded", None, .5),
+    ("front", "hit", 1., .5), ("front", "hit", .999, .2),
+    ("front_left", "hit", .5, .2), ("front_right", "hit", .5, .2),
+    ("front", "hit", .101, .0137228132), ("front", "hit", .1, 0.),
+    ("rear", "hit", .05, .5), ("left", "hit", .05, .5), ("right", "hit", .05, .5)])
+def test_continuous_policy_proximity_changes_speed_without_inventing_clearance(continuous_policy, direction, status, distance, expected):
+    from types import SimpleNamespace
+    policy = continuous_policy
+    policy.sim.proximity_sensors.return_value.distances = [SimpleNamespace(direction=direction, status=status, distance_m=distance)]
+
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+
+    policy.path_valid.assert_called_once()
+    assert policy.path_valid.call_args.args[1:] == pytest.approx((expected, 0.))
+    policy.runtime.apply.assert_called_once()
+    current_sim, action, buffer, sequence = policy.runtime.apply.call_args.args
+    assert current_sim is policy.sim and action == "replace_motion_buffer" and sequence == 17
+    assert buffer.expected_revision == 4
+    assert len(buffer.segments) == 2
+    for segment in buffer.segments:
+        assert segment.linear_mps == pytest.approx(expected)
+        assert segment.angular_radps == 0. and segment.duration_s == 1.
+    assert policy.controller.active and policy.controller.updates == 1
+    policy.runtime.cancel.assert_not_called()
+    policy.sim.observe.assert_called_once_with(render=False)
+
+
+@pytest.mark.parametrize("heading", [-.701, -.7, -.699, -.2, 0., .2, .699, .7, .701])
+def test_continuous_policy_turns_at_heading_limit_but_drives_below_it(continuous_policy, heading):
+    import math
+    import numpy as np
+    policy = continuous_policy
+    policy.sim.odometry[2] = heading
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+
+    segment = policy.runtime.apply.call_args.args[2].segments[0]
+    expected_linear = .5 * math.cos(heading) if abs(heading) < .7 else 0.
+    assert segment.linear_mps == pytest.approx(expected_linear)
+    assert segment.angular_radps == pytest.approx(float(np.clip(-2 * heading, -.5, .5)))
+    assert policy.controller.active
+    policy.runtime.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("distance", [.04, .1, .5, 1.2])
+def test_continuous_policy_slows_for_arrival_without_stopping_early(continuous_policy, distance):
+    policy = continuous_policy
+    policy.controller.path[-1] = [distance, 0.]
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    segment = policy.runtime.apply.call_args.args[2].segments[0]
+    assert segment.linear_mps == pytest.approx(min(.5, .7 * distance))
+    assert policy.controller.active
+    policy.runtime.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("allowed,expected", [([True], .5), ([False, True], .25), ([False, False, True], 0.), ([False, False, False], None)])
+def test_continuous_policy_checks_reduced_motion_before_rejecting_path(continuous_policy, allowed, expected):
+    policy = continuous_policy
+    policy.path_valid.side_effect = allowed
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+
+    attempts = [call.args[1] for call in policy.path_valid.call_args_list]
+    assert attempts == [.5, .25, 0.][:len(allowed)]
+    if expected is None:
+        policy.runtime.apply.assert_not_called()
+        policy.sim.observe.assert_not_called()
+        assert policy.controller.status == "blocked"
+        assert policy.controller.reason.startswith("OBSERVED_PATH_BLOCKED:")
+        policy.runtime.cancel.assert_called_once_with(policy.sim, policy.controller.reason)
+    else:
+        assert policy.runtime.apply.call_args.args[2].segments[0].linear_mps == expected
+        policy.runtime.cancel.assert_not_called()
+        assert policy.controller.active
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("stop", "Stopped by operator"), ("failed", "CONTACT_STOP: fixture contact"),
+    ("cancelled", "CANCELLED: fixture takeover"), ("clearance", "CLEARANCE_STOP: fixture obstacle"),
+    ("buffer", "BUFFER_EXPIRED:"), ("deadline", "SKILL_TIMEOUT:"),
+    ("missing_depth", "SPATIAL_STALE:"), ("stale_depth", "SPATIAL_STALE:"), ("future_depth", "SPATIAL_STALE:")])
+def test_continuous_policy_invalid_authority_stops_even_between_refreshes(continuous_policy, fault, reason):
+    policy = continuous_policy
+    policy.controller.updates = 1
+    policy.controller.last_update = 0.
+    policy.now[0] = .01
+    if fault == "stop":
+        policy.sim.cancel.set()
+        policy.runtime.expires_at = 0.
+        policy.observed.captured_at = None
+    elif fault in {"failed", "cancelled", "clearance"}:
+        policy.runtime.status = "awaiting_feedback" if fault == "clearance" else fault
+        policy.runtime.reason = reason
+    elif fault == "buffer":
+        policy.runtime.expires_at = policy.now[0]
+    elif fault == "deadline":
+        policy.runtime.skill_deadline = policy.now[0]
+    else:
+        policy.observed.captured_at = {"missing_depth": None, "stale_depth": -1., "future_depth": .02}[fault]
+
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+
+    assert policy.controller.status == ("cancelled" if fault == "stop" else "blocked")
+    assert policy.controller.reason.startswith(reason)
+    policy.path_valid.assert_not_called()
+    policy.sim.proximity_sensors.assert_not_called()
+    policy.sim.observe.assert_not_called()
+    policy.runtime.apply.assert_not_called()
+    if fault in {"failed", "cancelled"}:
+        policy.runtime.cancel.assert_not_called()
+    else:
+        policy.runtime.cancel.assert_called_once_with(policy.sim, policy.controller.reason)
+    cancel_count = policy.runtime.cancel.call_count
+    policy.sim.cancel.clear()
+    policy.runtime.status = "running"
+    policy.runtime.expires_at = 100.
+    policy.runtime.skill_deadline = 100.
+    policy.observed.captured_at = policy.now[0]
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    assert policy.runtime.cancel.call_count == cancel_count
+    policy.runtime.apply.assert_not_called()
+
+
+@pytest.mark.parametrize("remaining,permitted", [(-.000001, False), (0., False), (.000001, True)])
+def test_continuous_policy_buffer_expiry_boundary(continuous_policy, remaining, permitted):
+    policy = continuous_policy
+    policy.controller.updates = 1
+    policy.runtime.expires_at = remaining
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    if permitted:
+        policy.runtime.apply.assert_called_once()
+        policy.runtime.cancel.assert_not_called()
+    else:
+        assert policy.controller.reason.startswith("BUFFER_EXPIRED:")
+        policy.runtime.apply.assert_not_called()
+        policy.path_valid.assert_not_called()
+
+
+@pytest.mark.parametrize("age,permitted", [(-.000001, False), (0., True), (.999999, True), (1., True), (1.000001, False)])
+def test_continuous_policy_depth_age_boundary(continuous_policy, age, permitted):
+    policy = continuous_policy
+    policy.observed.captured_at = policy.now[0] - age
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    if permitted:
+        policy.runtime.apply.assert_called_once()
+        assert policy.runtime.command_sensor["age_s"] == pytest.approx(age)
+        policy.runtime.cancel.assert_not_called()
+    else:
+        assert policy.controller.reason.startswith("SPATIAL_STALE:")
+        policy.runtime.apply.assert_not_called()
+        policy.path_valid.assert_not_called()
+
+
+@pytest.mark.parametrize("elapsed,refreshed", [(.049999, False), (.05, True)])
+def test_continuous_policy_refresh_interval_does_not_brake_valid_motion(continuous_policy, elapsed, refreshed):
+    policy = continuous_policy
+    policy.controller.updates = 1
+    policy.controller.last_update = 0.
+    policy.now[0] = elapsed
+    original_buffer = list(policy.runtime.buffer)
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    assert policy.controller.active and policy.runtime.buffer == original_buffer
+    policy.runtime.cancel.assert_not_called()
+    policy.runtime.brake.assert_not_called()
+    assert policy.runtime.apply.call_count == int(refreshed)
+    assert policy.controller.updates == 1 + int(refreshed)
+    if not refreshed:
+        policy.path_valid.assert_not_called()
+        policy.sim.observe.assert_not_called()
+
+
+@pytest.mark.parametrize("elapsed,translation,rotation,permitted", [
+    (3., 0., 0., True), (3.000001, 0., 0., False),
+    (4., .025, 0., False), (4., .025001, 0., True),
+    (4., 0., .08, False), (4., 0., .080001, True)])
+def test_continuous_policy_progress_accepts_real_turns_and_translation(continuous_policy, elapsed, translation, rotation, permitted):
+    policy = continuous_policy
+    policy.controller.progress_pose = policy.sim.odometry.copy()
+    policy.controller.progress_at = 0.
+    policy.now[0] = elapsed
+    policy.observed.captured_at = elapsed
+    policy.sim.odometry[:] = [translation, 0., rotation]
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    if permitted:
+        assert policy.controller.active
+        policy.runtime.apply.assert_called_once()
+        policy.runtime.cancel.assert_not_called()
+        if translation or rotation:
+            assert policy.controller.progress_at == elapsed
+    else:
+        assert policy.controller.reason.startswith("NO_PROGRESS:")
+        policy.runtime.apply.assert_not_called()
+        policy.runtime.cancel.assert_called_once_with(policy.sim, policy.controller.reason)
+
+
+@pytest.mark.parametrize("distance,arrived", [(.039999, True), (.04, False), (.040001, False)])
+def test_continuous_policy_arrival_boundary(continuous_policy, distance, arrived):
+    policy = continuous_policy
+    policy.controller.path[-1] = [distance, 0.]
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    if arrived:
+        assert policy.controller.status == "arrived"
+        policy.runtime.cancel.assert_called_once_with(policy.sim, "Reached selected floor point")
+        policy.path_valid.assert_not_called()
+        policy.runtime.apply.assert_not_called()
+    else:
+        assert policy.controller.active
+        policy.runtime.cancel.assert_not_called()
+        assert policy.runtime.apply.call_args.args[2].segments[0].linear_mps > 0.
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "at_distance_limit", "distance_exceeded", "planner_error", "retries_exhausted"])
+def test_continuous_policy_replan_is_bounded_and_preserves_task_authority(continuous_policy, outcome):
+    from unittest.mock import Mock
+    import numpy as np
+    policy = continuous_policy
+    policy.controller.updates = 1
+    policy.runtime.travel = {"at_distance_limit": .6, "distance_exceeded": .601}.get(outcome, .3)
+    policy.path_valid.return_value = False
+    policy.controller.replans = 2 if outcome == "retries_exhausted" else 0
+    replan = Mock(return_value=[[0., 0.], [1.2, 0.]])
+    if outcome == "planner_error":
+        replan.side_effect = ValueError("No observed route")
+    identity = policy.controller.identity
+    deadline, travel = policy.runtime.skill_deadline, policy.runtime.travel
+    target = policy.controller.path[-1].copy()
+
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid, replan)
+
+    assert policy.controller.identity == identity
+    assert (policy.runtime.skill_deadline, policy.runtime.travel) == (deadline, travel)
+    np.testing.assert_array_equal(policy.controller.path[-1], target)
+    policy.runtime.apply.assert_not_called()
+    if outcome == "retries_exhausted":
+        replan.assert_not_called()
+        policy.runtime.brake.assert_not_called()
+    else:
+        replan.assert_called_once()
+        np.testing.assert_array_equal(replan.call_args.args[0], policy.sim.odometry[:2])
+        np.testing.assert_array_equal(replan.call_args.args[1], target)
+        policy.runtime.brake.assert_called_once_with(policy.sim, "awaiting_feedback", "Replanning the same observed destination")
+    if outcome in {"accepted", "at_distance_limit"}:
+        assert policy.controller.active and policy.controller.refill_after_replan
+        assert policy.controller.replans == 1
+        policy.runtime.cancel.assert_not_called()
+        policy.runtime.buffer.clear()
+        policy.now[0] = .1
+        policy.path_valid.return_value = True
+        policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid, replan)
+        policy.runtime.apply.assert_called_once()
+        assert not policy.controller.refill_after_replan and policy.controller.buffer_stops == 0
+        assert (policy.runtime.skill_deadline, policy.runtime.travel) == (deadline, travel)
+    else:
+        assert not policy.controller.active and not policy.controller.refill_after_replan
+        assert policy.controller.reason.startswith("OBSERVED_PATH_BLOCKED:")
+        policy.runtime.cancel.assert_called_once_with(policy.sim, policy.controller.reason)
+
+
+def test_continuous_policy_empty_buffer_is_not_silently_refilled(continuous_policy):
+    policy = continuous_policy
+    policy.controller.updates = 1
+    policy.runtime.buffer.clear()
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    assert policy.controller.reason.startswith("BUFFER_EMPTY:")
+    assert policy.controller.buffer_stops == 1 and not policy.controller.active
+    policy.runtime.cancel.assert_called_once_with(policy.sim, policy.controller.reason)
+    policy.runtime.apply.assert_not_called()
+
+
+def test_continuous_policy_command_sensor_age_includes_observation_time(continuous_policy):
+    from types import SimpleNamespace
+    policy = continuous_policy
+    def observe(*, render):
+        assert render is False
+        policy.now[0] = .3
+        return SimpleNamespace(seq=18)
+    policy.sim.observe.side_effect = observe
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    policy.runtime.apply.assert_called_once()
+    assert policy.runtime.apply.call_args.args[3] == 18
+    assert policy.runtime.command_sensor["captured_at_s"] == -.2
+    assert policy.runtime.command_sensor["age_s"] == pytest.approx(.5)
 
 
 @pytest.mark.parametrize("fault", ["stale", "blocked", "lease", "stop", "deadline", "no_progress"])

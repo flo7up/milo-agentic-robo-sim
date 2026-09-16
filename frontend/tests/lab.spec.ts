@@ -1,5 +1,5 @@
 import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
-import type { LiveState } from '../src/types';
+import type { LiveState, MotionZones } from '../src/types';
 import { execFileSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -69,6 +69,76 @@ for (const imageFailure of ['expired', 'stalled']) {
   });
 }
 
+test('movement zones render sampled clearance without changing camera or motion', async ({page,request}) => {
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  const cameraBefore=await(await request.get(initial.camera.url)).body();
+  await request.post('/api/spatial',{data:{run_id:initial.run_id,episode_epoch:initial.episode_epoch,enabled:true}});
+  const headers={'X-Milo-Motion-Zones':'1'};
+  await expect.poll(async()=>((await(await request.get('/api/spatial',{headers})).json()).motion_zones?.sectors.length ?? 0)).toBe(48);
+  const observed=await(await request.get('/api/spatial',{headers})).json();
+  const original:MotionZones=observed.motion_zones;
+  let mode='fresh';
+  const previewRequests:string[]=[];
+  await page.route('**/api/spatial',async route=>{
+    const preview=route.request().headers()['x-milo-motion-zones']==='1';
+    previewRequests.push(preview ? 'zones' : 'plain');
+    const zones:MotionZones={...original,source:'scripted_display_fixture',stale:mode==='stale',sensor_age_s:mode==='stale'?2:.05,valid_for_s:.95,
+      odometry_m_rad:mode==='moved'?[initial.observation.odometry_m_rad[0]+1,0,0]:initial.observation.odometry_m_rad,
+      run_id:mode==='other-episode'?'other-episode':initial.run_id,
+      sectors:original.sectors.map((sector,index)=>({...sector,status:index%3===0?'clear':index%3===1?'restricted':'unknown',reason:'Scripted observed-mask region'}))};
+    await route.fulfill({json:{...observed,power:{on:true,mode:'working'},paused:false,frame:null,
+      error:mode==='error'?'Sensor unavailable':null,motion_zones:preview?zones:undefined}});
+  });
+  const commands:string[]=[];
+  page.on('request',message=>{if(message.method()==='POST'&&!message.url().endsWith('/api/preferences'))commands.push(message.url());});
+  const errors:string[]=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  await page.goto('/');
+  const canvas=page.locator('.spectator canvas');
+  const toggle=page.getByRole('checkbox',{name:'Movement zones',exact:true});
+  await expect(toggle).not.toBeChecked();
+  await expect(canvas).toHaveAttribute('data-zone-count','0');
+  const before=await spectatorPixels(page);
+  await toggle.check();
+  await expect(canvas).toHaveAttribute('data-zone-state','Observed');
+  await expect(canvas).toHaveAttribute('data-zone-count','48');
+  await expect.poll(async()=>(await spectatorPixels(page)).signature!==before.signature).toBe(true);
+  await expect(page.getByLabel('Movement zone legend')).toContainText('geometry only');
+  for(const width of [1440,1024,390,320]){
+    await page.setViewportSize({width,height:1000});
+    await page.locator('.world-viewport').scrollIntoViewIfNeeded();
+    await expect.poll(async()=>(await spectatorPixels(page)).colors).toBeGreaterThan(30);
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await page.locator('.world-viewport').screenshot({path:`../.runtime/policy-clearance-v1/zones-${width}.png`});
+  }
+  await page.getByText('Zone readings / center travel',{exact:true}).click();
+  await expect(page.locator('.movement-zone-readings tbody tr')).toHaveCount(16);
+  await expect(page.locator('.movement-zone-readings tbody')).toContainText('restricted');
+  mode='stale';
+  await expect(canvas).toHaveAttribute('data-zone-state','Stale');
+  await expect(page.locator('.movement-zone-readings tbody')).not.toContainText('clear');
+  mode='moved';
+  await expect(canvas).toHaveAttribute('data-zone-state','Pose changed');
+  mode='error';
+  await expect(canvas).toHaveAttribute('data-zone-state','Unavailable');
+  mode='other-episode';
+  await expect(canvas).toHaveAttribute('data-zone-count','0');
+  mode='fresh';
+  await expect(canvas).toHaveAttribute('data-zone-count','48');
+  await toggle.uncheck();
+  await expect(canvas).toHaveAttribute('data-zone-state','Hidden');
+  await expect.poll(()=>previewRequests.at(-1)).toBe('plain');
+  const after:LiveState=await(await request.get('/api/state')).json();
+  expect(after.snapshot).toEqual(initial.snapshot);
+  expect(after.agent.active).toBe(false);
+  expect(await(await request.get(after.camera.url)).body()).toEqual(cameraBefore);
+  expect(commands).toEqual([]);
+  expect(errors).toEqual([]);
+  expect((await request.post('/api/spatial',{data:{run_id:initial.run_id,episode_epoch:initial.episode_epoch,enabled:false}})).ok()).toBe(true);
+  await page.close();
+  await expect.poll(async()=>((await(await request.get('/api/state')).json()) as LiveState).stopped).toBe(true);
+});
+
 test('camera and spatial map stay in the right-side 3D HUD across viewports', async ({ page, request }) => {
   test.setTimeout(90000);
   const errors: string[] = [];
@@ -89,6 +159,10 @@ test('camera and spatial map stay in the right-side 3D HUD across viewports', as
   await expect(map).toContainText('Sensing off');
   await expect(page.locator('.spatial-section')).not.toHaveAttribute('open');
   await expect(mapCanvas).toBeVisible();
+  await expect(map).toHaveAttribute('data-minimized', 'true');
+  await expect(hud.getByRole('region', { name: 'Head camera HUD' })).toHaveAttribute('data-minimized', 'true');
+  await hud.getByRole('button', { name: 'Restore head camera', exact: true }).click();
+  await hud.getByRole('button', { name: 'Restore spatial map', exact: true }).click();
   const initial: LiveState = await (await request.get('/api/state')).json();
   expect((await request.post('/api/spatial', { data: { run_id: initial.run_id, episode_epoch: initial.episode_epoch, enabled: true } })).ok()).toBe(true);
   await expect(mapCanvas).toHaveAttribute('data-state', 'idle');
@@ -189,6 +263,52 @@ test('camera and spatial map stay in the right-side 3D HUD across viewports', as
   expect((await request.post('/api/spatial', { data: { run_id: before.run_id, episode_epoch: before.episode_epoch, enabled: false } })).ok()).toBe(true);
   await expect(map).toContainText('Sensing off');
   await expect(mapCanvas).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test('detailed robot appearance preserves sensors and follows head motion across viewports', async ({ page, request }) => {
+  test.setTimeout(90000);
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const output = fileURLToPath(new URL('../../.runtime/robot-appearance-v1/', import.meta.url));
+  await mkdir(output, { recursive: true });
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  await page.goto('/');
+  const viewport = page.locator('.spectator canvas');
+  await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(100);
+  const before: LiveState = await (await request.get('/api/state')).json();
+  const cameraBefore = await (await request.get(before.camera.url)).body();
+  const initialPixels = await spectatorPixels(page);
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 1100 });
+    await viewport.scrollIntoViewIfNeeded();
+    await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(100);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.locator('.spectator-shell').screenshot({ path: `${output}/robot-${width}.png` });
+  }
+  const after: LiveState = await (await request.get('/api/state')).json();
+  expect(after.snapshot).toEqual(before.snapshot);
+  expect(after.geometry).toEqual(before.geometry);
+  expect(after.observation).toEqual(before.observation);
+  expect((await (await request.get(after.camera.url)).body()).equals(cameraBefore)).toBe(true);
+  expect(after.agent.active).toBe(false);
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  await viewport.scrollIntoViewIfNeeded();
+  const motion = await request.post('/api/command', { data: { run_id: after.run_id, episode_epoch: after.episode_epoch,
+    observation_seq: after.observation.seq, action_id: 'detailed-robot-head', tool: 'set_head',
+    arguments: { yaw_rad: -.6, pitch_rad: .25, duration_s: 1 } } });
+  expect((await motion.json()).status).toBe('ok');
+  await expect.poll(async () => (await spectatorPixels(page)).signature).not.toBe(initialPixels.signature);
+  await page.locator('.spectator-shell').screenshot({ path: `${output}/robot-head-turned.png` });
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+  await expect(page.getByRole('status', { name: 'Robot status', exact: true })).toContainText('Stopped');
+  await expect.poll(async () => (await (await request.get('/api/state')).json()).stopped).toBe(true);
+  const stopped: LiveState = await (await request.get('/api/state')).json();
+  await page.mouse.move((await viewport.boundingBox())!.x + 100, (await viewport.boundingBox())!.y + 100);
+  await page.mouse.wheel(0, -180);
+  const zoomed: LiveState = await (await request.get('/api/state')).json();
+  expect(zoomed.snapshot.simulated_time_s).toBe(stopped.snapshot.simulated_time_s);
+  expect(zoomed.run_id).toBe(before.run_id);
   expect(errors).toEqual([]);
 });
 
@@ -768,16 +888,21 @@ async function robotPickPoint(page: Page) {
     const context = element.getContext('webgl2')!;
     const pixels = new Uint8Array(element.width * element.height * 4);
     context.readPixels(0, 0, element.width, element.height, context.RGBA, context.UNSIGNED_BYTE, pixels);
-    const matches: { horizontal: number; vertical: number }[] = [];
+    let target = { horizontal: 0, vertical: 0, span: 0 };
     for (let vertical = 0; vertical < element.height; vertical += 2) {
+      let start = -1;
       for (let horizontal = 0; horizontal < element.width; horizontal += 2) {
         const offset = ((element.height - vertical - 1) * element.width + horizontal) * 4;
         const [red, green, blue] = pixels.slice(offset, offset + 3);
-        if (red > green * 1.25 && blue > green * 1.1 && green > 40) matches.push({ horizontal, vertical });
+        const painted = red > green * 1.25 && blue > green * 1.1 && green > 40;
+        if (painted && start < 0) start = horizontal;
+        if (painted && horizontal - start > target.span) {
+          target = { horizontal: (start + horizontal) / 2, vertical, span: horizontal - start };
+        }
+        if (!painted) start = -1;
       }
     }
-    const band = matches.filter(candidate => candidate.vertical >= matches[0].vertical + 4 && candidate.vertical <= matches[0].vertical + 12);
-    const target = band[Math.floor(band.length / 2)];
+    if (target.span < 6) throw new Error('No continuous robot body paint is visible');
     return { horizontal: target.horizontal / element.width, vertical: target.vertical / element.height };
   });
   const bounds = (await canvas.boundingBox())!;

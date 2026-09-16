@@ -634,6 +634,7 @@ test('expanded robot camera remains live, responsive, and stoppable', async ({ p
   await page.goto('/');
   const camera = page.getByAltText('Authoritative robot head camera');
   await expect(camera).toHaveJSProperty('naturalWidth', 640);
+  await page.getByRole('button', {name:'Restore head camera', exact:true}).click();
   await page.getByRole('button', {name:'Expand robot camera', exact:true}).click();
   const dialog = page.getByRole('dialog', {name:'Robot camera', exact:true});
   const expanded = page.getByAltText('Expanded robot head camera');
@@ -825,8 +826,11 @@ test('motion history contact sheets and originals are visible and Stop remains a
   }, {timeout:60000}).toBe(true);
   await page.getByRole('tab',{name:'Trace',exact:true}).click();
   await page.getByRole('button',{name:'Inputs',exact:true}).click();
-  const sheet = page.getByRole('img',{name:/^Motion history \/ /}).first();
-  const original = page.getByRole('img',{name:/^Historical original view-/}).first();
+  const sheet = page.locator('img[alt^="Motion history / "]').first();
+  const original = page.locator('img[alt^="Historical original view-"]').first();
+  await page.locator('.exchange-entry').filter({has:sheet}).locator('.exchange-disclosure > summary').click();
+  const originalDisclosure = page.locator('.exchange-entry').filter({has:original}).locator('.exchange-disclosure');
+  if (!await originalDisclosure.evaluate((element: HTMLDetailsElement) => element.open)) await originalDisclosure.locator(':scope > summary').click();
   await sheet.scrollIntoViewIfNeeded();
   await expect(sheet).toHaveJSProperty('naturalWidth',332);
   await expect(sheet).toHaveJSProperty('naturalHeight',332);
@@ -1328,28 +1332,67 @@ test('observatory keeps scripted inputs decisions drafts and safety controls acc
       ]}},
     {id:3,turn:1,timestamp:1789250002,title:'Head movement result',kind:'result',image_url:null,
       payload:{tool:'set_head',call_id:'decision-1',result:{status:'ok',actual_duration_s:.5,message:'Head pose reached.'}}},
+    {id:4,turn:1,timestamp:1789250003,title:'Objective renewal',kind:'policy',image_url:null,
+      payload:{action:'explore',status:'accepted',reason:'Fresh corridor confirmed.',operation_id:'scripted-objective'}},
+    {id:5,turn:1,timestamp:1789250004,title:'Head command',kind:'tool',image_url:null,
+      payload:{tool:'set_head',call_id:'decision-1',arguments:{yaw_rad:.4,pitch_rad:.5}}},
+    {id:6,turn:1,timestamp:1789250005,title:'Session instructions',kind:'session',image_url:null,
+      payload:{goal:'Find the kitchen.',instructions:'Scripted controller instructions.',tools:[{name:'set_head'}]}},
+    {id:7,turn:1,timestamp:1789250006,title:'Motion rejected',kind:'result',image_url:null,
+      payload:{tool:'drive_base',call_id:'blocked-command',result:{status:'rejected',error:'SPATIAL_STALE',message:'Sensor updates unavailable; motion stopped.'}}},
   ];
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.routeWebSocket('**/api/live', socket => socket.send(JSON.stringify({...initial,
-    agent:{...initial.agent,active:true,execution_mode:'luna_continuous',session_id:session,phase:'thinking',trace_revision:3,turns:1,max_turns:80,goal:'Find the kitchen.'}})));
-  await page.route('**/api/agent/trace?*', route => route.fulfill({json:{session_id:session,revision:3,first_id:1,capacity:200,events}}));
+    agent:{...initial.agent,active:true,execution_mode:'luna_continuous',session_id:session,phase:'thinking',trace_revision:events.length,turns:1,max_turns:80,goal:'Find the kitchen.'}})));
+  await page.route('**/api/agent/trace?*', route => route.fulfill({json:{session_id:session,revision:events.length,first_id:1,capacity:200,events}}));
   await page.setViewportSize({width:1440,height:1000});
   await page.goto('/');
   const trace = page.getByRole('tab',{name:'Trace',exact:true});
   await expect(trace).toHaveAttribute('aria-selected','true');
+  await expect(page.locator('.exchange-entry')).toHaveCount(events.length);
+  await expect(page.locator('.exchange-disclosure[open]')).toHaveCount(0);
+  await expect(page.locator('.exchange-preview.bad')).toContainText('SPATIAL_STALE');
+  await expect(page.locator('.exchange-response .exchange-preview')).toContainText(reason);
+  await expect(page.locator('.decision-summary')).toBeHidden();
+  await page.locator('.exchange-response .exchange-disclosure > summary').focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('checkbox',{name:'Follow latest',exact:true})).not.toBeChecked();
   await expect(page.locator('.decision-summary')).toContainText(reason);
   await expect(page.locator('.decision-summary')).toHaveCount(1);
   await expect(page.getByText('Reported reason',{exact:true})).toBeVisible();
   await page.getByRole('button',{name:'Inputs',exact:true}).click();
   await expect(page.locator('.exchange-entry')).toHaveCount(1);
+  await expect(page.getByAltText(/^LLM input camera/)).toBeHidden();
+  await page.locator('.exchange-disclosure > summary').click();
   await expect(page.getByAltText(/^LLM input camera/)).toHaveJSProperty('naturalWidth',640);
   await page.getByRole('button',{name:'LLM',exact:true}).click();
+  await page.locator('.exchange-disclosure > summary').click();
   await expect(page.locator('.decision-summary')).toContainText(reason);
+  await page.getByRole('button',{name:'Policy',exact:true}).click();
+  await page.locator('.exchange-disclosure > summary').click();
+  await page.getByText('Policy payload',{exact:true}).click();
+  await expect(page.locator('.exchange-entry .exchange-payload pre')).toContainText('scripted-objective');
+  await page.getByRole('button',{name:'Tools',exact:true}).click();
+  await page.locator('.exchange-tool .exchange-disclosure > summary').click();
+  await expect(page.locator('.exchange-arguments')).toContainText('yaw_rad');
+  await page.getByRole('button',{name:'Session',exact:true}).click();
+  await page.locator('.exchange-disclosure > summary').click();
+  await page.getByText('Controller instructions',{exact:true}).click();
+  await expect(page.locator('.exchange-entry .exchange-payload[open] pre')).toHaveText('Scripted controller instructions.');
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.getByRole('button',{name:'Copy exchange feed',exact:true}).click();
+  await expect(page.getByRole('status').filter({hasText:'Copied 7 exchanges'})).toBeVisible();
+  const copied = JSON.parse(await page.evaluate(() => navigator.clipboard.readText()));
+  expect(copied.events).toEqual(events);
+  await page.getByRole('button',{name:'All',exact:true}).click();
   await trace.focus();
   await page.keyboard.press('ArrowRight');
   await expect(page.getByRole('tab',{name:'Settings',exact:true})).toBeFocused();
   await expect(page.getByRole('combobox',{name:'Navigation controller',exact:true})).toBeDisabled();
+  await page.locator('.run-options > summary').click();
+  await expect(page.getByRole('combobox',{name:'Navigation controller',exact:true})).toBeHidden();
+  await page.getByRole('tab',{name:'Settings',exact:true}).focus();
   await page.keyboard.press('Home');
   await expect(page.getByRole('tab',{name:'Conversation',exact:true})).toBeFocused();
   await page.getByRole('textbox',{name:'New run instruction',exact:true}).fill('Inspect the room on the left.');
@@ -1371,7 +1414,9 @@ test('observatory keeps scripted inputs decisions drafts and safety controls acc
     await page.screenshot({path:`test-results/observatory-${width}.png`});
     await page.getByRole('link',{name:'Luna',exact:true}).click();
     await expect(trace).toBeInViewport();
-    await page.locator('.interaction-column').screenshot({path:`test-results/observatory-trace-${width}.png`});
+    await page.locator('.mission-instructions > summary').click();
+    await page.locator('.interaction-column').screenshot({path:`../.runtime/compact-cockpit-v1/activity-${width}.png`});
+    await page.locator('.mission-instructions > summary').click();
     await page.locator('#controls').scrollIntoViewIfNeeded();
     await expect(page.getByRole('button',{name:'Stop',exact:true})).toBeInViewport();
     expect(await page.getByRole('button',{name:'Stop',exact:true}).evaluate(button=>{

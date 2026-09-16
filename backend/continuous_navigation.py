@@ -395,6 +395,9 @@ class ContinuousNavigation:
     def update(self, sim, runtime, observed_map, path_valid, replan=None):
         if not self.active:
             return
+        runtime.command_sensor = {"kind": "observed_depth", "clock": "monotonic",
+            "captured_at_s": observed_map.captured_at,
+            "age_s": self.clock()-observed_map.captured_at if observed_map.captured_at is not None else None}
         if sim.cancel.is_set():
             self.finish(sim, runtime, "cancelled", "Stopped by operator")
             return
@@ -493,6 +496,8 @@ class ContinuousNavigation:
             self.minimum_cruise_speed = min(self.minimum_cruise_speed, float(runtime.velocity[0]))
         observation = sim.observe(render=False)
         runtime.observe(sim, observation)
+        if runtime.command_sensor and runtime.command_sensor["captured_at_s"] is not None:
+            runtime.command_sensor["age_s"] = self.clock()-runtime.command_sensor["captured_at_s"]
         runtime.apply(sim, "replace_motion_buffer", ContinuousMotionBuffer(expected_revision=runtime.revision,
             segments=[{"kind": "drive", "linear_mps": linear, "angular_radps": angular, "duration_s": 1.}] * 2), observation.seq)
         self.refill_after_replan = False

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowRight, Bot, Camera, CheckCheck, Copy, ListFilter, Radio, RefreshCw, Wrench } from 'lucide-react';
+import { ArrowRight, Bot, Camera, CheckCheck, ChevronRight, Copy, ListFilter, Radio, RefreshCw, Wrench } from 'lucide-react';
 import type { AgentState, ExchangeEntry, ExchangeFeed as FeedData } from './types';
+import { MotionDiagnostics, RouteFailureDetails } from './MotionDiagnostics';
 
 const channels = {
   session: { icon: Radio, from: 'Controller', to: '' },
@@ -10,13 +11,35 @@ const channels = {
   result: { icon: CheckCheck, from: 'Robot', to: 'Controller' },
   policy: { icon: Bot, from: 'Controller', to: 'Mission' },
 };
-const filters = ['All', 'Inputs', 'LLM', 'Tools', 'Policy', 'Session'] as const;
+const filters = ['All', 'Inputs', 'LLM', 'Tools', 'Policy', 'Session', 'Failures'] as const;
+
+function hasRecordedFailure(entry: ExchangeEntry) {
+  if (entry.kind === 'policy') return !!entry.payload.task?.route_failures?.length;
+  if (entry.kind === 'feedback') return !!entry.payload.observation.spatial?.task?.route_failures?.length
+    || entry.payload.observation.navigation?.status === 'failed'
+    || ['watchdog','collision_monitor'].includes(entry.payload.observation.navigation?.diagnostics?.stop?.initiator ?? '');
+  if (entry.kind === 'result') return !['ok','cancelled'].includes(entry.payload.result.status);
+  return entry.kind === 'session' && entry.payload.status === 'error';
+}
 
 function Payload({ title, value }: { title: string; value: unknown }) {
   return <details className="exchange-payload"><summary>{title}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>;
 }
 
-function DecisionSummary({ arguments: arguments_ }: { arguments: string }) {
+function entryPreview(entry: ExchangeEntry): string {
+  if (entry.kind === 'feedback') return `Frame ${entry.payload.observation.seq} / ${entry.payload.images_in_request} image(s) / ${entry.payload.observation.simulated_time_s.toFixed(2)} s simulated`;
+  if (entry.kind === 'response') return [entry.payload.status, `${entry.payload.latency_s.toFixed(2)} s`,
+    entry.payload.refusals.join(' ') || entry.payload.text || entry.payload.calls.map(call => {
+      const decision = reportedDecision(call.arguments);
+      return decision ? `${decision.action?.replaceAll('_', ' ') ?? call.name}: ${decision.reason}` : call.name;
+    }).join('; ')].filter(Boolean).join(' / ');
+  if (entry.kind === 'tool') return entry.payload.tool;
+  if (entry.kind === 'result') return [entry.payload.result.status, entry.payload.result.error, entry.payload.result.message || entry.payload.tool].filter(Boolean).join(' / ');
+  if (entry.kind === 'policy') return entry.payload.task?.reason || ['status', 'action', 'reason', 'message'].map(key => entry.payload[key]).filter(value => typeof value === 'string').join(' / ');
+  return entry.payload.reason || entry.payload.message || entry.payload.goal || entry.payload.status || '';
+}
+
+function reportedDecision(arguments_: string) {
   let decision: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(arguments_);
@@ -26,6 +49,13 @@ function DecisionSummary({ arguments: arguments_ }: { arguments: string }) {
   const reason = typeof decision.reason === 'string' ? decision.reason : null;
   const action = typeof decision.action === 'string' ? decision.action : typeof decision.intent === 'string' ? decision.intent : null;
   if (!reason) return null;
+  return {action, reason};
+}
+
+function DecisionSummary({ arguments: arguments_ }: { arguments: string }) {
+  const decision = reportedDecision(arguments_);
+  if (!decision) return null;
+  const {action, reason} = decision;
   return <div className="decision-summary">
     <strong>{action ? action.replaceAll('_', ' ') : 'Proposed decision'}</strong>
     <span>Reported reason</span><p>{reason}</p>
@@ -35,6 +65,7 @@ function DecisionSummary({ arguments: arguments_ }: { arguments: string }) {
 function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
   if (entry.kind === 'policy') {
     return <>
+      <RouteFailureDetails task={entry.payload.task}/>
       {entry.image_url && <a href={entry.image_url} target="_blank" rel="noreferrer">
         <img src={entry.image_url} alt={`Policy input camera, event ${entry.id}`} width={160} height={120} loading="lazy" />
       </a>}
@@ -52,11 +83,11 @@ function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
           <div><dt>Frame</dt><dd>{observation.seq}</dd></div>
           <div><dt>Simulated time</dt><dd>{observation.simulated_time_s.toFixed(2)} s</dd></div>
           <div><dt>Head yaw / pitch</dt><dd>{observation.head_rad.map(value => value.toFixed(2)).join(' / ')} rad</dd></div>
-          <div><dt>Joint readings</dt><dd>{observation.joints.length}</dd></div>
+          {observation.joints && <div><dt>Joint readings</dt><dd>{observation.joints.length}</dd></div>}
           <div><dt>Bumpers</dt><dd>{observation.bumpers.join(', ') || 'Clear'}</dd></div>
           {observation.proximity && <div><dt>Distance beams</dt><dd>{observation.proximity.distances.length} / {observation.proximity.max_range_m} m range</dd></div>}
           {observation.battery && <div><dt>Battery</dt><dd>{observation.battery.charge_pct.toFixed(1)}% / {observation.battery.charging ? 'Charging' : observation.battery.low ? 'Low' : 'Ready'}</dd></div>}
-          {Object.entries(observation.grippers).map(([side, sensor]) => <div key={side}><dt>{side} gripper</dt><dd>{(sensor.aperture_m * 1000).toFixed(0)} mm / {sensor.load_n.toFixed(2)} N</dd></div>)}
+          {Object.entries(observation.grippers ?? {}).map(([side, sensor]) => <div key={side}><dt>{side} gripper</dt><dd>{(sensor.aperture_m * 1000).toFixed(0)} mm / {sensor.load_n.toFixed(2)} N</dd></div>)}
         </dl>
       </div>
       {!!entry.image_urls && entry.image_urls.length > 1 && <div className="exchange-camera-batch" aria-label="Additional model input images">
@@ -79,6 +110,18 @@ function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
       {entry.payload.memory_frame_seq != null && <div className="exchange-meta">Remembered initial frame: {entry.payload.memory_frame_seq}</div>}
       {entry.payload.tool_result_call_ids.length > 0 && <div className="exchange-call-ids">Included tool results: {entry.payload.tool_result_call_ids.join(', ')}</div>}
       {entry.payload.collision_feedback && <p className="exchange-text bad">{entry.payload.collision_feedback.guidance}</p>}
+      {observation.navigation?.diagnostics && <MotionDiagnostics connected={false} recorded={observation.navigation.diagnostics}/>}
+      {observation.spatial?.localization && <dl className="policy-facts">
+        <div><dt>Recorded localization</dt><dd>{observation.spatial.localization.status}</dd></div>
+        <div><dt>Laser sample age</dt><dd>{observation.spatial.localization.age_s.toFixed(3)} s / {observation.spatial.localization.sample_clock ?? 'clock not recorded'}</dd></div>
+        <div><dt>Tracking</dt><dd>{observation.spatial.localization.tracking_method ?? 'Not recorded'}</dd></div>
+        <div><dt>Continuous pose correction</dt><dd>{observation.spatial.localization.continuous_pose_correction === false ? 'No' : observation.spatial.localization.continuous_pose_correction === true ? 'Yes' : 'Not recorded'}</dd></div>
+      </dl>}
+      {entry.payload.observed_map_snapshot && <dl className="policy-facts">
+        <div title={entry.payload.observed_map_snapshot.age_basis}><dt>Map capture age</dt><dd>{entry.payload.observed_map_snapshot.age_s.toFixed(3)} s / {entry.payload.observed_map_snapshot.capture_clock ?? 'clock not recorded'}</dd></div>
+        <div title={entry.payload.observed_map_snapshot.geometry_age_basis}><dt>Latest geometry integration age</dt><dd>{entry.payload.observed_map_snapshot.geometry_age_s == null ? 'Not recorded' : `${entry.payload.observed_map_snapshot.geometry_age_s.toFixed(3)} s / Unix-derived`}</dd></div>
+      </dl>}
+      <RouteFailureDetails task={observation.spatial?.task}/>
       <Payload title="Sensor payload" value={observation} />
       {!!entry.payload.recent_actions?.length && <Payload title="Recent actions supplied" value={entry.payload.recent_actions} />}
       <Payload title="Request context" value={{ ...entry.payload, observation: undefined }} />
@@ -119,6 +162,7 @@ function ExchangeContent({ entry }: { entry: ExchangeEntry }) {
     </div>
     {context.instructions && <Payload title="Controller instructions" value={context.instructions} />}
     {context.tools && <Payload title={`Available tools (${context.tools.length})`} value={context.tools} />}
+    <Payload title="Session payload" value={context} />
   </>;
 }
 
@@ -171,6 +215,7 @@ export function ExchangeFeed({ agent, visible = true }: { agent: AgentState; vis
   const shown = entries.filter(entry => filter === 'All' || (filter === 'Inputs' && entry.kind === 'feedback') ||
     (filter === 'LLM' && entry.kind === 'response') || (filter === 'Tools' && ['tool', 'result'].includes(entry.kind)) ||
     (filter === 'Policy' && entry.kind === 'policy') ||
+    (filter === 'Failures' && hasRecordedFailure(entry)) ||
     (filter === 'Session' && entry.kind === 'session'));
   useLayoutEffect(() => {
     if (visible && follow && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
@@ -219,12 +264,18 @@ export function ExchangeFeed({ agent, visible = true }: { agent: AgentState; vis
           ? { icon: Bot, from: 'Luna', to: 'SmolVLA' } : channels[entry.kind];
         const Icon = channel.icon;
         return <article className={`exchange-entry exchange-${entry.kind}`} key={`${feed.session_id}:${entry.id}`} data-kind={entry.kind} data-turn={entry.turn}>
+          <details className="exchange-disclosure" onToggle={event => {if (event.currentTarget.open) setFollow(false);}}>
+          <summary aria-label={`Event ${entry.id}: ${entry.title}`}>
           <div className="exchange-icon"><Icon size={16} /></div>
           <div className="exchange-body">
             <div className="exchange-heading"><span className="exchange-direction">{channel.from}{channel.to && <><ArrowRight size={12} aria-hidden="true" /><span>{channel.to}</span></>}</span><span className="exchange-turn">Turn {entry.turn}</span><time dateTime={new Date(entry.timestamp * 1000).toISOString()}>{new Date(entry.timestamp * 1000).toLocaleTimeString('en-GB', { hour12: false })}</time></div>
-            <h4>{entry.title}</h4>
-            <ExchangeContent entry={entry} />
+            <strong className="exchange-title">{entry.title}</strong>
+            <span className={`exchange-preview ${entry.kind === 'result' && entry.payload.result.status !== 'ok' ? 'bad' : ''}`}>{entryPreview(entry)}</span>
           </div>
+          <ChevronRight className="disclosure-chevron" size={15} />
+          </summary>
+          <div className="exchange-detail"><ExchangeContent entry={entry} /></div>
+          </details>
         </article>;
       }) : <p className="empty">{entries.length ? 'No matching exchanges.' : 'No exchanges in this session.'}</p>}
     </div>

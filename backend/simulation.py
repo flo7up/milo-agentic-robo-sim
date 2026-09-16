@@ -586,16 +586,18 @@ class BulletSimulation:
         position, rotation = bullet.getBasePositionAndOrientation(self.robot, physicsClientId=self.client)
         matrix = np.array(bullet.getMatrixFromQuaternion(rotation)).reshape(3, 3)
         names = ("front", "front_left", "left", "rear_left", "rear", "rear_right", "right", "front_right")
-        starts, ends = [], []
+        starts, ends, origins = [], [], []
         for index in range(8):
             angle = index * math.pi / 4
             direction = np.array([math.cos(angle), math.sin(angle), 0])
             edge = min(.18 / max(abs(direction[0]), 1e-9), .25 / max(abs(direction[1]), 1e-9))
             origin = direction * edge + [0, 0, -.115]
+            origins.append(origin.tolist())
             starts.append((position + matrix @ origin).tolist())
             ends.append((position + matrix @ (origin + direction * 2)).tolist())
         hits = bullet.rayTestBatch(starts, ends, physicsClientId=self.client)
         distances = [{"direction": names[index], "bearing_rad": index * math.pi / 4,
+                      "origin_base_m": origins[index],
                       "distance_m": round(hit[2] * 2, 3) if hit[0] not in (-1, self.robot) else None,
                       "status": "clear" if hit[0] == -1 else "occluded" if hit[0] == self.robot else "hit"}
                      for index, hit in enumerate(hits)]

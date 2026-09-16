@@ -85,6 +85,66 @@ def test_route_uses_footprint_unknown_and_live_obstacles():
         home.route([0., 0.], [8., 0.], .3)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_map_shortcuts_cannot_skip_corner_cells_or_grid_boundaries(reverse):
+    home = HomeMap("corner-clearance")
+    allowed = np.ones((home.size, home.size), dtype=bool)
+    start, goal = [.7516411411491793, .5600558407407251], [1.05, .85]
+    if reverse:
+        start, goal = goal, start
+    assert home.segment_allowed(start, goal, allowed)
+    allowed[206, 207] = False
+    coarse = home.indices(np.linspace(start, goal, max(2, math.ceil(math.dist(start, goal) / .025))))
+    assert allowed[coarse[:, 1], coarse[:, 0]].all()
+    assert not home.segment_allowed(start, goal, allowed)
+    assert home.segment_allowed([.75, .55], [.95, .55], allowed)
+    assert not home.segment_allowed([.75, .6], [.75, .9], allowed)
+    assert not home.segment_allowed([100., 0.], [0., 0.], allowed)
+    assert not home.segment_allowed([float("nan"), 0.], [0., 0.], allowed)
+
+
+def test_mapped_clearance_reuses_only_current_grid_and_checks_same_trajectory(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from backend.home_mission import HomeMission
+    radius = [.3]
+    worker = SimpleNamespace(challenge=None, stop_revision=0, task_revision=0,
+        sim=SimpleNamespace(robot_footprint=lambda: {"radius_m": radius[0]}),
+        navigation=SimpleNamespace(velocity=[.08, -.2]))
+    mission = HomeMission(worker, MapStore(tmp_path / "clearance.sqlite3"))
+    mission.home = HomeMap("test")
+    mission.home.evidence[185:230, 185:230] = -2
+    mission.task = {"status": "running"}
+    mission.transform = [.2, -.1, .35]
+    mission.require_localized = lambda: None
+    calls = []
+    original = mission.home.allowed
+
+    def measured(*args):
+        calls.append(args[0])
+        return original(*args)
+
+    monkeypatch.setattr(mission.home, "allowed", measured)
+    pose = [.1, .2, .45]
+    for linear, angular in [(.1, .4), (0., -.5), (-.1, .2), (.4, 0.)]:
+        expected = []
+        for speed, turn in [(linear, angular), worker.navigation.velocity]:
+            for horizon in np.linspace(0., 1., 16):
+                heading = pose[2] + turn * horizon / 2
+                point = np.asarray(pose[:2]) + speed * horizon * np.array([math.cos(heading), math.sin(heading)])
+                expected.append(transform_pose([*point, 0.], mission.transform)[:2])
+        indices = mission.home.indices(expected)
+        assert mission.path_valid(pose, linear, angular) == original(radius[0])[indices[:, 1], indices[:, 0]].all()
+        assert mission.allowed(radius[0]) is mission.allowed_cache
+    assert calls == [.3]
+    radius[0] = .4
+    mission.path_valid(pose, .1, .4)
+    assert calls == [.3, .4]
+    mission.home.evidence[190:220, 190:220] = 4
+    mission.allowed_cache = None
+    assert not mission.path_valid(pose, .1, .4)
+    assert calls == [.3, .4, .4]
+
+
 def test_map_odometry_transform_round_trip():
     pose, transform = [1., 2., .4], [3., -2., 1.2]
     np.testing.assert_allclose(transform_pose(transform_pose(pose, transform), inverse_pose(transform)), pose)
@@ -617,6 +677,56 @@ def test_scan_matching_uses_sensor_returns_and_rejects_missing_data():
         home.match_scan({**laser, "ranges_m": [None] * 720}, [1., -.5, .4])
 
 
+async def test_localization_search_corrects_offset_against_frozen_independent_scan(tmp_path, record_property):
+    import json
+    import time
+    from backend.challenges import get_challenge
+    from backend.continuous_navigation import ContinuousScan
+    from backend.home_mission import HomeMission, HomeRequest
+    from backend.ros_navigation import capture_laser
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(challenge=get_challenge("flat_kitchen"), rendering="tiny", pace=False)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "independent.sqlite3"))
+        await worker.scan_continuous(ContinuousScan(run_id=worker.sim.run_id, episode_epoch=0, compact_arms=True))
+        await worker.home_command(HomeRequest(run_id=worker.sim.run_id, episode_epoch=0, action="start_mapping"))
+        await worker.home_command(HomeRequest(run_id=worker.sim.run_id, episode_epoch=0, action="save_map", name="Frozen reference"))
+        home = worker.home_mission
+        before = home.home.document()
+        reference_pose = list(home.pose)
+        frozen_evidence = home.home.evidence.copy()
+
+        def offset(sim):
+            sim._ticks(12)
+            sim.odometry += [.2, -.15, .1]
+            home.allow_expansion = False
+            return sim.odometry.tolist(), capture_laser(sim)
+
+        drifted, independent_scan = await worker.call(offset)
+        seed = transform_pose(drifted, home.transform)
+        try:
+            quality = home.home.scan_quality(independent_scan, seed)
+            assert quality["pose_correction_estimated"] is False
+        except ValueError:
+            quality = {"rejected": True, "pose_correction_estimated": False}
+        assert home.pose == reference_pose
+        await worker.home_command(HomeRequest(run_id=worker.sim.run_id, episode_epoch=0,
+            action="localize", pose_m_rad=seed))
+        assert math.dist(home.pose[:2], reference_pose[:2]) < .12
+        assert abs(home.pose[2]-reference_pose[2]) < .06
+        assert home.localization["quality"]["pose_correction_estimated"] is True
+        np.testing.assert_array_equal(home.home.evidence, frozen_evidence)
+        assert home.home.document() == before
+        record_property("localization_offset", json.dumps({"evidence": "scripted_fresh_scan_frozen_map",
+            "before_pose": seed, "estimated_pose": home.pose, "reference_pose": reference_pose,
+            "position_error_m": math.dist(home.pose[:2], reference_pose[:2]), "tracking_only_check": quality,
+            "new_scan_not_integrated": True, "scope": "Local seeded correction, not continuous SLAM or global relocalization"}))
+    finally:
+        worker.stop()
+        await worker.close()
+
+
 async def test_guided_map_save_reload_localize_and_navigate_real_physics(tmp_path):
     from backend.challenges import get_challenge
     from backend.contracts import Command
@@ -868,7 +978,7 @@ async def test_luna_home_dispatch_is_grounded_bounded_and_compact(tmp_path):
         await worker.close()
 
 
-@pytest.mark.parametrize("fault", ["timeout", "sensor", "task_revision", "stop", "selected_blocked", "selected_arrived"])
+@pytest.mark.parametrize("fault", ["timeout", "sensor", "task_revision", "stop", "selected_blocked", "selected_arrived", "buffer_expiry", "path_blocked"])
 def test_frontier_executive_is_bounded_and_fails_closed(tmp_path, fault):
     import threading
     import time
@@ -903,6 +1013,23 @@ def test_frontier_executive_is_bounded_and_fails_closed(tmp_path, fault):
     mission.tick()
     assert len(paths) == 1 and mission.task["segments"] == 1
     assert np.linalg.norm(paths[0][-1] - paths[0][0]) <= 1.01
+    if fault in {"buffer_expiry", "path_blocked"}:
+        target, frontier, deadline = list(mission.task["target_m"]), mission.task["frontier_id"], mission.task["deadline"]
+        reason = "BUFFER_EXPIRED: Motion authorization expired" if fault == "buffer_expiry" else "OBSERVED_PATH_BLOCKED: Inspect route"
+        for attempt in range(3):
+            worker.continuous = SimpleNamespace(active=False, home_owned=True, status="blocked", reason=reason)
+            mission.recheck_at = 0.
+            mission.tick()
+            assert mission.task["deadline"] == deadline and mission.task["retries"] == attempt + 1
+            if attempt == 0:
+                if fault == "buffer_expiry":
+                    assert mission.task["target_m"] == target and mission.task["frontier_id"] == frontier
+                    assert not mission.task.get("rejected_frontiers")
+                else:
+                    assert frontier in mission.task["rejected_frontiers"]
+        assert not mission.active and len(paths) == 3 and holds
+        assert mission.task["status"] == "failed" and "bounded route retries exhausted" in mission.task["reason"]
+        return
     if fault == "timeout":
         mission.task["deadline"] = 0.
     elif fault == "sensor":
@@ -952,6 +1079,97 @@ async def test_object_observation_uses_paired_depth_and_becomes_last_seen(tmp_pa
         restored = MapStore(tmp_path / "observations.sqlite3").object_observations(record["map_id"])
         assert restored[0]["position_m"] == record["position_m"] and restored[0]["confidence"] == .4
     finally:
+        await worker.close()
+
+
+@pytest.mark.parametrize("offset,heading,ending", [(0., 1.158, "arrive"), (.08, .85, "arrive"),
+    (-.08, 1.45, "arrive"), (0., 1.158, "stop"), (0., 1.158, "closed")])
+async def test_local_doorway_route_rounds_observed_corner_without_luna(tmp_path, record_property, offset, heading, ending):
+    import json
+    import time
+    import pybullet as bullet
+    from backend.challenges import get_challenge
+    from backend.continuous_navigation import ContinuousScan
+    from backend.home_mission import HomeMission, HomeRequest
+    from backend.worker import SimulationWorker
+    challenge = get_challenge("flat_kitchen").model_copy(update={"initial_xy": [-3.732 + offset, -1.644]})
+    if ending == "closed":
+        challenge.objects = [*challenge.objects, {"name": "closed_test_door", "size": [1.6, .12, 1.25],
+            "position": [-3., -1.05, .625], "color": [.5, .5, .5, 1]}]
+    worker = SimulationWorker(challenge=challenge, rendering="enhanced", pace=True)
+    contacts = []
+    try:
+        await asyncio.wrap_future(worker.ready)
+
+        def prepare(sim):
+            position = bullet.getBasePositionAndOrientation(sim.robot, physicsClientId=sim.client)[0]
+            bullet.resetBasePositionAndOrientation(sim.robot, position,
+                bullet.getQuaternionFromEuler([0., 0., heading]), physicsClientId=sim.client)
+            sim.odometry[:] = [.668 + offset, .556, heading]
+            worker.home_mission = HomeMission(worker, MapStore(tmp_path / "corner.sqlite3"))
+            worker.home_mission.home = HomeMap("standalone:flat_kitchen")
+            worker.home_mission.transform = [0., 0., 0.]
+            worker.home_mission.last_odometry = sim.odometry.tolist()
+            previous = sim.on_tick
+
+            def capture():
+                contacts.extend(sim.proximity_sensors().collisions)
+                previous()
+
+            sim.on_tick = capture
+
+        await worker.call(prepare)
+        await worker.scan_continuous(ContinuousScan(run_id=worker.sim.run_id, episode_epoch=0, compact_arms=True))
+        await worker.home_command(HomeRequest(run_id=worker.sim.run_id, episode_epoch=0, action="start_mapping"))
+        mission = worker.home_mission
+        destination = transform_pose([1.4, 2.2, math.pi/2], mission.transform)
+        def admission(sim):
+            from scipy.ndimage import distance_transform_edt
+            allowed = mission.home.allowed(sim.robot_footprint()["radius_m"], mission.obstacles())
+            indices = mission.home.indices([mission.pose[:2], destination[:2]])
+            clearance = distance_transform_edt(np.pad(mission.home.cells == 0, 1))[1:-1, 1:-1] * mission.home.resolution_m
+            return {"allowed": allowed[indices[:, 1], indices[:, 0]].tolist(),
+                "clearance_m": clearance[indices[:, 1], indices[:, 0]].tolist(),
+                "radius_m": sim.robot_footprint()["radius_m"], "destination": destination}
+        record_property("corner_admission", json.dumps(await worker.call(admission)))
+        started = time.monotonic()
+        if ending == "closed":
+            before = await worker.call(lambda sim: (sim.odometry.copy(), sim.ticks))
+            with pytest.raises(ValueError, match="UNREACHABLE"):
+                await worker.home_command(HomeRequest(run_id=worker.sim.run_id, episode_epoch=0,
+                    action="guided_to", pose_m_rad=destination, time_budget=45.))
+            after = await worker.call(lambda sim: (sim.odometry.copy(), sim.ticks))
+            assert np.array_equal(before[0], after[0]) and before[1] == after[1]
+            assert not mission.active and not contacts
+            record_property("doorway", json.dumps({"ending": ending, "model_calls": 0, "travel_m": 0., "contacts": 0}))
+            return
+        await worker.home_command(HomeRequest(run_id=worker.sim.run_id, episode_epoch=0,
+            action="guided_to", pose_m_rad=destination, time_budget=45.))
+        deadline = mission.task["deadline"]
+        async with asyncio.timeout(50.):
+            while mission.active:
+                await worker.home_state(compact=True)
+                if ending == "stop" and worker.sim.path_length >= .15:
+                    worker.stop()
+                await asyncio.sleep(.05)
+        measured = await worker.call(lambda sim: {"pose": sim.odometry.tolist(), "travel_m": sim.path_length,
+            "task": dict(mission.task), "world_pose": bullet.getBasePositionAndOrientation(sim.robot, physicsClientId=sim.client)[0]})
+        record_property("doorway", json.dumps({"evidence": "scripted_destination_real_enhanced_physics",
+            "model_calls": 0, "offset": offset, "heading": heading, "ending": ending, "seconds": time.monotonic()-started,
+            "contacts": len(contacts), **measured}))
+        assert mission.task["deadline"] == deadline
+        if ending == "stop":
+            assert mission.task["status"] == "cancelled" and measured["travel_m"] >= .15 and not contacts
+            frozen = await worker.call(lambda sim: (sim.odometry.copy(), sim.ticks))
+            await asyncio.sleep(.2)
+            after = await worker.call(lambda sim: (sim.odometry.copy(), sim.ticks))
+            assert np.array_equal(frozen[0], after[0]) and frozen[1] == after[1]
+            return
+        assert mission.task["status"] == "completed", measured
+        assert math.dist(measured["world_pose"][:2], [-3., 0.]) <= .15
+        assert measured["travel_m"] > 1.5 and not contacts
+    finally:
+        worker.stop()
         await worker.close()
 
 

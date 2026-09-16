@@ -10,6 +10,7 @@ from threading import Lock
 import time
 import zlib
 
+from backend.worker_timing import timed
 
 recording_json_lock = Lock()
 
@@ -126,8 +127,14 @@ class RunRecorder:
         self.home_events_omitted = 0
         self.home_telemetry_limit = 2000
         self.home_capture_max_s = 0.
+        self.timing_start = None
+        self.timing_incidents = 0
+        self.timing_omitted = 0
+        self.timing_dropped_start = 0
+        self.timing_dropped = 0
         self.stream = (self.directory / "trajectory.jsonl").open("w", encoding="utf-8")
 
+    @timed("recording.capture_home")
     def capture_home(self, worker, now):
         mission = getattr(worker, "home_mission", None)
         if mission is None:
@@ -205,9 +212,14 @@ class RunRecorder:
                 "telemetry_path": telemetry_path}
         return self.home_telemetry, events
 
+    @timed("recording.capture")
     def capture(self, worker):
         import pybullet as bullet
         sim = worker.sim
+        timing = getattr(worker, "worker_timing", None)
+        if timing is not None and self.timing_start is None:
+            self.timing_start = timing.incident_sequence
+            self.timing_dropped_start = timing.incidents_dropped
         if self.scene is None:
             self.scene = {"schema_version": 1, "evaluation_only": True,
                 "coordinate_frame": "recorded_world_xy_m", "robot_body_id": sim.robot,
@@ -273,7 +285,20 @@ class RunRecorder:
             operator_assisted=bool(worker.latest.get("assisted")))
         if len(self.pending) == self.pending.maxlen:
             self.dropped += 1
-        self.pending.append((sample, self.camera_media + self.spatial_media + self.home_media + self.home_telemetry_media))
+        timing_media = []
+        if timing is not None:
+            self.timing_dropped = timing.incidents_dropped - self.timing_dropped_start
+            for incident in timing.take_incidents():
+                if incident["incident_id"] <= self.timing_start:
+                    continue
+                if self.timing_incidents >= 128:
+                    self.timing_omitted += 1
+                    continue
+                self.timing_incidents += 1
+                filename = f"media/worker-timing-{incident['incident_id']}.json"
+                timing_media.append((filename, incident))
+            sample["worker_timing_files"] = [filename for filename, _ in timing_media]
+        self.pending.append((sample, self.camera_media + self.spatial_media + self.home_media + self.home_telemetry_media + timing_media))
 
     def flush(self):
         if self.scene is not None and not self.scene_written:
@@ -302,6 +327,9 @@ class RunRecorder:
         with (self.directory / "trajectory.jsonl").open(encoding="utf-8") as source:
             samples = [json.loads(line) for line in source]
         score = score_samples(samples, dropped=self.dropped)
+        score["worker_timing"] = {"scope": "Bounded stop-centered worker wall-time snapshots",
+            "incidents": self.timing_incidents, "omitted": self.timing_omitted,
+            "dropped": self.timing_dropped, "limit": 128}
         score["operator_assisted"] = any(sample["manual_placements"] or sample.get("operator_assisted") for sample in samples)
         homes = [sample["home"] for sample in samples if sample.get("home") and sample["home"].get("coverage")]
         score["spatial_recording"] = {"snapshots": self.home_snapshot_count, "snapshots_omitted": self.home_snapshots_omitted,

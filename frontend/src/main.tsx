@@ -12,7 +12,7 @@ import { robotOutcome } from './OutcomeFeedback';
 import { RobotControlSurface } from './RobotControlSurface';
 import { ViewNavigation, type TestView } from './ViewNavigation';
 import { PreferencesProvider, usePreference } from './Preferences';
-import type { LiveState, ManualPlacement, ProximitySensors, Result } from './types';
+import type { LiveState, ManualPlacement, ProximitySensors, Result, SpatialTelemetry } from './types';
 import './style.css';
 
 export async function api(path: string, body?: unknown) {
@@ -115,7 +115,9 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
   const [pending, setPending] = useState(false);
   const [sceneLoading, setSceneLoading] = useState(false);
   const [spatialHud, setSpatialHud] = useState<HTMLDivElement | null>(null);
-  const [cameraMinimized, setCameraMinimized] = useState(false);
+  const [cameraMinimized, setCameraMinimized] = useState(true);
+  const [spatialTelemetry, setSpatialTelemetry] = useState<SpatialTelemetry | null>(null);
+  const [showMotionZones,setShowMotionZones]=useState(false);
   const [powerPending, setPowerPending] = useState(false);
   const [commandHost, setCommandHost] = useState<HTMLDivElement | null>(null);
   const [controlSurface, setControlSurface] = useState<HTMLElement | null>(null);
@@ -190,6 +192,8 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
   const disabled = !connected || !powered || powerPending || pending || sceneLoading || !!state?.busy || !!state?.stopped || !!state?.agent.active;
   const jointLimits = [1.8, 2.5, 2.7, 3, 2.5, 3];
   const observation = state?.observation;
+  const inferenceBudget = state?.agent.inference_budget;
+  const reportedTokens = (state?.agent.input_tokens ?? 0) + (state?.agent.output_tokens ?? 0);
   const commandBar = <section className="command-bar" aria-label="Robot controls">
     <RobotActivity state={state} connected={connected} />
     <div className="run-actions">{state?.power && <div className="robot-power-control">
@@ -202,6 +206,14 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
         <button disabled={!connected || !powered || (!state?.stopped && !state?.agent.active)} onClick={() => control(state?.agent.active ? 'agent/takeover' : 'resume')}><Hand size={16} />{state?.agent.active ? 'Take manual control' : 'Enable manual control'}</button>
         <button disabled={!connected || sceneLoading || powerPending} onClick={() => control('reset')}><RotateCcw size={16} />Reset episode</button>
       </div></details></div>
+    {inferenceBudget && <div className="command-budget" role="group" aria-label="Luna usage and limits"
+      data-limit-reached={reportedTokens >= inferenceBudget.max_tokens}
+      title="Provider-reported usage. The threshold is checked after each request, so a response may cross it.">
+      <span>{!connected ? 'Last received' : state?.agent.active ? 'Current run' : 'Last run'}</span>
+      <span>Tokens <strong>{reportedTokens.toLocaleString('en-US')} / {inferenceBudget.max_tokens.toLocaleString('en-US')}</strong></span>
+      <span>Requests <strong>{inferenceBudget.requests} / {inferenceBudget.max_requests}</strong></span>
+      {inferenceBudget.usage_unknown && <span>Usage incomplete</span>}
+    </div>}
   </section>;
   return <RobotControlSurface.Provider value={setControlSurface}>
     <header className="topbar cockpit-header">
@@ -221,9 +233,11 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
       <div className="observation-column" id="observe">
       <section className="view-grid">
         <div className="world-panel">
-          <div className="panel-header"><h3><Move3D size={16} /> World view <span className="tag">Operator only</span></h3><label className="toggle"><input type="checkbox" checked={axes} onChange={event => setAxes(event.target.checked)} /> Axes</label></div>
+          <div className="panel-header world-options"><h3><Move3D size={16} /> World view <span className="tag">Operator only</span></h3>
+            <label className="toggle"><input type="checkbox" checked={showMotionZones} onChange={event=>setShowMotionZones(event.target.checked)}/>Movement zones</label>
+            <label className="toggle"><input type="checkbox" checked={axes} onChange={event => setAxes(event.target.checked)} /> Axes</label></div>
           <div className="world-viewport">
-            {state ? <Spectator state={state} axes={axes} enabled={!disabled} onPlace={placeRobot} /> : <div className="loading">Connecting to physics worker...</div>}
+            {state ? <Spectator state={state} axes={axes} enabled={!disabled} onPlace={placeRobot} showZones={showMotionZones} telemetry={spatialTelemetry} connected={connected} /> : <div className="loading">Connecting to physics worker...</div>}
             <aside className="viewport-hud" aria-label="Robot sensor HUD">
               <section className="viewport-widget" aria-label="Head camera HUD" data-minimized={cameraMinimized}>
                 <div className="viewport-widget-heading"><h3><Camera size={14} /> Head camera</h3></div>
@@ -258,10 +272,11 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
       <div id="map">{state && <><HomeMapping key={`home-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
         connected={connected} busy={sceneLoading || state.busy || state.agent.active} stopped={state.stopped} request={api} />
         <SpatialSensing key={`spatial-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
-        connected={connected} busy={sceneLoading || state.busy || state.agent.active} request={api} hudHost={spatialHud} /></>}</div>
+        connected={connected} busy={sceneLoading || state.busy || state.agent.active} request={api} hudHost={spatialHud} onTelemetry={setSpatialTelemetry} showMotionZones={showMotionZones} /></>}</div>
       </div>
       <aside className="interaction-column" id="interact" aria-label="Robot interaction">
-        {state && <AgentControl key={state.run_id} state={state} connected={connected && !sceneLoading && !powerPending} request={api} commandHost={commandHost} />}
+        {state && <AgentControl key={state.run_id} state={state} connected={connected && !sceneLoading && !powerPending} request={api} commandHost={commandHost}
+          spatialTelemetry={spatialTelemetry?.run_id === state.run_id && spatialTelemetry.episode_epoch === state.episode_epoch ? spatialTelemetry : null} />}
       </aside>
       </div>
       <div className="lab-tools" id="controls">

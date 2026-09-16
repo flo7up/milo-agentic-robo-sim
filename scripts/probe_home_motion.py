@@ -79,6 +79,7 @@ async def fresh_exploration(output, resources, hashes):
 async def probe(output, case_id):
     output.mkdir(parents=True, exist_ok=False)
     timings = defaultdict(list)
+    cpu_timings = defaultdict(list)
     events = []
     patched = []
     started = time.monotonic()
@@ -89,6 +90,7 @@ async def probe(output, case_id):
         @wraps(original)
         def measured(instance, *args, **kwargs):
             began = time.perf_counter()
+            cpu_began = time.thread_time()
             worker = instance if isinstance(instance, SimulationWorker) else getattr(instance, "worker", None)
             navigation = getattr(worker, "navigation", None)
             before = None if navigation is None else {"status": navigation.status,
@@ -97,11 +99,14 @@ async def probe(output, case_id):
                 return original(instance, *args, **kwargs)
             finally:
                 elapsed = time.perf_counter() - began
+                cpu_elapsed = time.thread_time() - cpu_began
                 timings[key].append(elapsed)
+                cpu_timings[key].append(cpu_elapsed)
                 if (elapsed >= .015 or key in {"ContinuousNavigation.finish", "SimulationWorker._update_continuous", "SimulationWorker._sample_spatial", "SimulationWorker._receive_mapped_capture"}) and len(events) < 10000:
                     after = None if navigation is None else {"status": navigation.status, "reason": navigation.reason,
                         "lease_s": navigation.expires_at - time.monotonic(), "buffered": bool(navigation.buffer)}
                     events.append({"wall_s": time.monotonic() - started, "operation": key, "duration_s": elapsed,
+                        "thread_cpu_s": cpu_elapsed, "force": kwargs.get("force", False),
                         "before": before, "after": after, "finish": str(args[2:]) if key == "ContinuousNavigation.finish" else None,
                         "sensor": None if worker is None else {"age_s": None if worker.spatial_map is None or worker.spatial_map.captured_at is None else time.monotonic() - worker.spatial_map.captured_at,
                             "pending": worker.spatial_pending is not None, "ready": worker.spatial_pending.done() if worker.spatial_pending else None,
@@ -114,10 +119,12 @@ async def probe(output, case_id):
         setattr(owner, name, measured)
         patched.append((owner, name, original))
 
-    for owner, names in ((HomeMission, ("sample", "observe_depth", "path_valid", "state", "tick")),
+    from backend import camera as camera_module
+    for owner, names in ((camera_module, ("scene_snapshot", "capture_spatial_snapshot")),
+            (HomeMission, ("sample", "observe_depth", "path_valid", "state", "tick")),
             (HomeMap, ("observe", "allowed", "scan_quality", "route")),
             (SimulationWorker, ("_sample_spatial", "_receive_spatial", "_receive_mapped_capture", "_update_continuous", "_publish_navigation", "_publish", "_feedback")),
-            (BulletSimulation, ("capture_spatial", "robot_footprint")),
+            (BulletSimulation, ("capture_spatial", "robot_footprint", "geometry", "snapshot")),
             (EnhancedRenderer, ("capture",)), (NavigationRuntime, ("tick", "apply", "check_clearance")), (ContinuousNavigation, ("update", "finish")),
             (RunRecorder, ("capture", "capture_home"))):
         for name in names:
@@ -142,6 +149,7 @@ async def probe(output, case_id):
         for name, values in timings.items():
             ordered = sorted(values)
             summary[name] = {"calls": len(values), "total_s": sum(values), "max_s": max(values),
+                "thread_cpu_total_s": sum(cpu_timings[name]), "thread_cpu_max_s": max(cpu_timings[name]),
                 "p95_s": ordered[min(len(values) - 1, int(.95 * len(values)))]}
         report = {"design": design, "case": case, "result": result,
             "timings": summary, "events": events,

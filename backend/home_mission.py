@@ -11,6 +11,7 @@ from pydantic import Field
 from backend.contracts import StrictModel
 from backend.home_mapping import HomeMap, MapStore, inverse_pose, laser_points, transform_pose
 from backend.simulation import MotionError
+from backend.worker_timing import timed
 
 
 DEFAULT_MAP_PATH = Path(__file__).resolve().parents[1] / ".runtime" / "maps" / "homes.sqlite3"
@@ -113,6 +114,7 @@ class HomeMission:
         if self.stage == "mapping":
             self.stage = "review"
 
+    @timed("map.sample")
     def sample(self, force=False):
         try:
             self._sample(force)
@@ -150,6 +152,9 @@ class HomeMission:
         if now - self.validated_at >= 1. and self.home.scan_count >= 3:
             try:
                 self.localization["quality"] = self.home.scan_quality(laser, self.pose)
+                self.localization["quality"].update(evaluation_order="before_current_laser_integration",
+                    reference_geometry="accumulated_sensor_map_not_independent_reference",
+                    reference_scan_count=self.home.scan_count)
                 self.validated_at = time.monotonic()
             except ValueError as error:
                 self.error = str(error)
@@ -185,6 +190,7 @@ class HomeMission:
         self.localization["status"] = "localized"
         self.allowed_cache = None
 
+    @timed("map.observe_depth")
     def observe_depth(self, sensor):
         from backend.spatial import point_cloud
         now = time.monotonic()
@@ -204,6 +210,8 @@ class HomeMission:
                 cells = cells[self.home.inside(cells)]
                 columns, rows = cells.T
                 self.home.evidence[rows, columns] = np.maximum(4, self.home.evidence[rows, columns])
+                if len(cells):
+                    self.home.updated_at = time.time()
             self.last_depth_sequence = sensor.sequence
             self.allowed_cache = None
 
@@ -216,7 +224,7 @@ class HomeMission:
         if self.pose is None or self.localization["status"] != "localized" or time.monotonic() - self.sampled_at > .75 or time.monotonic() - self.validated_at > 2.:
             raise ValueError("LOCALIZATION_REQUIRED: localize against the saved map with fresh sensors")
 
-    def command(self, request, stop_revision, task_revision, selected_evidence=None, operator_review=False):
+    def command(self, request, stop_revision, task_revision, selected_evidence=None, operator_review=False, selected_frontier=None):
         worker, sim = self.worker, self.worker.sim
         if request.run_id != sim.run_id or request.episode_epoch != sim.epoch:
             raise MotionError("STALE_STATE", "Map request belongs to another episode")
@@ -436,8 +444,14 @@ class HomeMission:
             chosen_frontier = None
             radius = sim.robot_footprint()["radius_m"]
             if request.action == "explore_frontier":
-                choices = self.home.frontiers(self.pose, radius, self.obstacles(), request.region_id)
-                chosen_frontier = next((item for item in choices if item["frontier_id"] == request.frontier_id), None)
+                if selected_frontier is not None:
+                    selected_frontier.check(self.mission_owner, sim.run_id, sim.epoch, self.home.identity, sim.odometry, time.monotonic())
+                    if request.frontier_id != selected_frontier.frontier_id:
+                        raise ValueError("FRONTIER_SELECTION_CHANGED: supplied identity changed")
+                    chosen_frontier = {"frontier_id": selected_frontier.frontier_id, "position_m": list(selected_frontier.position_m)}
+                else:
+                    choices = self.home.frontiers(self.pose, radius, self.obstacles(), request.region_id)
+                    chosen_frontier = next((item for item in choices if item["frontier_id"] == request.frontier_id), None)
                 if chosen_frontier is None:
                     raise ValueError("UNKNOWN_FRONTIER: select a currently reachable frontier")
                 if not self.allow_expansion:
@@ -501,22 +515,30 @@ class HomeMission:
             and abs(math.atan2(math.sin(heading), math.cos(heading))) <= .05
             and max(abs(actual - observed) for actual, observed in zip(current_head, head)) <= .05)
 
+    @timed("map.clearance_mask")
+    def allowed(self, radius):
+        if self.allowed_cache is None or getattr(self, "allowed_radius", None) != radius:
+            self.allowed_cache = self.home.allowed(radius, self.obstacles())
+            self.allowed_radius = radius
+        return self.allowed_cache
+
+    @timed("map.path_valid")
     def path_valid(self, pose, linear, angular, *, guided=False):
         if not self.active and not (guided and self.stage == "mapping"):
             return False
         self.require_localized()
         radius = self.worker.sim.robot_footprint()["radius_m"]
-        if self.allowed_cache is None:
-            self.allowed_cache = self.home.allowed(radius, self.obstacles())
-        points = []
+        allowed = self.allowed(radius)
         velocity = self.worker.navigation.velocity if self.worker.navigation else (0., 0.)
-        for speed, turn in [(linear, angular), velocity]:
-            for horizon in np.linspace(0., 1., 16):
-                heading = pose[2] + turn * horizon / 2
-                point = np.array(pose[:2]) + speed * horizon * np.array([math.cos(heading), math.sin(heading)])
-                points.append(transform_pose([*point, 0.], self.transform)[:2])
+        candidates = np.asarray([(linear, angular), velocity])
+        horizons = np.linspace(0., 1., 16)
+        headings = pose[2] + candidates[:, 1, None] * horizons / 2
+        points = (np.asarray(pose[:2]) + candidates[:, 0, None, None] * horizons[None, :, None]
+            * np.stack((np.cos(headings), np.sin(headings)), axis=-1)).reshape(-1, 2)
+        cosine, sine = math.cos(self.transform[2]), math.sin(self.transform[2])
+        points = points @ np.array([[cosine, sine], [-sine, cosine]]) + self.transform[:2]
         indices = self.home.indices(points)
-        return bool(self.home.inside(indices).all() and self.allowed_cache[indices[:, 1], indices[:, 0]].all())
+        return bool(self.home.inside(indices).all() and allowed[indices[:, 1], indices[:, 0]].all())
 
     def guard_guided_drive(self, arguments):
         from backend.navigation import NavigationRuntime
@@ -530,6 +552,7 @@ class HomeMission:
         except ValueError as error:
             raise MotionError("GUIDED_MAP_BLOCKED", str(error)) from error
 
+    @timed("map.tick")
     def tick(self):
         if self.workflow and self.workflow["status"] in {"navigating_to_room", "awaiting_room_report", "returning"}:
             if self.worker.sim.cancel.is_set() or self.stop_revision != self.worker.stop_revision or self.task_revision != self.worker.task_revision:
@@ -564,7 +587,8 @@ class HomeMission:
                     if task["retries"] > 2:
                         raise ValueError("BLOCKED: bounded route retries exhausted; last route: " + worker.continuous.reason)
                     task["reason"] = "Replanning after " + worker.continuous.reason
-                    if task["kind"] == "explore" and not task.get("single_frontier") and task["frontier_id"]:
+                    timing_failure = worker.continuous.reason.startswith(("BUFFER_EXPIRED:", "BUFFER_EMPTY:", "MOTION_LEASE_EXPIRED:"))
+                    if not timing_failure and task["kind"] == "explore" and not task.get("single_frontier") and task["frontier_id"]:
                         task.setdefault("rejected_frontiers", []).append(task["frontier_id"])
                         self.home.mark_frontier(task["frontier_id"])
                         task["target_m"] = None
@@ -648,14 +672,13 @@ class HomeMission:
                 task["reason"] = "Selecting another frontier after map rejection: " + str(error)
                 self.recheck_at = time.monotonic() + .2
                 return
-            allowed = self.home.allowed(radius, self.obstacles())
+            allowed = self.allowed(radius)
             endpoint = self.route[1]
             self.task["route_index"] = 1
             for index, candidate in enumerate(self.route[2:], 2):
                 if math.dist(self.pose[:2], candidate) > 1.:
                     break
-                indices = self.home.indices(np.linspace(self.pose[:2], candidate, max(2, math.ceil(math.dist(self.pose[:2], candidate) / .025))))
-                if not allowed[indices[:, 1], indices[:, 0]].all():
+                if not self.home.segment_allowed(self.pose[:2], candidate, allowed):
                     break
                 endpoint = candidate
                 self.task["route_index"] = index
@@ -680,6 +703,10 @@ class HomeMission:
         failures.append({"phase": phase, "reason": reason, "segment": self.task.get("segments", 0),
             "frontier_id": self.task.get("frontier_id"),
             "elapsed_s": round(time.monotonic() - self.task.get("started_at", time.monotonic()), 3)})
+        runtime = getattr(self.worker, "navigation", None)
+        if runtime is not None and hasattr(runtime, "diagnostic_state"):
+            failures[-1]["motion_diagnostics"] = runtime.diagnostic_state()
+        failures[-1]["clock"] = "monotonic"
         del failures[:-4]
 
     def continue_local_exploration(self):
@@ -700,14 +727,13 @@ class HomeMission:
             return
         self.require_localized()
         task["continued_at"] = now
-        allowed = self.home.allowed(radius, self.obstacles())
+        allowed = self.allowed(radius)
         chosen = task["route_index"]
         for index in range(chosen + 1, len(self.route)):
             target = self.route[index]
             if math.dist(self.pose[:2], target) > 1.:
                 break
-            indices = self.home.indices(np.linspace(self.pose[:2], target, max(2, math.ceil(math.dist(self.pose[:2], target) / .025) + 1)))
-            if not self.home.inside(indices).all() or not allowed[indices[:, 1], indices[:, 0]].all():
+            if not self.home.segment_allowed(self.pose[:2], target, allowed):
                 break
             delta = np.asarray(target) - self.pose[:2]
             bearing = math.atan2(delta[1], delta[0]) - self.pose[2]
@@ -726,17 +752,33 @@ class HomeMission:
         task["route_index"] = chosen
         task["continuations"] = task.get("continuations", 0) + 1
 
-    def state(self, compact=False):
+    def state(self, compact=False, lightweight=False):
         home = self.home
         result = {"environment_id": self.environment_id, "stage": self.stage, "map_id": home.identity if home else None,
             "controller": "builtin_mapped_navigation", "design": "guided-waypoints-v1", "version": "0.4.0",
             "name": home.name if home else None, "revision": home.revision if home else 0, "expansion_allowed": self.allow_expansion,
             "localization": {**self.localization, "age_s": max(0., time.monotonic() - self.sampled_at),
+                "age_basis": "time_since_last_laser_sample", "sample_clock": "monotonic",
+                "last_sample_at_s": self.sampled_at, "last_consistency_check_at_s": self.validated_at,
+                "tracking_method": "wheel_odometry_with_fixed_pose_scan_consistency",
+                "continuous_pose_correction": False,
                 "pose_m_rad": self.pose, "map_from_odometry_m_rad": self.transform},
             "frame": "map", "units": "m_rad", "timestamp_unix_s": time.time(), "error": self.error,
             "task": {key: value for key, value in self.task.items() if key not in {"deadline", "started_at", "arrived_at"}} if self.task else None,
             "places": [], "coverage": None}
         result["room_workflow"] = {key: value for key, value in self.workflow.items() if key != "deadline"} if self.workflow else None
+        if lightweight:
+            from copy import deepcopy
+            result.pop("environment_id", None)
+            result["task"] = deepcopy(result["task"])
+            result["room_observations"] = deepcopy(self.room_records[:8])
+            result["frontiers"] = []
+            result["frontier_selection_available"] = False
+            if home:
+                result["coverage"] = {"free_m2": float(np.count_nonzero(home.cells == 0) * home.resolution_m ** 2),
+                    "known_cells": int(np.count_nonzero(home.evidence)), "visited_cells": int(np.count_nonzero(home.visits)),
+                    "scan_count": home.scan_count, "whole_home_percentage": None}
+            return result
         if home:
             radius = self.worker.sim.robot_footprint()["radius_m"]
             fresh = (self.pose is not None and self.localization["status"] == "localized"
@@ -784,4 +826,6 @@ class HomeMission:
                     frontier_attempts=home.frontier_attempts, dirty=not home.saved or home.annotations_dirty)
         if not compact:
             result["maps"] = self.store.catalog()
+        else:
+            result.pop("environment_id", None)
         return result

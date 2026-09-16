@@ -3,6 +3,162 @@ import pytest
 from backend.mission import Mission, MissionPlan
 
 
+@pytest.mark.parametrize("fault", [None, "mission", "run", "epoch", "map", "expired", "future", "moved", "turned", "nonfinite"])
+def test_mission_frontier_selection_requires_same_fresh_stopped_evidence(fault):
+    from backend.mission import MissionDecision, MissionFrontierSelection
+    selection = MissionFrontierSelection(mission_id="mission", run_id="run", episode_epoch=1, map_id="map", frontier_id="1:0",
+        position_m=[1., 0.], odometry_m_rad=[0., 0., 0.], captured_at=10., source_sequence=2)
+    values = ["mission", "run", 1, "map", [0., 0., 0.], 11.]
+    if fault in {"mission", "run", "epoch", "map"}:
+        index = ("mission", "run", "epoch", "map").index(fault)
+        values[index] = 2 if fault == "epoch" else "other"
+    elif fault in {"expired", "future"}:
+        values[-1] = 25.001 if fault == "expired" else 9.999
+    elif fault:
+        values[4] = [.051, 0., 0.] if fault == "moved" else [0., 0., .081] if fault == "turned" else [float("nan"), 0., 0.]
+    if fault:
+        with pytest.raises(ValueError, match="FRONTIER_SELECTION"):
+            selection.check(*values)
+    else:
+        selection.check(*values)
+        selection.check("mission", "run", 1, "map", [0., 0., 2 * 3.141592653589793], 25.)
+        assert MissionDecision(action="navigate_frontier", frontier_id="1:0").frontier_id == "1:0"
+        with pytest.raises(ValueError, match="frontier identity"):
+            MissionDecision(action="navigate_frontier")
+
+
+@pytest.mark.parametrize("current", [False, True])
+def test_semantic_payload_separates_current_task_and_bounded_history(current):
+    import copy
+    import json
+    from backend.mission_supervisor import semantic_payload
+    mission = Mission("run", 1, 2, 3, deadline=60., clock=lambda: 10.)
+    mission.configure(MissionPlan(kind="room", target="Kitchen"))
+    task = {"mission_id": mission.identity if current else "previous-mission", "task_id": "task", "kind": "explore",
+        "status": "running" if current else "failed", "reason": "Replanning after OBSERVED_PATH_BLOCKED",
+        "route_failures": [{"reason": "OBSERVED_PATH_BLOCKED", "segment": index,
+            "motion_diagnostics": {"recent_events": ["debug-only"] * 200}} for index in range(5)]}
+    observation = {"run_id": "run", "episode_epoch": 1, "seq": 4, "frame_ref": "1-4.png", "head_rad": [.123456789, .2],
+        "odometry_m_rad": [1.23456789, 0., 0.], "joints": ["unused-joints"] * 100, "grippers": {"left": "unused-grippers"},
+        "navigation": {"status": "running", "reason": "Old reason", "diagnostics": {"recent_events": ["debug-only"] * 200}},
+        "proximity": {"max_range_m": 2., "distances": [{"direction": "front", "distance_m": .654321, "status": "hit"}]},
+        "spatial": {"task": task, "environment_id": "private-scene-name", "localization": {"status": "localized", "age_s": .2}},
+        "observed_map": {"frame": "map", "revision": "revision", "age_s": .2, "geometry_source": "accumulated_sensor_map",
+            "cells": [0] * 6400, "trail_m": [[0., 0.]] * 128, "route_m": [[1., 1.]] * 128}}
+    original = copy.deepcopy(observation)
+    payload = semantic_payload(observation, mission, None, {"task": task}, ["explore"], {"tokens": 10, "max_tokens": 100})
+    assert observation == original
+    assert payload["observation"]["frame_ref"] == "1-4.png"
+    assert payload["observation"]["odometry_m_rad"] == [1.235, 0, 0]
+    assert payload["observation"]["proximity"]["distances"][0]["distance_m"] == .654
+    assert payload["observation"]["observed_map"]["age_s"] == .2
+    assert payload["budget"]["max_tokens"] == 100
+    text = json.dumps(payload)
+    assert len(text) < 2500
+    assert all(forbidden not in text for forbidden in ("unused-joints", "unused-grippers", "debug-only", "private-scene-name", "cells", "trail_m", "route_m"))
+    if current:
+        assert payload["observation"]["spatial"]["task"]["reason"] == "Local task active"
+        assert len(payload["observation"]["spatial"]["task"]["recent_failures"]) == 2
+        assert payload["observation"]["navigation"]["reason"] == "Executing bounded motion"
+        assert payload["last_execution"]["task"]["task_id"] == "task"
+    else:
+        assert payload["observation"]["spatial"]["task"] is None
+        assert payload["observation"]["navigation"] is None
+        assert payload["last_execution"] is None
+        assert "OBSERVED_PATH_BLOCKED" not in text
+
+
+def test_observed_mission_trail_keeps_inter_review_turns_and_excludes_future_positions():
+    from backend.mission import ObservedMotionTrail
+    trail = ObservedMotionTrail()
+    points = [[0., 0.], [1., 0.], [1., 1.], [0., 1.], [0., 0.]]
+    for timestamp, point in enumerate(points):
+        trail.record([*point, 0.], float(timestamp))
+    assert trail.at(4., [0., 0., 0.]) == points
+    assert trail.at(2.5, [.5, 1., 0.]) == points[:3] + [[.5, 1.]]
+    trail.record([99., 99., 0.], 1.)
+    assert trail.at(4., [0., 0., 0.]) == points
+    for index in range(140):
+        trail.record([float(index), 0., 0.], 10. + index)
+    assert len(trail.samples) == 128 and trail.dropped > 0
+    assert len(trail.at(149., [139., 0., 0.])) == 128
+
+
+@pytest.mark.parametrize("invented", [False, True])
+async def test_mission_executes_only_a_supplied_observed_frontier(tmp_path, invented):
+    import asyncio
+    import json
+    import math
+    from backend.challenges import get_challenge
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
+
+    class ChoosingModel(ScriptedModel):
+        async def respond(self, profile, reasoning, goal, inputs):
+            self.inputs.append(inputs)
+            brief = json.loads(inputs[-1]["content"][0]["text"])
+            if len(self.inputs) == 1:
+                decision = {"action": "plan", "plan": {"kind": "room", "target": "Kitchen"}}
+            elif len(self.inputs) == 2:
+                choices = brief["observation"]["spatial"]["frontiers"]
+                assert choices and "navigate_frontier" in brief["available_actions"]
+                self.selected = "invented-choice" if invented else choices[0]["frontier_id"]
+                decision = {"action": "navigate_frontier", "frontier_id": self.selected}
+            else:
+                decision = {"action": "look"}
+            return model_response("guide_mission", json.dumps(decision), call_id=f"choice-{len(self.inputs)}")
+
+    model = ChoosingModel([])
+    worker = SimulationWorker(challenge=get_challenge("park"), rendering="tiny", pace=True)
+    controller = controller_for(model)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "maps.sqlite3"))
+        controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
+            map_context=True, images_per_request=2, mission_budget_s=40., max_turns=3, max_model_requests=3))
+        await asyncio.wait_for(controller.task, 55.)
+        assert controller.state["error"] is None, controller.state["error"]
+        assert not worker.sim.proximity_sensors().collisions and worker.latest["stopped"]
+        if invented:
+            assert worker.home_mission.task is None
+            assert any("UNKNOWN_FRONTIER" in str(event["payload"]) for event in controller.trace()["events"])
+        else:
+            assert worker.home_mission.task["single_frontier"]
+            assert worker.home_mission.task["frontier_id"] == model.selected
+            assert math.hypot(*worker.sim.odometry[:2]) > .15
+            snapshots = [event["payload"]["observed_map_snapshot"] for event in controller.trace()["events"]
+                if event["kind"] == "feedback" and event["payload"]["observed_map_snapshot"]]
+            assert len(snapshots[-1]["trail_m"]) > len(model.inputs)
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+def test_mission_tools_only_expose_current_capabilities_and_observed_ids():
+    from types import SimpleNamespace
+    from backend.mission_supervisor import available_actions, instructions_for, tools
+    planning = tools(["plan"])[0]["parameters"]
+    assert set(planning["properties"]) == {"action", "reason", "plan"}
+    navigation = tools(["explore", "navigate_frontier", "look"], ["1:0", "2:3"])[0]["parameters"]
+    assert navigation["properties"]["action"]["enum"] == ["explore", "navigate_frontier", "look"]
+    assert navigation["properties"]["frontier_id"]["enum"] == ["1:0", "2:3"]
+    assert "object_bounds" not in navigation["properties"] and "$defs" not in navigation
+    mission = Mission("run", 1, 0, 0, deadline=60., clock=lambda: 0.)
+    mission.configure(MissionPlan(kind="room", target="Kitchen"))
+    assert "navigate_frontier" in available_actions(mission, SimpleNamespace(spatial={"frontiers": [{"frontier_id": "1:0"}]}), None)
+    operation = mission.begin("exploring", mission.authority)
+    running_actions = available_actions(mission, SimpleNamespace(spatial={"frontiers": [{"frontier_id": "1:0"}]}), None)
+    assert "navigate_frontier" not in running_actions
+    assert {"explore", "look", "report_observation"}.issubset(running_actions)
+    mission.end_operation(operation, mission.authority)
+    guidance = instructions_for({"mission": mission.state()})
+    assert "observe_room" in guidance and "object_bounds" not in guidance and "circle_direction" not in guidance
+    assert len(guidance) < 3800
+    assert "Stop" in guidance and "unknown" in guidance and "Never bypass" in guidance
+
+
 def test_mission_has_one_operation_original_deadline_and_required_receipts():
     authority = ("run", 1, 2, 3)
     mission = Mission(*authority, deadline=60., clock=lambda: 10.)
@@ -39,6 +195,27 @@ def test_mission_rejects_late_results(fault):
     with pytest.raises((ValueError, TimeoutError)):
         mission.end_operation(operation, changed, "exploration")
     assert not mission.receipts
+
+
+@pytest.mark.parametrize("direction", ["clockwise", "counterclockwise"])
+def test_circuit_mission_exposes_existing_capability_and_requires_measured_receipt(direction):
+    from types import SimpleNamespace
+    from backend.mission import MissionDecision
+    from backend.mission_supervisor import available_actions, tools
+    mission = Mission("run", 0, 0, 0, deadline=10., clock=lambda: 0.)
+    mission.configure(MissionPlan(kind="circuit", target="Table", circle_direction=direction))
+    assert "circle" in available_actions(mission, SimpleNamespace(spatial={}), None)
+    assert "circle" in tools()[0]["parameters"]["properties"]["action"]["enum"]
+    for bounds, label in [(None, "Table"), ([0., 0., 2., 1.], "Table"), ([.3, .1, .7, .6], "")]:
+        with pytest.raises(ValueError):
+            MissionDecision(action="circle", object_bounds=bounds, object_label=label, circle_direction=direction)
+    decision = MissionDecision(action="circle", object_bounds=[.3, .1, .7, .6], object_label="Table", circle_direction=direction)
+    assert decision.circle_direction == mission.plan.circle_direction
+    with pytest.raises(ValueError, match="not verified"):
+        mission.complete(mission.authority)
+    operation = mission.begin("navigating", mission.authority)
+    mission.end_operation(operation, mission.authority, "target")
+    mission.complete(mission.authority)
 
 
 def test_observed_map_crop_raster_and_unknown_preservation():
@@ -106,6 +283,8 @@ def test_mission_capability_endpoint_requires_new_contract_and_same_origin():
         capabilities = client.get("/api/mission/capabilities")
         assert capabilities.status_code == 200 and capabilities.json()["observed_map_version"] == 1
         assert capabilities.json()["backends"] == ["builtin"]
+        assert capabilities.json()["task_kinds"] == MissionPlan.model_json_schema()["properties"]["kind"]["enum"]
+        assert "circuit" in capabilities.json()["task_kinds"]
         state = client.get("/api/state").json()
         request = {"run_id":state["run_id"],"episode_epoch":state["episode_epoch"],"goal":"Explore"}
         assert client.post("/api/mission/start", json=request).status_code == 422
@@ -139,27 +318,160 @@ async def test_local_mission_prepares_fresh_observed_map_and_stops_without_model
         await worker.close()
 
 
-async def test_exploration_plan_continues_locally_without_repeated_luna_calls(tmp_path):
+def test_targeted_exploration_plan_is_rejected_before_it_can_disable_room_supervision():
+    from backend.mission import MissionDecision
+    with pytest.raises(ValueError, match="kind=room"):
+        MissionDecision(action="plan", plan=MissionPlan(kind="explore",
+            target="Kitchen identified by visible cooking appliances; enter fully and stop in its clear interior"))
+    assert MissionDecision(action="plan", plan=MissionPlan(kind="explore")).plan.target == ""
+    assert MissionDecision(action="plan", plan=MissionPlan(kind="room", target="Kitchen with cooking appliances")).plan.kind == "room"
+
+
+@pytest.mark.parametrize("bad_target", [False, True])
+async def test_exploration_plan_cannot_disable_requested_luna_supervision(tmp_path, bad_target):
     import asyncio
+    import json
     from backend.challenges import get_challenge
     from backend.home_mapping import MapStore
     from backend.home_mission import HomeMission
     from backend.worker import SimulationWorker
     from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
     worker = SimulationWorker(challenge=get_challenge("park"), rendering="tiny", pace=True)
-    model = ScriptedModel([model_response("guide_mission", '{"action":"plan","plan":{"kind":"explore","return_home":false}}')])
+    replies = ([model_response("guide_mission", '{"action":"plan","plan":{"kind":"explore","target":"Kitchen identified by cooking appliances"}}',
+        call_id="bad-kitchen-plan")] if bad_target else [])
+    replies.extend([
+        model_response("guide_mission", json.dumps({"action": "plan", "plan": {"kind": "room" if bad_target else "explore",
+            "target": "Kitchen" if bad_target else "", "return_home": False}}), call_id="plan"),
+        model_response("guide_mission", '{"action":"wait","duration_s":0.5}', call_id="supervised-wait")])
+    model = ScriptedModel(replies)
     controller = controller_for(model)
     try:
         await asyncio.wrap_future(worker.ready)
         worker.home_mission = HomeMission(worker, MapStore(tmp_path / "maps.sqlite3"))
         controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
-            map_context=False, mission_budget_s=25., max_turns=2, max_model_requests=1))
+            map_context=False, mission_budget_s=25., max_turns=len(replies), max_model_requests=len(replies)))
         await asyncio.wait_for(controller.task, 35.)
         assert controller.state["error"] is None
-        assert len(model.inputs) == controller.state["inference_budget"]["requests"] == 1
-        assert any(event["title"] == "Mission operation finished" for event in controller.trace()["events"]), {
-            "mission": controller.mission.state(), "task": worker.home_mission.task,
-            "events": [event for event in controller.trace()["events"] if event["kind"] == "policy"]}
+        assert len(model.inputs) == controller.state["inference_budget"]["requests"] == len(replies)
+        assert json.loads(model.inputs[-1][-1]["content"][0]["text"])["mission"]["plan"]["kind"] == ("room" if bad_target else "explore")
+        if bad_target:
+            correction = json.loads(model.inputs[1][-1]["content"][0]["text"])
+            assert correction["mission"]["plan"] is None and correction["available_actions"] == ["plan"]
+            assert "kind=room" in correction["last_execution"]["reason"]
+        assert worker.home_mission.task is None
+        assert worker.latest["stopped"] and not controller.active
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+@pytest.mark.parametrize("ending", ["complete", "stop", "wrong_kind", "wrong_direction", "timeout"])
+async def test_unified_table_circuit_drives_and_preserves_authority(tmp_path, monkeypatch, record_property, ending):
+    import asyncio
+    import json
+    import math
+    import time
+    from backend.challenges import get_challenge
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
+    plan = {"kind": "object" if ending == "wrong_kind" else "circuit", "target": "Table", "circle_direction": "clockwise"}
+    decision = {"action": "circle", "object_label": "Table", "object_bounds": [.32, 0., .68, .58],
+        "circle_direction": "counterclockwise" if ending == "wrong_direction" else "clockwise"}
+    model = ScriptedModel(["wait"] if ending == "timeout" else [
+        model_response("guide_mission", json.dumps({"action": "plan", "plan": plan}), call_id="circuit-plan"),
+        model_response("guide_mission", json.dumps(decision), call_id="circuit-drive")])
+    controller = controller_for(model, request_timeout_s=.03 if ending == "timeout" else 45)
+    worker = SimulationWorker(challenge=get_challenge("furniture_circuit"), rendering="enhanced", pace=True)
+    progress = []
+    original_trace = controller._trace
+
+    def trace(kind, title, payload, **kwargs):
+        original_trace(kind, title, payload, **kwargs)
+        if title == "Observed furniture circuit":
+            progress.append(payload)
+            if ending == "stop" and payload["swept_degrees"] > 20.:
+                worker.stop()
+
+    monkeypatch.setattr(controller, "_trace", trace)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "maps.sqlite3"))
+        started = time.monotonic()
+        controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
+            map_context=True, images_per_request=2,
+            mission_budget_s=180., max_turns=2, max_model_requests=2).model_copy(update={"goal": "Circle the table clockwise and stop"}))
+        deadline = controller.mission.deadline
+        await asyncio.wait_for(controller.task, 195.)
+        measured = await worker.call(lambda sim: {"pose": sim.odometry.tolist(), "travel_m": sim.path_length,
+            "contacts": len(sim.proximity_sensors().collisions), "challenge": sim.challenge_status(), "ticks": sim.ticks})
+        record_property("unified_circuit", json.dumps({"evidence": "scripted_image_box_real_enhanced_physics",
+            "ending": ending, "seconds": time.monotonic()-started, "requests": len(model.inputs),
+            "progress": progress[-1] if progress else None, "mission": controller.mission.state(), **measured}))
+        assert worker.latest["stopped"] and not controller.active and not worker.home_mission.active
+        assert controller.mission.deadline == deadline and measured["contacts"] == 0
+        if ending == "complete":
+            assert controller.state["error"] is None, controller.trace()
+            assert controller.mission.phase == "completed" and "target" in controller.mission.receipts
+            assert measured["challenge"]["status"] == "completed", measured
+            assert measured["travel_m"] > 6. and progress[-1]["complete"]
+        else:
+            assert "target" not in controller.mission.receipts
+            if ending == "stop":
+                assert progress[-1]["swept_degrees"] > 20. and measured["travel_m"] > .3
+            else:
+                assert not progress and math.hypot(*measured["pose"][:2]) < .01
+            if ending == "timeout":
+                assert "response timed out" in controller.state["error"] and "no objective was authorized" in controller.state["error"]
+                assert controller.state["inference_budget"]["usage_unknown"] and len(model.inputs) == 1
+        await asyncio.sleep(.2)
+        assert await worker.call(lambda sim: sim.ticks) == measured["ticks"]
+    finally:
+        model.release.set()
+        await controller.halt()
+        await worker.close()
+
+
+@pytest.mark.parametrize("supervised", [False, True])
+async def test_table_scene_drives_from_simple_local_to_supervised_exploration(tmp_path, record_property, supervised):
+    import asyncio
+    import json
+    import math
+    import time
+    from backend.challenges import get_challenge
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
+    model = ScriptedModel([
+        model_response("guide_mission", '{"action":"plan","plan":{"kind":"explore"}}', call_id="startup-plan"),
+        model_response("guide_mission", '{"action":"explore"}', call_id="startup-explore")])
+    controller = controller_for(model)
+    worker = SimulationWorker(challenge=get_challenge("furniture_circuit"), rendering="enhanced", pace=True)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "maps.sqlite3"))
+        started = time.monotonic()
+        controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
+            mission_local_only=not supervised, map_context=True, images_per_request=2,
+            mission_budget_s=60., max_turns=3, max_model_requests=2))
+        async with asyncio.timeout(65.):
+            while math.hypot(*worker.sim.odometry[:2]) < .3:
+                assert not controller.task.done(), {"state": controller.state, "task": worker.home_mission.task}
+                await asyncio.sleep(.05)
+        measured = await worker.call(lambda sim: {"pose": sim.odometry.tolist(),
+            "contacts": len(sim.proximity_sensors().collisions), "ticks": sim.ticks})
+        record_property("startup_drive", json.dumps({"evidence": "scripted_enhanced_physics",
+            "supervised": supervised, "time_to_30cm_s": time.monotonic()-started,
+            "model_requests": len(model.inputs), **measured}))
+        worker.stop()
+        await controller.halt()
+        frozen = await worker.call(lambda sim: (sim.odometry.copy(), sim.ticks))
+        await asyncio.sleep(.2)
+        after = await worker.call(lambda sim: (sim.odometry.copy(), sim.ticks))
+        assert math.dist(frozen[0], after[0]) == 0. and frozen[1] == after[1]
+        assert measured["contacts"] == 0 and len(model.inputs) == 2 * int(supervised)
         assert worker.latest["stopped"] and not controller.active
     finally:
         await controller.halt()
@@ -207,7 +519,7 @@ async def test_room_search_delegates_frontiers_to_local_worker(tmp_path, monkeyp
             await controller.halt()
         else:
             await asyncio.wait_for(controller.task, 70.)
-        assert "frontier_id" not in tools()[0]["parameters"]["properties"]
+        assert "frontier_id" not in tools(["explore"])[0]["parameters"]["properties"]
         surveys = [event for event in controller.trace()["events"] if event["title"] == "Local exploration survey finished"]
         assert len(surveys) <= 1 and len(requests) == 1 + len(surveys)
         assert all(request.action == "explore" and request.frontier_id is None for request in requests)
@@ -361,13 +673,13 @@ async def test_mission_recovers_starting_room_report_then_executes_next_action(t
     from backend.worker import SimulationWorker
     from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
     evidence = "Starting room appears to be a kitchen: visible oven, cabinets and worktop."
-    plan = {"kind": "room", "target": "Bathroom with toilet and sink", "return_home": False}
+    plan = {"kind": "room", "target": "Bathroom with toilet and sink", "return_home": False, "circle_direction": "clockwise"}
     replies = [{"action": "plan", "plan": plan},
         {"action": "observe_room", "room_matches": False, "evidence_text": evidence}]
     if repeat_plan:
         replies.extend([{"action": "observe_room", "place_id": None, "room_matches": False, "evidence_text": evidence},
             {"action": "plan", "plan": plan}])
-    replies.extend([{"action": "report_observation", "evidence_text": evidence},
+    replies.extend([{"action": "report_observation", "evidence_text": evidence, "room_label": "Kitchen", "room_confidence": .7},
         {"action": "look", "yaw_rad": .2, "pitch_rad": .2}])
     worker = SimulationWorker(challenge=get_challenge("kitchen_bathroom"), rendering="tiny", pace=False)
     model = ScriptedModel([model_response("guide_mission", json.dumps(reply), call_id=f"report-{index}")
@@ -391,6 +703,16 @@ async def test_mission_recovers_starting_room_report_then_executes_next_action(t
             assert payloads[-2]["mission"]["home_id"] == payloads[1]["mission"]["home_id"]
         reported = payloads[-1]["last_execution"]
         assert reported["status"] == "observation_reported" and reported["evidence_text"] == evidence
+        record = reported["room_observation"]
+        assert record["label"] == "Kitchen" and record["confidence"] == .7
+        assert record["review_status"] == "tentative" and not record["identity_verified"]
+        from backend.feedback import compact_numbers
+        stored_record = worker.home_mission.store.room_observations(record["map_id"])[0]
+        assert compact_numbers(stored_record) == record
+        full_report = next(event["payload"]["result"] for event in controller.trace()["events"]
+            if event["title"] == "Mission capability feedback" and event["payload"]["result"].get("status") == "observation_reported")
+        assert full_report["room_observation"] == stored_record
+        assert worker.home_mission.store.room_image(record["map_id"], record["observation_id"]).startswith(b"\x89PNG")
         assert not reported["arrival_verified"] and not reported["identity_verified"]
         assert reported["observation_seq"] == payloads[-2]["observation"]["seq"]
         assert controller.state["error"] is None and controller.mission.rejections == 0

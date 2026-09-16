@@ -9,6 +9,9 @@ param(
     [switch]$BackendOnly,
     [Parameter(ParameterSetName = 'Lab')]
     [switch]$Nav2,
+    [Parameter(ParameterSetName = 'Lab')]
+    [ValidateRange(0, 86400)]
+    [int]$IdleTimeoutSeconds = 300,
     [Parameter(Mandatory = $true, ParameterSetName = 'Navigation')]
     [switch]$NavigationTest,
     [Parameter(ParameterSetName = 'Navigation')]
@@ -96,7 +99,21 @@ try {
     if (-not $PSCmdlet.ShouldProcess($url, 'Build as needed and start the browser UI/API; no automatic model inference')) { return }
     $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
     if ($listeners | Where-Object { $_.Port -eq $Port }) {
-        throw "Port $Port is already in use. Use the existing app if it is Milo, or choose another -Port. Port 8001 is reserved for automated tests."
+        $existing = $null
+        try {
+            $listener = Get-NetTCPConnection -State Listen -LocalPort $Port
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)"
+            if ($process.ExecutablePath -eq (Resolve-Path -LiteralPath $physicsPython).Path) {
+                $existing = Invoke-RestMethod "$url/api/state" -TimeoutSec 5
+            }
+        }
+        catch { $existing = $null }
+        if ($existing.run_id -and $existing.agent -and $existing.snapshot) {
+            Write-Host "Robot Lab is already running: $url"
+            Write-Host 'Using the existing server; no duplicate was started. Restart that server to load backend changes or new launch options.'
+            return
+        }
+        throw "Port $Port is occupied by another service. Stop that service or explicitly choose a different -Port. Port 8001 is reserved for automated tests."
     }
     if (-not $SkipBuild -and -not $BackendOnly) {
         if (-not (Test-Path -LiteralPath 'frontend/node_modules' -PathType Container)) {
@@ -129,7 +146,11 @@ try {
     Write-Host 'SmolVLA stays loaded between browser runs. Use Unload local model to release GPU memory.'
     Write-Host 'Optional isolated evaluation: ./start.ps1 -NavigationTest.'
     Write-Host 'No arm-policy server is required. Luna deployment access is required for supervision.'
-    & $physicsPython -m uvicorn backend.app:app --host 127.0.0.1 --port $Port
+    if ($IdleTimeoutSeconds) {
+        Write-Host "Automatic shutdown after $IdleTimeoutSeconds seconds with no clients, requests, or active work."
+    }
+    else { Write-Host 'Automatic unused-server shutdown explicitly disabled.' }
+    & $physicsPython -m backend.server --host 127.0.0.1 --port $Port --idle-timeout $IdleTimeoutSeconds
     if ($LASTEXITCODE -ne 0) { throw "Robot Lab server exited with code $LASTEXITCODE." }
 }
 finally {

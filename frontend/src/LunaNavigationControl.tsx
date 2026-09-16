@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Bot, Check, Play, Power, Settings2, Timer, Send, MessageSquare, History, Radio } from 'lucide-react';
+import { Bot, Check, ChevronRight, Play, Power, Route, Settings2, Timer, Send, MessageSquare, History, Radio } from 'lucide-react';
 import { ExchangeFeed } from './ExchangeFeed';
+import { MotionDiagnostics } from './MotionDiagnostics';
 import { LocalModelProgress } from './LocalModelProgress';
 import { usePreference } from './Preferences';
-import type { LiveState, Reasoning } from './types';
+import type { LiveState, Reasoning, SpatialTelemetry } from './types';
 
 function normalizedEndpoint(value: string) {
   try {
@@ -29,8 +30,9 @@ function TokenCounter({ agent, connected }: { agent: LiveState['agent']; connect
   </div>;
 }
 
-export function LunaNavigationControl({ state, connected, request, commandHost }: {
+export function LunaNavigationControl({ state, connected, request, commandHost, spatialTelemetry }: {
   state: LiveState; connected: boolean; request: (path: string, body?: unknown) => Promise<unknown>; commandHost: HTMLElement | null;
+  spatialTelemetry?:SpatialTelemetry | null;
 }) {
   const agent = state.agent;
   const kitchenSearch = state.challenge?.id === 'flat_kitchen';
@@ -77,6 +79,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost }
   const [inspector, setInspector] = usePreference('inspector', 'trace');
   const [connectionOpen, setConnectionOpen] = usePreference('connection_open', !luna?.configured);
   const [runSettingsOpen, setRunSettingsOpen] = usePreference('run_settings_open', false);
+  const [instructionsOpen, setInstructionsOpen] = useState(true);
   const [compactArms] = usePreference('compact_arms', true);
   const hasRun = !!agent.session_id || agent.active;
   const [preferredMode, setNavigationMode] = usePreference('navigation_mode', 'luna_continuous');
@@ -121,6 +124,18 @@ export function LunaNavigationControl({ state, connected, request, commandHost }
   }
   const residentLabels = { unloaded: continuous ? 'Model not loaded / SmolVLA inactive' : 'Model not loaded / loads on first Start', loading: 'Loading model into GPU memory',
     ready: 'Model ready / kept in GPU memory', inferencing: 'Model loaded / processing a request', error: 'Model worker unavailable / reloads on Start' };
+  const policyLabels = { single_step:'Single-step tools', navigation_plan:'Buffered navigation plan', supervised_policy:'Supervised SmolVLA',
+    local_navigation:'Local SmolVLA navigation', luna_navigation:'Luna + SmolVLA primitives', luna_continuous:'Continuous local control' };
+  const localMotionActive = state.continuous_navigation?.status === 'running' || state.navigation?.status === 'running'
+    || state.skill?.status === 'running' || state.skill?.status === 'awaiting_policy';
+  const policyActive = agent.active || localMotionActive;
+  const policyName = !agent.active && localMotionActive ? state.skill?.skill ? `Local skill: ${state.skill.skill}` : 'Local navigation'
+    : agent.unified_mission ? 'Unified mission' : policyLabels[agent.execution_mode];
+  const policyStatus = !connected ? 'Last received / disconnected' : policyActive ? policyName : 'No active policy';
+  function selectInspector(next: typeof inspector) {
+    setInspector(next);
+    if (next === 'settings') setRunSettingsOpen(true);
+  }
   return <section className="agent-section" aria-label="LLM control">
     <div className="panel-header"><h3><Bot size={17} /> {unified ? 'Mission' : 'Luna'}</h3></div>
     {unified && !capabilities.ready && <p role="alert">Mission controller unavailable on this server. Restart with the current backend.</p>}
@@ -159,9 +174,13 @@ export function LunaNavigationControl({ state, connected, request, commandHost }
         model_id: 'luna', reasoning, goal, max_turns: turns, feedback_interval_s: interval,
         max_model_requests:maxRequests, max_model_tokens:maxTokens });
     }}>
+      <details className="mission-instructions compact-disclosure" open={instructionsOpen} onToggle={event => setInstructionsOpen(event.currentTarget.open)}>
+      <summary><ChevronRight className="disclosure-chevron" size={15} /><MessageSquare size={15} /><strong>Instructions</strong>
+        {!instructionsOpen && <span className="disclosure-preview">{goal}</span>}</summary>
       <div className="agent-goal-row"><label>Robot goal<textarea aria-label="Robot goal" value={goal} required maxLength={2000} rows={4}
         disabled={agent.active || pending} onChange={event => setGoal(event.target.value)} /></label>
       </div>
+      </details>
       {commandHost && createPortal(<button type="submit" form="mission-form" className="primary" aria-label={unified ? 'Start mission' : 'Start LLM control'} title={unified ? 'Start mission' : 'Start LLM control'} disabled={agent.active || !connected || pending || state.power?.on === false || state.busy || (!localOnly && (!luna?.configured || connectionChanged || !goal.trim()))
           || !Number.isInteger(maxRequests) || maxRequests < 1 || maxRequests > 200 || !Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 2000000
           || (unified && (!capabilities.ready || explorationBudget < 5 || explorationBudget > 300))
@@ -170,6 +189,32 @@ export function LunaNavigationControl({ state, connected, request, commandHost }
           <Play size={16} /> Start</button>, commandHost)}
     </form>
     {error && <div className="error" role="alert">{error}</div>}
+    <MotionDiagnostics navigation={state.navigation} connected={connected} state={state} spatial={spatialTelemetry} />
+    <details className="active-policy compact-disclosure" aria-label="Active policy">
+      <summary><ChevronRight className="disclosure-chevron" size={15} /><Route size={15} /><strong>Active policy</strong><span className="disclosure-preview">{policyStatus}</span></summary>
+      {hasRun || localMotionActive ? <>
+        <dl className="policy-facts">
+          <div><dt>{policyActive && connected ? 'Controller' : 'Last reported controller'}</dt><dd>{policyName}</dd></div>
+          {hasRun && <>
+          <div><dt>{agent.active ? 'Execution mode' : 'Last run mode'}</dt><dd>{agent.execution_mode}</dd></div>
+          <div><dt>{agent.active ? 'Navigation backend' : 'Last run backend'}</dt><dd>{agent.navigation_backend === 'nav2' ? 'Nav2' : agent.navigation_backend === 'builtin' ? 'Built-in' : 'Not reported'}</dd></div>
+          <div><dt>{agent.active ? 'Phase' : 'Last run phase'}</dt><dd>{agent.mission?.phase ?? agent.phase}</dd></div>
+          <div><dt>{agent.active ? 'Model profile' : 'Last run model profile'}</dt><dd>{agent.model_id || 'Not reported'} / {agent.reasoning}</dd></div>
+          </>}
+          {agent.mission?.plan && <div><dt>{agent.active ? 'Mission' : 'Last mission'}</dt><dd>{agent.mission.plan.kind} / {agent.mission.plan.target || 'No named target'}</dd></div>}
+          {agent.mission?.objective && <div><dt>{agent.active ? 'Objective' : 'Last objective'}</dt><dd>{agent.mission.objective.action} / {agent.mission.objective.status}
+            <br />{agent.mission.objective.remaining_s.toFixed(1)} s / {agent.mission.objective.remaining_travel_m.toFixed(2)} m remaining</dd></div>}
+          {state.continuous_navigation && <div><dt>Local motion</dt><dd>{state.continuous_navigation.status} / {state.continuous_navigation.reason}</dd></div>}
+          {state.skill?.skill && <div><dt>Skill</dt><dd>{state.skill.skill} / {state.skill.status}</dd></div>}
+          {state.skill?.checkpoint && <div><dt>Skill checkpoint</dt><dd>{state.skill.checkpoint}</dd></div>}
+        </dl>
+        {agent.mission?.reason && <p className="exchange-text">{agent.mission.reason}</p>}
+        <details className="exchange-payload"><summary>Reported policy state</summary><pre>{JSON.stringify({
+          session_id:agent.session_id, active:agent.active, execution_mode:agent.execution_mode, navigation_backend:agent.navigation_backend,
+          mission:agent.mission, navigation:state.navigation, continuous_navigation:state.continuous_navigation, skill:state.skill,
+        }, null, 2)}</pre></details>
+      </> : <p className="empty">No policy has run in this episode.</p>}
+    </details>
     {hasRun && <TokenCounter agent={agent} connected={connected} />}
     {agent.inference_budget && <div className="agent-metrics" aria-label="Luna task budget">
       <span>Luna requests <strong>{agent.inference_budget.requests} / {agent.inference_budget.max_requests}</strong></span>
@@ -184,12 +229,12 @@ export function LunaNavigationControl({ state, connected, request, commandHost }
       const index = keys.indexOf(inspector);
       const next = event.key === 'ArrowRight' ? (index + 1) % keys.length : event.key === 'ArrowLeft' ? (index + keys.length - 1) % keys.length : event.key === 'Home' ? 0 : event.key === 'End' ? keys.length - 1 : -1;
       if (next < 0) return;
-      event.preventDefault(); setInspector(keys[next]);
+      event.preventDefault(); selectInspector(keys[next]);
       event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next].focus();
     }}>
       {([{id:'conversation',label:'Conversation',icon:MessageSquare},{id:'trace',label:'Trace',icon:Radio},{id:'settings',label:'Settings',icon:Settings2}] as const).map(({id,label,icon:Icon}) =>
         <button type="button" key={id} role="tab" id={`inspector-${id}`} aria-controls={`panel-${id}`} aria-selected={inspector === id}
-          tabIndex={inspector === id ? 0 : -1} onClick={() => setInspector(id)}><Icon size={15} />{label}</button>)}
+          tabIndex={inspector === id ? 0 : -1} onClick={() => selectInspector(id)}><Icon size={15} />{label}</button>)}
     </div>}
     <div id="panel-conversation" role="tabpanel" aria-labelledby="inspector-conversation" hidden={!hasRun || inspector !== 'conversation'}>
     <section className="chat-section" aria-label="Run chat">
@@ -200,12 +245,6 @@ export function LunaNavigationControl({ state, connected, request, commandHost }
           <strong>{message.role === 'user' ? 'You' : message.source === 'model' ? 'Luna' : 'Controller'} / {message.status}</strong>
           <p>{message.text}</p></article>)}
       </div>
-      <form className="chat-composer" hidden={!agent.active} onSubmit={event => {event.preventDefault();void sendInstruction();}}>
-        <label>New instruction<textarea aria-label="New run instruction" value={instruction} rows={2} maxLength={2000}
-          disabled={!connected || sending || !agent.active} onChange={event=>setInstruction(event.target.value)} /></label>
-        <button type="submit" disabled={!connected || sending || !agent.active || !instruction.trim()}><Send size={16} />Send instruction</button>
-      </form>
-      {instructionError && <p className="error" role="alert">{instructionError}</p>}
     </section>
     </div>
     <div id="panel-trace" role="tabpanel" aria-labelledby="inspector-trace" hidden={!hasRun || inspector !== 'trace'}>
@@ -223,9 +262,9 @@ export function LunaNavigationControl({ state, connected, request, commandHost }
     </details>
     </div>
     {connectionChanged && <p role="status">Connection changes not applied</p>}
-    <details className="run-options" open={hasRun || runSettingsOpen} onToggle={event => {if (!hasRun) setRunSettingsOpen(event.currentTarget.open);}}
+    <details className="run-options compact-disclosure" open={runSettingsOpen} onToggle={event => setRunSettingsOpen(event.currentTarget.open)}
       hidden={(hasRun && inspector !== 'settings')}>
-    <summary hidden={hasRun}><Settings2 size={15} />Run settings</summary>
+    <summary><ChevronRight className="disclosure-chevron" size={15} /><Settings2 size={15} /><strong>Run settings</strong></summary>
     <div id="panel-settings" role={hasRun ? 'tabpanel' : undefined} aria-labelledby={hasRun ? 'inspector-settings' : undefined}>
       {!agent.active && (unified ? capabilities.architecture : variant) && <dl className="test-variant-preview" aria-label="Current architecture version"><div><dt>Architecture</dt><dd>{(unified ? capabilities.architecture : variant)?.name}</dd></div><div><dt>Version</dt><dd>{(unified ? capabilities.architecture : variant)?.version}+{(unified ? capabilities.architecture : variant)?.revision}</dd></div></dl>}
       <div className="agent-settings">
@@ -283,5 +322,11 @@ export function LunaNavigationControl({ state, connected, request, commandHost }
     </div>}
     </div>
     </details>
+    <form className="chat-composer" hidden={!agent.active} onSubmit={event => {event.preventDefault();void sendInstruction();}}>
+      <label>New instruction<textarea aria-label="New run instruction" value={instruction} rows={2} maxLength={2000}
+        disabled={!connected || sending || !agent.active} onChange={event=>setInstruction(event.target.value)} /></label>
+      <button type="submit" disabled={!connected || sending || !agent.active || !instruction.trim()}><Send size={16} />Send instruction</button>
+    </form>
+    {instructionError && <p className="error" role="alert">{instructionError}</p>}
   </section>;
 }

@@ -141,6 +141,7 @@ class DistanceReading(StrictModel):
     bearing_rad: float
     distance_m: float | None = Field(default=None, ge=0, le=2)
     status: Literal["hit", "clear", "occluded"]
+    origin_base_m: list[float] | None = Field(default=None, min_length=3, max_length=3)
 
 
 class CollisionReading(StrictModel):
@@ -153,6 +154,7 @@ class ProximitySensors(StrictModel):
     max_range_m: float = 2
     distances: list[DistanceReading]
     collisions: list[CollisionReading]
+    coverage: str = "Eight individual rays, not sectors; clear means no detected hit within 2 m of each ray origin, not a free body corridor."
 
 
 class NavigationStepState(StrictModel):
@@ -160,6 +162,26 @@ class NavigationStepState(StrictModel):
     goal: str
     status: Literal["pending", "running", "completed", "failed", "cancelled"]
     evidence: str
+
+
+class NavigationDiagnostics(StrictModel):
+    clock: Literal["monotonic", "simulation", "test"] = "monotonic"
+    authorization_id: str | None = None
+    scope: str = "short_motion_buffer"
+    issuer: str = "navigation_runtime"
+    renewal_owner: str = "controller"
+    task_id: str | None = None
+    objective_id: str | None = None
+    issued_at_s: float | None = None
+    renewed_at_s: float | None = None
+    expires_at_s: float | None = None
+    last_renewal: dict | None = None
+    last_controller_tick_at_s: float | None = None
+    maximum_recent_tick_gap_s: float = 0.
+    tick_window_s: float = 5.
+    sensor_at_last_command: dict | None = None
+    stop: dict | None = None
+    recent_events: list[dict] = Field(default_factory=list, max_length=16)
 
 
 class NavigationFeedback(StrictModel):
@@ -176,6 +198,7 @@ class NavigationFeedback(StrictModel):
     velocity_mps_radps: list[float]
     travel_m: float
     scan_span_rad: float
+    diagnostics: NavigationDiagnostics | None = None
 
 
 class SkillFeedback(StrictModel):
@@ -202,7 +225,12 @@ class ObservedMapContext(StrictModel):
     source_sequence: int
     captured_at: float
     age_s: float
+    capture_clock: Literal["monotonic"] = "monotonic"
+    age_basis: str = "Age of the paired current camera/depth capture; not age of all accumulated geometry."
+    snapshot_built_at_monotonic_s: float | None = None
     geometry_updated_unix_s: float | None = None
+    geometry_age_s: float | None = None
+    geometry_age_basis: str = "Time since last map integration, not oldest cell observation; per-cell ages are unavailable."
     geometry_source: Literal["rolling_sensor", "accumulated_sensor_map"] = "rolling_sensor"
     frame: Literal["map", "wheel_odometry"]
     localization: str
@@ -216,6 +244,9 @@ class ObservedMapContext(StrictModel):
     camera_yaw_rad: float
     destinations: list[dict] = Field(default_factory=list, max_length=24)
     trail_m: list[list[float]] = Field(default_factory=list, max_length=128)
+    trail_source: Literal["review_samples", "worker_odometry"] = "review_samples"
+    trail_truncated: bool = False
+    trail_spacing_m: float | None = Field(default=None, gt=0)
     route_m: list[list[float]] = Field(default_factory=list, max_length=128)
     note: str = "Observed geometry only; unknown is not traversable. Labels are hypotheses. Revalidate all motion."
 

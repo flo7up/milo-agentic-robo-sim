@@ -304,13 +304,25 @@ async def test_actual_model_payload_excludes_evaluator_annotations(tmp_path):
         supplied = payload["input"][-1]
         data = json.loads(supplied["content"][0]["text"])
         assert data["observation"] == feedback["payload"]["observation"]
+        assert data["contract"] == "semantic-mission-v1"
+        assert payload["instructions"] == feedback["payload"]["effective_instructions"]
+        assert payload["tools"] == feedback["payload"]["effective_tools"]
+        assert payload["tools"][0]["parameters"]["properties"]["action"]["enum"] == ["plan"]
+        assert data["sensing"]["paired_camera_depth"] and not data["sensing"]["motion_authorized"]
+        assert "joints" not in data["observation"] and "grippers" not in data["observation"]
+        assert len(supplied["content"][0]["text"]) < 8000
+        import base64
+        images = [part for part in supplied["content"] if part["type"] == "input_image"]
+        assert images and images[0]["image_url"].startswith("data:image/png;base64,")
+        assert base64.b64decode(images[0]["image_url"].split(",", 1)[1]) == controller.trace_images[feedback["id"]]
         assert "User goal: " + GOAL in payload["instructions"]
         user_text = json.dumps(payload["input"])
         for forbidden in ("camera_eye", "pixel_matches", "annotation_available", "evaluation_protocol", "bathroom_basin",
                           "toilet_bowl", "tub_interior", "Base and wheels stopped inside the bathroom"):
             assert forbidden not in user_text
         public_observation = copy.deepcopy(data["observation"])
-        assert public_observation["spatial"].pop("environment_id") == "standalone:kitchen_bathroom"
+        assert "environment_id" not in public_observation["spatial"]
+        assert "standalone:kitchen_bathroom" not in user_text
         assert "bathroom" not in json.dumps(public_observation).lower()
         assert worker.home_mission.home is not None
         assert "bathroom" not in json.dumps(worker.home_mission.home.places).lower()

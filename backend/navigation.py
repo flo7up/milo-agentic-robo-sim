@@ -9,10 +9,16 @@ from pydantic import Field, model_validator
 
 from backend.contracts import StrictModel
 from backend.simulation import MotionError, TIMESTEP
+from backend.worker_timing import timed
 
 
 CONTINUOUS_SPEED_MPS = .5
 LINEAR_ACCELERATION_MPS2 = .3
+
+
+def distance_stop_threshold(linear_mps):
+    stopping_distance = linear_mps * linear_mps / (2 * LINEAR_ACCELERATION_MPS2) + abs(linear_mps) * .05
+    return max(.18, stopping_distance + .08)
 
 
 class Skill(StrictModel):
@@ -84,7 +90,12 @@ NAVIGATION_DESCRIPTIONS = {
 
 
 class NavigationRuntime:
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, clock_type=None):
+        from backend.contracts import NavigationDiagnostics
+        self.diagnostics = NavigationDiagnostics(clock=clock_type or ("monotonic" if clock is time.monotonic else "test"))
+        self.renewal_events = deque(maxlen=16)
+        self.tick_gaps = deque(maxlen=128)
+        self.command_sensor = None
         self.clock = clock
         self.revision = 0
         self.steps = []
@@ -116,7 +127,34 @@ class NavigationRuntime:
             "effective_skill_budget_s": round(max(0, self.skill_deadline - self.skill_started_at), 3),
             "deadline_recovery_enabled": self.recover_deadline,
             "velocity_mps_radps": self.velocity.tolist(), "travel_m": round(self.travel, 3),
-            "scan_span_rad": round(self.scan_max - self.scan_min, 3)}
+            "scan_span_rad": round(self.scan_max - self.scan_min, 3),
+            "diagnostics": self.diagnostic_state()}
+
+    def diagnostic_state(self):
+        if self.clock is not time.monotonic and self.diagnostics.clock == "monotonic":
+            self.diagnostics.clock = "test"
+        now = self.diagnostics.stop["at_s"] if self.diagnostics.stop else self.clock()
+        self.diagnostics.maximum_recent_tick_gap_s = max((gap for at, gap in self.tick_gaps if now-at <= 5.), default=0.)
+        return {**self.diagnostics.model_dump(), "recent_events": [dict(event) for event in self.renewal_events]}
+
+    def record_renewal(self, result, reason=None):
+        record = {"at_s": self.clock(), "result": result, "rejection_reason": reason,
+            "revision": self.revision, "expires_at_s": self.expires_at or self.diagnostics.expires_at_s}
+        self.diagnostics.last_renewal = record
+        self.renewal_events.append({"event": "renewal", **record})
+
+    @staticmethod
+    def stop_initiator(reason):
+        if reason.startswith(("CLEARANCE_STOP", "CONTACT_STOP")):
+            return "collision_monitor"
+        if reason.startswith(("BUFFER_", "FEEDBACK_EXPIRED", "SPATIAL_STALE", "MOTION_LEASE_EXPIRED", "SKILL_TIMEOUT", "OBJECTIVE_TIME_EXPIRED", "OBJECTIVE_DISTANCE_LIMIT",
+            "Objective duration or travel authorization expired")) or "buffer expired" in reason.lower():
+            return "watchdog"
+        if reason.startswith(("Luna requested", "Supervisor", "Mission supervision")):
+            return "supervisor"
+        if "Stop" in reason or "operator" in reason.lower() or reason.startswith("CANCELLED"):
+            return "external_stop"
+        return "controller"
 
     def observe(self, sim, observation):
         self.tickets[observation.seq] = (self.revision, self.clock(), sim.odometry.copy(), bool(self.buffer))
@@ -136,7 +174,15 @@ class NavigationRuntime:
         if np.linalg.norm(delta[:2]) > .25 or abs(delta[2]) > .35:
             raise MotionError("STALE_OBSERVATION", "Robot moved too far since the planning observation.")
 
+    @timed("navigation.brake")
     def brake(self, sim, status, reason):
+        record_stop = False
+        if self.diagnostics.authorization_id and (self.buffer or self.diagnostics.stop is None):
+            record_stop = True
+            self.diagnostics.stop = {"at_s": self.clock(), "initiator": self.stop_initiator(reason), "reason": reason}
+            self.renewal_events.append({"event": "stopped", **self.diagnostics.stop})
+            if self.expires_at:
+                self.diagnostics.expires_at_s = self.expires_at
         self.buffer.clear()
         self.velocity[:] = 0
         self.expires_at = 0
@@ -144,6 +190,9 @@ class NavigationRuntime:
         self.tickets.clear()
         self.status, self.reason = status, reason
         sim.hold_current()
+        timing = getattr(sim, "worker_timing", None)
+        if record_stop and timing is not None:
+            timing.stop(self.diagnostic_state(), sim.run_id, sim.epoch, sim.ticks * TIMESTEP)
 
     def cancel(self, sim, reason="Navigation cancelled"):
         self.brake(sim, "cancelled", reason)
@@ -161,6 +210,15 @@ class NavigationRuntime:
         sim.stop()
 
     def begin_skill(self, sim):
+        from uuid import uuid4
+        self.diagnostics.authorization_id = str(uuid4())
+        self.diagnostics.issued_at_s = None
+        self.diagnostics.renewed_at_s = None
+        self.diagnostics.last_renewal = None
+        self.diagnostics.stop = None
+        self.renewal_events.clear()
+        self.tick_gaps.clear()
+        self.diagnostics.last_controller_tick_at_s = None
         self.start_odometry = sim.odometry.copy()
         self.authorized_travel_m = None
         head = bullet.getJointState(sim.robot, sim.joints["head_yaw"], physicsClientId=sim.client)[0]
@@ -171,7 +229,16 @@ class NavigationRuntime:
         self.steps[self.index]["status"] = "running"
         self.status, self.reason = "awaiting_feedback", "Review the camera and supply the next skill buffer."
 
+    @timed("navigation.apply")
     def apply(self, sim, name, arguments, sequence):
+        try:
+            return self._apply(sim, name, arguments, sequence)
+        except (ValueError, MotionError) as error:
+            if name == "replace_motion_buffer":
+                self.record_renewal("rejected", str(error))
+            raise
+
+    def _apply(self, sim, name, arguments, sequence):
         self.validate_ticket(sim, sequence, arguments.expected_revision)
         if name == "begin_local_subgoal":
             if self.buffer or sim.proximity_sensors().collisions:
@@ -221,19 +288,29 @@ class NavigationRuntime:
         self.status, self.reason = "running", "Executing a bounded skill buffer."
         self.expires_at = self.clock() + sum(segment.duration_s for segment in arguments.segments) + .5
         self.sensed_at = self.clock()
+        if self.diagnostics.issued_at_s is None:
+            self.diagnostics.issued_at_s = self.clock()
+        else:
+            self.diagnostics.renewed_at_s = self.clock()
+        self.diagnostics.expires_at_s = self.expires_at
+        self.diagnostics.stop = None
+        self.diagnostics.sensor_at_last_command = dict(self.command_sensor) if self.command_sensor else {
+            "kind": "navigation_ticket", "clock": self.diagnostics.clock, "sequence": sequence,
+            "age_s": None, "note": "Depth evidence not supplied by this controller"}
+        self.record_renewal("accepted")
 
     @staticmethod
     def bounds_overlap(robot_lower, robot_upper, obstacle_lower, obstacle_upper, margin):
         return all(robot_lower[axis] <= obstacle_upper[axis] + margin
             and robot_upper[axis] >= obstacle_lower[axis] - margin for axis in range(3))
 
+    @timed("safety.check_clearance")
     def check_clearance(self, sim, linear, angular):
         sensors = sim.proximity_sensors()
         if sensors.collisions:
             raise MotionError("CONTACT_STOP", "Contact detected during buffered motion.")
         directions = {"front", "front_left", "front_right"} if linear >= 0 else {"rear", "rear_left", "rear_right"}
-        stopping_distance = linear * linear / (2 * LINEAR_ACCELERATION_MPS2) + abs(linear) * .05
-        if any(reading.direction in directions and reading.status == "hit" and reading.distance_m < max(.18, stopping_distance + .08)
+        if any(reading.direction in directions and reading.status == "hit" and reading.distance_m < distance_stop_threshold(linear)
                for reading in sensors.distances) and abs(linear) > .001:
             raise MotionError("CLEARANCE_STOP", "Insufficient distance-sensor clearance.")
         sim._sync_planner()
@@ -302,7 +379,14 @@ class NavigationRuntime:
         else:
             self.fail(sim, "SKILL_TIMEOUT: " + details)
 
+    @timed("navigation.tick")
     def tick(self, sim):
+        if self.status in {"running", "awaiting_feedback"} and self.buffer:
+            now = self.clock()
+            previous = self.diagnostics.last_controller_tick_at_s
+            if previous is not None:
+                self.tick_gaps.append((now, max(0., now-previous)))
+            self.diagnostics.last_controller_tick_at_s = now
         if (self.status in {"running", "awaiting_feedback"} and self.index < len(self.steps) and
             self.steps[self.index]["status"] == "running" and self.clock() >= self.skill_deadline):
             self.expire_skill(sim)

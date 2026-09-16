@@ -109,6 +109,29 @@ class HomeMap:
         clearance = distance_transform_edt(np.pad(known, 1))[1:-1, 1:-1] * self.resolution_m
         return known & (clearance > radius_m + self.resolution_m)
 
+    def segment_allowed(self, start, goal, allowed):
+        endpoints = (np.asarray([start, goal], dtype=float) - self.origin) / self.resolution_m
+        if endpoints.shape != (2, 2) or not np.isfinite(endpoints).all():
+            return False
+        if not self.inside(np.floor(endpoints).astype(int)).all():
+            return False
+        delta = endpoints[1] - endpoints[0]
+        fractions = [np.array([0., 1.])]
+        for axis in (0, 1):
+            if abs(delta[axis]) > 1e-12:
+                lower, upper = sorted(endpoints[:, axis])
+                boundaries = np.arange(math.floor(lower) + 1, math.ceil(upper))
+                fractions.append((boundaries - endpoints[0, axis]) / delta[axis])
+        crossings = np.unique(np.concatenate(fractions))
+        samples = np.r_[crossings, (crossings[:-1] + crossings[1:]) / 2]
+        positions = endpoints[0] + samples[:, None] * delta
+        on_boundary = np.isclose(positions, np.rint(positions), atol=1e-9, rtol=0.)
+        upper = np.where(on_boundary, np.rint(positions), np.floor(positions)).astype(int)
+        lower = upper - on_boundary.astype(int)
+        indices = np.vstack((lower, upper, np.column_stack((lower[:, 0], upper[:, 1])),
+            np.column_stack((upper[:, 0], lower[:, 1]))))
+        return bool(self.inside(indices).all() and allowed[indices[:, 1], indices[:, 0]].all())
+
     def route(self, start, goal, radius_m, obstacles=()):
         allowed = self.allowed(radius_m, obstacles)
         indices = self.indices([start, goal])
@@ -282,7 +305,8 @@ class HomeMap:
             or abs(math.atan2(math.sin(item[2][2] - best[2][2]), math.cos(item[2][2] - best[2][2]))) > .4) for item in refined[1:])
         if best[0] > .16 or best[1] < .65 or ambiguous:
             raise ValueError("LOCALIZATION_UNRELIABLE: scan mismatch or ambiguous location; select a known place and rescan")
-        return best[2], {"mean_residual_m": best[0], "matched_fraction": best[1], "seeded": seed is not None}
+        return best[2], {"mean_residual_m": best[0], "matched_fraction": best[1], "seeded": seed is not None,
+            "method": "scan_pose_search", "pose_correction_estimated": True, "calibrated_confidence": False}
 
     def scan_quality(self, laser, pose):
         _, endpoints, hits = laser_points(laser, pose)
@@ -296,7 +320,8 @@ class HomeMap:
         residual = float(np.minimum(residuals, .6).mean())
         if fraction < .5 or residual > .25:
             raise ValueError("LOCALIZATION_LOST: live scan disagrees with mapped pose")
-        return {"mean_residual_m": residual, "matched_fraction": fraction, "method": "fixed_pose_scan_consistency"}
+        return {"mean_residual_m": residual, "matched_fraction": fraction, "method": "fixed_pose_scan_consistency",
+            "pose_correction_estimated": False, "calibrated_confidence": False}
 
     @classmethod
     def restore(cls, data):
@@ -382,11 +407,11 @@ class MapStore:
             raise ValueError("Object image not found")
         return row[0]
 
-    def remember_room(self, observation, image):
+    def remember_room(self, observation, image, *, allow_draft=False):
         if len(image) > 1024 * 1024 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
             raise ValueError("Room evidence requires a bounded PNG image")
         with self.connect() as connection:
-            if connection.execute("SELECT 1 FROM maps WHERE map_id=?", (observation["map_id"],)).fetchone() is None:
+            if not allow_draft and connection.execute("SELECT 1 FROM maps WHERE map_id=?", (observation["map_id"],)).fetchone() is None:
                 raise ValueError("SAVE_REQUIRED: room observations require a saved map")
             connection.execute("INSERT INTO room_observations VALUES (?, ?, ?, ?, ?, ?)",
                 (observation["observation_id"], observation["map_id"], observation["place_id"], observation["observed_unix_s"],

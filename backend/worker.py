@@ -2,6 +2,7 @@ import asyncio
 from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
+import math
 from queue import Empty, Queue
 import threading
 import time
@@ -14,6 +15,7 @@ from backend.contracts import AgentObservation, NavigationFeedback, SkillFeedbac
 from backend.navigation import NAVIGATION_TOOLS, NavigationRuntime
 from backend.policy import SKILL_TOOLS, SkillRuntime
 from backend.simulation import BulletSimulation, MotionError, TIMESTEP
+from backend.worker_timing import WorkerTiming, timed
 
 
 class PolicyPacer:
@@ -83,6 +85,8 @@ class SimulationWorker:
     camera_capacity = 16
 
     def __init__(self, epoch=0, scene=None, pace=True, challenge=None, rendering=None, render_resources=None):
+        self.worker_timing = WorkerTiming()
+        self.timing_last_renewal = None
         self.queue = Queue()
         self.ready = Future()
         self.latest = {}
@@ -107,6 +111,7 @@ class SimulationWorker:
         self.inference_owner = None
         self.idle_sensor_interval_s = 2.
         self.navigation = None
+        self.navigation_tick_at = 0.
         self.continuous = None
         self.object_goal = None
         self.proposed_goal_id = None
@@ -193,8 +198,12 @@ class SimulationWorker:
                 self.power_transition = False
         return self.power_state()
 
+    @timed("publication.physics")
     def _publish(self):
         self._record_map_pose()
+        trail = getattr(self, "mission_trail", None)
+        if trail is not None and self.home_mission and self.home_mission.mission_owner == self.mission_trail_owner:
+            trail.record(self.sim.odometry, time.monotonic())
         if self.home_mission:
             self.home_mission.sample()
         ros_active = self.ros_navigation and self.ros_navigation.active
@@ -219,8 +228,10 @@ class SimulationWorker:
         if self.pace and not self.renderer and not ros_active:
             remaining = self.wall_start + (self.sim.ticks - self.tick_start) / 240 - time.monotonic()
             if remaining > 0:
-                self.sim.cancel.wait(remaining)
+                with self.worker_timing.measure("pacing.wait"):
+                    self.sim.cancel.wait(remaining)
 
+    @timed("publication.camera")
     def _publish_camera(self, image=None, simulated_time_s=None):
         if not self.powered:
             return
@@ -238,6 +249,7 @@ class SimulationWorker:
             "simulated_time_s": self.sim.ticks / 240 if simulated_time_s is None else simulated_time_s,
             "url": f"/api/camera/{self.sim.run_id}/{reference}"}}
 
+    @timed("sensing.preview")
     def _preview_update(self):
         import pybullet as bullet
         from backend.camera import scene_snapshot
@@ -311,9 +323,30 @@ class SimulationWorker:
             self.navigation.fail(self.sim, reason)
             self._publish_navigation()
 
+    @timed("worker.navigation_tick")
+    def _tick_navigation(self):
+        self.navigation_tick_at = time.monotonic() + .05
+        try:
+            if self.continuous and self.continuous.active:
+                self._update_continuous()
+            self.navigation.tick(self.sim)
+            if self.continuous and self.continuous.active and self.navigation.status in {"failed", "cancelled"}:
+                self.continuous.status, self.continuous.reason = "blocked", self.navigation.reason
+        except Exception as error:
+            if isinstance(error, MotionError) and error.code == "CANCELLED" and self.sim.cancel.is_set():
+                self.navigation.cancel(self.sim, "CANCELLED: Navigation interrupted by Stop.")
+                if self.continuous and self.continuous.active:
+                    self.continuous.status, self.continuous.reason = "cancelled", self.navigation.reason
+            else:
+                self.navigation.fail(self.sim, "EXECUTION_FAILED: Navigation worker stopped.")
+                if self.continuous and self.continuous.active:
+                    self.continuous.status, self.continuous.reason = "blocked", f"Execution stopped: {type(error).__name__}"
+        self._publish_navigation()
+
     def _run(self):
         try:
             self.sim = BulletSimulation(epoch=self.epoch, scene=self.scene, challenge=self.challenge, rendering=self.rendering)
+            self.sim.worker_timing = self.worker_timing
             if self.sim.rendering == "enhanced":
                 from backend.camera import EnhancedResources, snapshot_renderer
                 if self.render_resources is None:
@@ -364,7 +397,8 @@ class SimulationWorker:
                         queue_timeout = max(0., self.ros_tick_at - time.monotonic()) if self.pace else .01
                     else:
                         queue_timeout = 0 if buffered else .01 if skill_active or rendering else .05 if active or (self.home_mission and self.home_mission.active) else .25 if self.powered and self.spatial_enabled else None
-                    work = self.queue.get(timeout=queue_timeout)
+                    with self.worker_timing.measure("queue.wait_for_work"):
+                        work = self.queue.get(timeout=queue_timeout)
                 except Empty:
                     if self.ros_navigation and self.ros_navigation.active:
                         continue
@@ -394,17 +428,7 @@ class SimulationWorker:
                         else:
                             self.policy_pacer.reset()
                         continue
-                    try:
-                        if self.continuous and self.continuous.active:
-                            self._update_continuous()
-                        self.navigation.tick(self.sim)
-                        if self.continuous and self.continuous.active and self.navigation.status in {"failed", "cancelled"}:
-                            self.continuous.status, self.continuous.reason = "blocked", self.navigation.reason
-                    except Exception as error:
-                        self.navigation.fail(self.sim, "EXECUTION_FAILED: Navigation worker stopped.")
-                        if self.continuous and self.continuous.active:
-                            self.continuous.status, self.continuous.reason = "blocked", f"Execution stopped: {type(error).__name__}"
-                    self._publish_navigation()
+                    self._tick_navigation()
                     continue
                 if work is None:
                     break
@@ -414,9 +438,21 @@ class SimulationWorker:
                 future, operation = work
                 if not future.set_running_or_notify_cancel():
                     continue
+                if (self.navigation and self.navigation.status in {"running", "awaiting_feedback"}
+                        and not (self.skill and self.skill.active) and not self.renderer
+                        and not (self.ros_navigation and self.ros_navigation.active)
+                        and time.monotonic() >= self.navigation_tick_at):
+                    self._tick_navigation()
                 self.wall_start, self.tick_start = time.monotonic(), self.sim.ticks
                 try:
-                    future.set_result(operation(self.sim))
+                    name = getattr(operation, "__qualname__", type(operation).__name__)[:160]
+                    queued = getattr(future, "milo_enqueued_at", None)
+                    if queued is not None:
+                        self.worker_timing.event("queue_wait", operation=name, queued_at_s=queued,
+                            duration_s=max(0., time.monotonic() - queued))
+                    with self.worker_timing.measure("operation." + name):
+                        result = operation(self.sim)
+                    future.set_result(result)
                 except Exception as error:
                     future.set_exception(error)
         except Exception as error:
@@ -447,6 +483,7 @@ class SimulationWorker:
             self.spatial_frames.clear()
             self.camera_history = None
 
+    @timed("sensing.receive_map")
     def _receive_spatial(self, wait=False):
         if self.spatial_pending is None or (not wait and not self.spatial_pending.done()):
             return
@@ -483,6 +520,7 @@ class SimulationWorker:
         except Exception as error:
             self.spatial_error = str(error)
 
+    @timed("sensing.receive_capture")
     def _receive_mapped_capture(self, wait=False):
         from backend.camera import process_spatial
         pending = self.spatial_capture_pending
@@ -518,6 +556,7 @@ class SimulationWorker:
         self.spatial_submitted_at = time.monotonic()
         self.spatial_pending = self.spatial_processor.submit(process_spatial, self.spatial_map, observation, image)
 
+    @timed("sensing.sample_spatial")
     def _sample_spatial(self, force=False):
         from backend.camera import process_spatial
         if not self.powered:
@@ -633,12 +672,14 @@ class SimulationWorker:
             return self._history().record_label(observation, sighting.label, sighting.evidence, time.monotonic() - age)
         return await self.call(operation)
 
-    def spatial_state(self):
+    def spatial_state(self, include_motion_zones=False):
+        from backend.motion_zones import observed_motion_zones
         current = next(reversed(self.spatial_frames.values()), None) if self.spatial_frames else None
         metadata = current[0].model_dump(exclude={"depth_m"}) if current else None
         if metadata:
             prefix = f"/api/spatial/{self.sim.run_id}/{metadata['sequence']}"
             metadata.update(rgb_url=prefix + "/rgb.png", depth_url=prefix + "/depth.png", data_url=prefix + "/depth.json")
+        footprint = self.sim.robot_footprint() if self.spatial_enabled or include_motion_zones else None
         return {"enabled": self.spatial_enabled, "paused": self.renderer is not None, "error": self.spatial_error,
             "power": self.power_state(),
             "processing_pending": self.spatial_pending is not None, "maximum_processing_age_s": self.spatial_processing_max_s,
@@ -646,7 +687,8 @@ class SimulationWorker:
             "frame": metadata, "map": self.spatial_map.public() if self.spatial_map else None,
             "history": self._history().public(),
             "continuous": self.continuous.state() if self.continuous else None,
-            "footprint": self.sim.robot_footprint() if self.spatial_enabled else None}
+            "footprint": footprint if self.spatial_enabled else None,
+            **({"motion_zones": observed_motion_zones(self, footprint) if footprint else None} if include_motion_zones else {})}
 
     def _continuous_guard(self, sim, request, stop_revision):
         if self.home_mission and self.home_mission.active:
@@ -737,6 +779,12 @@ class SimulationWorker:
         sim = self.sim
         self.navigation = NavigationRuntime()
         self.navigation.recover_clearance = recover_clearance
+        self.navigation.diagnostics.renewal_owner = "local_continuous_controller"
+        if home_owned:
+            task = self.home_mission.task or {}
+            self.navigation.diagnostics.task_id = task.get("task_id")
+            binding = getattr(self, "_mission_objective_binding", None)
+            self.navigation.diagnostics.objective_id = binding["identity"] if binding else None
         self.navigation.recover_deadline = recover_clearance
         self.continuous = ContinuousNavigation(path)
         self.continuous.home_owned = home_owned
@@ -853,6 +901,7 @@ class SimulationWorker:
         import copy
         from backend.home_mapping import HomeMap, inverse_pose
         from backend.home_mission import HomeMission, HomeRequest
+        from backend.mission import ObservedMotionTrail
         def operation(sim):
             if sim.cancel.is_set() or (stop_revision, task_revision) != (self.stop_revision, self.task_revision):
                 raise ValueError("Mission preparation lost authority")
@@ -876,6 +925,9 @@ class SimulationWorker:
             if home.allow_expansion:
                 home.home.saved = False
             home.mission_owner = mission_id
+            self.mission_trail_owner = mission_id
+            self.mission_trail = ObservedMotionTrail()
+            self.mission_trail.record(sim.odometry, time.monotonic())
             nearby = next((place for place in home.home.places if place["name"].lower() == "home"
                 and np.linalg.norm(np.asarray(place["pose_m_rad"][:2])-home.pose[:2]) <= .15), None)
             if nearby is None:
@@ -917,9 +969,10 @@ class SimulationWorker:
                     or abs(sensor.odometry_m_rad[2] - sim.odometry[2]) > .35):
                 raise ValueError("Mission camera frame expired or capture pose moved too far")
 
-    async def mission_objective(self, mission, identity, *, decision=None, renew=False, end_reason=None):
+    async def mission_objective(self, mission, identity, *, decision=None, renew=False, end_reason=None, selection=None):
         from backend.home_mission import HomeRequest
         expected = self._mission_read_authority(mission)
+        previous_renewal = mission.objective.last_renewal if mission.objective else None
         def operation(sim):
             home = self.home_mission
             binding = getattr(self, "_mission_objective_binding", None)
@@ -927,7 +980,7 @@ class SimulationWorker:
                 if binding and binding["mission"] is mission and binding["identity"] == identity:
                     if home is binding["home"] and home.mission_owner == mission.identity and home.task is binding["task"]:
                         home.fail(end_reason, "paused")
-                    mission.objective.revoke(end_reason)
+                    mission.objective.revoke(end_reason, "external_stop" if sim.cancel.is_set() else "supervisor")
                     if sim.on_tick is binding["guard"]:
                         sim.on_tick = binding["previous"]
                     self._mission_objective_binding = None
@@ -937,6 +990,13 @@ class SimulationWorker:
             if decision is not None and not renew:
                 if binding is not None or home.active:
                     raise ValueError("A mission objective is already active")
+                if selection is not None:
+                    selection.check(mission.identity, sim.run_id, sim.epoch, home.home.identity, sim.odometry, time.monotonic())
+                    home.sample(force=True)
+                    home.require_localized()
+                    home.home.route(home.pose[:2], selection.position_m, sim.robot_footprint()["radius_m"], home.obstacles())
+                    self._mission_read_guard(sim, expected)
+                    selection.check(mission.identity, sim.run_id, sim.epoch, home.home.identity, sim.odometry, time.monotonic())
                 mission.authorize_objective(identity, decision, expected[:4], sim.odometry)
                 remaining = mission.objective.expires_at - time.monotonic()
                 if remaining <= 0.:
@@ -944,9 +1004,14 @@ class SimulationWorker:
                     raise ValueError("Objective expired before starting")
                 previous_task = home.task
                 try:
-                    home.command(HomeRequest(run_id=sim.run_id, episode_epoch=sim.epoch, action="explore",
-                        time_budget=max(1., remaining)), *expected[2:4])
+                    home.command(HomeRequest(run_id=sim.run_id, episode_epoch=sim.epoch,
+                        action="explore_frontier" if selection else "explore", frontier_id=selection.frontier_id if selection else None,
+                        time_budget=max(1., remaining)), *expected[2:4], **({"selected_frontier": selection} if selection else {}))
                     self._mission_read_guard(sim, expected)
+                    if selection is not None:
+                        selection.check(mission.identity, sim.run_id, sim.epoch, home.home.identity, sim.odometry, time.monotonic())
+                        if math.dist(home.task["target_m"], selection.position_m) > .15:
+                            raise ValueError("FRONTIER_SELECTION_CHANGED: destination changed during preparation")
                     mission.check_objective(identity, expected[:4], sim.odometry)
                 except BaseException:
                     mission.objective.revoke("Objective start interrupted")
@@ -976,7 +1041,7 @@ class SimulationWorker:
                 try:
                     mission.check_objective(identity, expected[:4], sim.odometry)
                     if renew:
-                        self._sample_spatial(force=True)
+                        self._sample_spatial()
                         sensor = next(reversed(self.spatial_frames.values()))[0]
                         self._mission_read_guard(sim, expected, sensor)
                         home.require_localized()
@@ -993,24 +1058,98 @@ class SimulationWorker:
                 mission.objective.revoke(home.task["reason"])
                 if renew:
                     raise ValueError("Ended objective cannot renew or restart")
-            return home.state(compact=True)
-        return await self.call(operation)
+            return home.state(compact=True, lightweight=True)
+        try:
+            return await self.call(operation)
+        except (ValueError, TimeoutError) as error:
+            if (renew and mission.objective and mission.objective.operation_id == identity
+                    and mission.objective.last_renewal is previous_renewal):
+                mission.objective.record_renewal("rejected", str(error))
+            raise
 
     async def mission_feedback(self, mission=None):
         expected = self._mission_read_authority(mission)
         def operation(sim):
             self._mission_read_guard(sim, expected)
-            self._sample_spatial(force=True)
+            moving = bool(self.home_mission and self.home_mission.active)
+            self._sample_spatial(force=not moving)
             if self.home_mission:
                 self.home_mission.sample()
             if not self.spatial_enabled or self.spatial_error or not self.spatial_frames:
                 raise ValueError("Mission feedback requires fresh observed sensors")
             sensor, image, _ = next(reversed(self.spatial_frames.values()))
             self._mission_read_guard(sim, expected, sensor)
-            observation, _ = self._feedback(sim, image)
+            observation, _ = self._feedback(sim, image, lightweight_home=moving)
             observation = observation.model_copy(update={"odometry_m_rad": list(sensor.odometry_m_rad),
                 "head_rad": list(sensor.head_rad), "simulated_time_s": sensor.simulated_time_s})
+            home = self.home_mission
+            if mission and home and home.home and observation.spatial and not moving:
+                from backend.home_mapping import transform_pose
+                home.require_localized()
+                pose = transform_pose(sensor.odometry_m_rad, home.transform)
+                candidates = home.home.frontiers(pose, sim.robot_footprint()["radius_m"], home.obstacles(),
+                    excluded=home.task.get("rejected_frontiers", ()) if home.task and home.task.get("mission_id") == mission.identity else ())
+                for candidate in candidates:
+                    delta = np.asarray(candidate["position_m"]) - pose[:2]
+                    bearing = math.atan2(delta[1], delta[0]) - pose[2]
+                    candidate["bearing_rad"] = math.atan2(math.sin(bearing), math.cos(bearing))
+                candidates.sort(key=lambda item: item["distance_m"] + .8 * abs(item["bearing_rad"]) + item["attempts"])
+                observation = observation.model_copy(update={"spatial": {**observation.spatial, "frontiers": candidates[:4]}})
             return sensor, image, observation
+        return await self.call(operation)
+
+    async def record_mission_room(self, mission, sensor, image, observation, decision):
+        from backend.home_mapping import transform_pose
+        from uuid import uuid4
+        import hashlib
+        expected = self._mission_read_authority(mission)
+
+        def operation(sim):
+            self._mission_read_guard(sim, expected)
+            mission.check(expected[:4])
+            home = self.home_mission
+            home.require_localized()
+            pose = transform_pose(sensor.odometry_m_rad, home.transform)
+            if (home.active or (self.continuous and self.continuous.active)
+                    or not 0 <= time.monotonic()-sensor.captured_at <= 15.
+                    or sensor.run_id != sim.run_id or sensor.episode_epoch != sim.epoch
+                    or observation.run_id != sensor.run_id or observation.episode_epoch != sensor.episode_epoch
+                    or list(observation.odometry_m_rad) != list(sensor.odometry_m_rad)
+                    or list(observation.head_rad) != list(sensor.head_rad)
+                    or observation.simulated_time_s != sensor.simulated_time_s
+                    or sim.frames.get(observation.frame_ref) != image
+                    or not home.room_view_matches(pose, sensor.head_rad)):
+                raise ValueError("Room report requires the current paired image at a stopped unchanged viewpoint")
+            identity = str(uuid4())
+            place = next((place for place in home.home.places if place["kind"] == "room"
+                and place["name"] == decision.room_label and np.linalg.norm(np.asarray(place["pose_m_rad"][:2])-pose[:2]) <= .75), None)
+            before = len(home.home.places), home.home.annotations_dirty
+            try:
+                if place is None:
+                    name = decision.room_label
+                    if any(place["name"].casefold() == name.casefold() for place in home.home.places):
+                        name += " " + identity[:8]
+                    place = home.home.add_place(name, "room", pose, sim.robot_footprint()["radius_m"])
+                    place.update(identity_status="tentative", source="camera_room_hypothesis")
+                record = {"observation_id": identity, "map_id": home.home.identity, "place_id": place["place_id"],
+                    "label": decision.room_label, "kind": "room", "frame": "map", "pose_m_rad": pose,
+                    "run_id": sim.run_id, "episode_epoch": sim.epoch, "spatial_sequence": sensor.sequence,
+                    "observation_seq": observation.seq, "frame_ref": observation.frame_ref,
+                    "captured_at_monotonic_s": sensor.captured_at, "head_rad": list(sensor.head_rad),
+                    "observed_unix_s": time.time()-(time.monotonic()-sensor.captured_at),
+                    "image_sha256": hashlib.sha256(image).hexdigest(), "evidence": decision.evidence_text,
+                    "confidence": decision.room_confidence, "confidence_calibrated": False,
+                    "review_status": "tentative", "room_matches": None, "identity_verified": False,
+                    "arrival_verified": False, "map_saved": home.home.saved,
+                    "image_url": f"/api/home/{home.home.identity}/rooms/{identity}/image.png"}
+                home.store.remember_room(record, image, allow_draft=True)
+            except Exception:
+                del home.home.places[before[0]:]
+                home.home.annotations_dirty = before[1]
+                raise
+            home.room_records = home.store.room_observations(home.home.identity)
+            return record
+
         return await self.call(operation)
 
     async def mission_map(self, sensor, observation, trail=(), overview=False, mission=None):
@@ -1031,6 +1170,9 @@ class SimulationWorker:
             frame, identity, origin, resolution = "wheel_odometry", sim.run_id, public["origin_m"], public["resolution_m"]
             grid, pose, route, destinations, localized = self.spatial_map.cells.copy(), list(sensor.odometry_m_rad), [], [], "local_odometry"
             measured_trail = list(trail)
+            recorded_trail = getattr(self, "mission_trail", None) if mission and getattr(self, "mission_trail_owner", None) == mission.identity else None
+            if recorded_trail is not None:
+                measured_trail = recorded_trail.at(sensor.captured_at, sensor.odometry_m_rad)
             if home and home.home and home.transform is not None and home.localization["status"] == "localized":
                 home.require_localized()
                 frame, identity, origin, resolution = "map", home.home.identity, home.home.origin.tolist(), home.home.resolution_m
@@ -1040,7 +1182,7 @@ class SimulationWorker:
                     if home.home.inside(cell):
                         grid[cell[1], cell[0]] = 100
                 pose = transform_pose(list(sensor.odometry_m_rad), home.transform)
-                measured_trail = [transform_pose([*point[:2], 0.], home.transform)[:2] for point in trail]
+                measured_trail = [transform_pose([*point[:2], 0.], home.transform)[:2] for point in measured_trail]
                 route = home.route
                 spatial = observation.spatial or {}
                 destinations = [{"id": place["place_id"], "kind": "place", "label": place["name"],
@@ -1055,9 +1197,15 @@ class SimulationWorker:
             context = observed_context(grid, origin, resolution, pose, identity=identity, run_id=sim.run_id, epoch=sim.epoch,
                 sequence=sensor.sequence, captured_at=sensor.captured_at, now=time.monotonic(), frame=frame, localization=localized,
                 camera_yaw=pose[2]+sensor.head_rad[0], destinations=destinations, trail=measured_trail, route=route, overview=overview)
+            if recorded_trail is not None:
+                context.trail_source = "worker_odometry"
+                context.trail_truncated = recorded_trail.dropped > 0
+                context.trail_spacing_m = recorded_trail.spacing_m
             if frame == "map":
                 context.geometry_source = "accumulated_sensor_map"
                 context.geometry_updated_unix_s = home.home.updated_at
+                geometry_age = time.time() - home.home.updated_at
+                context.geometry_age_s = geometry_age if geometry_age >= 0. else None
             self._mission_read_guard(sim, expected, sensor)
             return context
         return await self.call(operation)
@@ -1729,6 +1877,7 @@ class SimulationWorker:
             return result
         return await self.call(operation)
 
+    @timed("controller.update_continuous")
     def _update_continuous(self):
         import math
         import pybullet as bullet
@@ -1756,6 +1905,11 @@ class SimulationWorker:
             self.continuous.update(self.sim, self.navigation, self.home_mission, self.home_mission.path_valid)
             if self.continuous.active:
                 self.navigation.expires_at = min(self.navigation.expires_at, time.monotonic() + .5)
+                self.navigation.diagnostics.expires_at_s = self.navigation.expires_at
+                if self.navigation.diagnostics.last_renewal:
+                    self.navigation.diagnostics.last_renewal["expires_at_s"] = self.navigation.expires_at
+                    if self.navigation.renewal_events:
+                        self.navigation.renewal_events[-1]["expires_at_s"] = self.navigation.expires_at
             return
         self._continue_observed_orbit()
         self._continue_exploration()
@@ -1826,6 +1980,7 @@ class SimulationWorker:
         if self.closed:
             raise RuntimeError("Episode closed")
         future = Future()
+        future.milo_enqueued_at = time.monotonic()
         self.queue.put((future, operation))
         return await asyncio.wrap_future(future)
 
@@ -1993,7 +2148,18 @@ class SimulationWorker:
 
         return await self.call(operation)
 
+    @timed("publication.navigation")
     def _publish_navigation(self):
+        timing = getattr(self, "worker_timing", None)
+        diagnostics = self.navigation.diagnostics
+        renewal = diagnostics.last_renewal
+        key = (diagnostics.authorization_id, renewal.get("at_s"), renewal.get("revision")) if renewal else None
+        if timing is not None and key is not None and key != self.timing_last_renewal:
+            self.timing_last_renewal = key
+            timing.event("buffer_renewal", authorization_id=diagnostics.authorization_id,
+                task_id=diagnostics.task_id, objective_id=diagnostics.objective_id,
+                renewal=dict(renewal), expires_at_s=diagnostics.expires_at_s,
+                sensor_at_last_command=diagnostics.sensor_at_last_command)
         if self.continuous and not self.continuous.active and getattr(self.continuous, "preview_dimensions", None):
             self.sim.width, self.sim.height = self.continuous.preview_dimensions
             self.continuous.preview_dimensions = None
@@ -2005,7 +2171,8 @@ class SimulationWorker:
                        "busy": bool(self.navigation.buffer) or bool(self.continuous and self.continuous.active) or bool(self.ros_navigation and self.ros_navigation.active),
                        "snapshot": self.sim.snapshot(), "stopped": self.sim.cancel.is_set()}
 
-    def _feedback(self, sim, image=None):
+    @timed("publication.feedback")
+    def _feedback(self, sim, image=None, *, lightweight_home=False):
         if not self.powered:
             observation = AgentObservation.model_validate(self.latest["observation"])
             return observation, next(reversed(self.camera_frames.values()))
@@ -2028,7 +2195,8 @@ class SimulationWorker:
         if self.skill:
             observation.skill = SkillFeedback.model_validate(self.skill.state())
         if self.home_mission and self.home_mission.home:
-            observation.spatial = self.home_mission.state(compact=True)
+            observation.spatial = self.home_mission.state(compact=True, lightweight=lightweight_home)
+            observation.spatial.pop("environment_id", None)
         self.latest = {**self.latest, "observation": observation.model_dump()}
         return observation, image
 

@@ -13,6 +13,239 @@ from backend.simulation import MotionError
 from backend.worker import CameraActivity, SimulationWorker
 
 
+def test_worker_timing_separates_nested_wall_time_and_preserves_exception():
+    from backend.worker_timing import WorkerTiming
+    now = [0.]
+    timing = WorkerTiming(clock=lambda: now[0])
+    with timing.measure("control"):
+        now[0] = .1
+        with pytest.raises(ValueError, match="fixture"):
+            with timing.measure("map"):
+                now[0] = .4
+                raise ValueError("fixture")
+        now[0] = .5
+    child, parent = timing.events
+    assert child["phase"] == "map" and child["duration_s"] == pytest.approx(.3)
+    assert child["error_type"] == "ValueError" and child["parent_id"] == parent["span_id"]
+    assert parent["duration_s"] == .5 and parent["self_s"] == pytest.approx(.2)
+    assert not timing.stack
+
+
+def test_worker_timing_stop_snapshot_is_bounded_and_marks_unfinished_work():
+    from backend.worker_timing import WorkerTiming
+    now = [0.]
+    timing = WorkerTiming(clock=lambda: now[0], capacity=3, incident_capacity=1)
+    diagnostic = {"authorization_id": "buffer", "stop": {"reason": "BUFFER_EXPIRED"}}
+    with timing.measure("queued_operation"):
+        now[0] = .1
+        with timing.measure("collision"):
+            now[0] = .6
+            for index in range(5):
+                timing.event("renewal", revision=index)
+            timing.stop(diagnostic, "run", 2, .05)
+            diagnostic["stop"]["reason"] = "changed"
+            snapshot = timing.incidents[0]
+            assert snapshot["navigation"]["stop"]["reason"] == "BUFFER_EXPIRED"
+            assert len(snapshot["events"]) == 3 and snapshot["events_evicted"] == 2
+            assert snapshot["active_spans"][0]["self_so_far_s"] == pytest.approx(.1)
+            assert snapshot["active_spans"][1]["duration_so_far_s"] == .5
+    timing.stop(diagnostic, "run", 2, .05)
+    assert timing.incidents_dropped == 1 and len(timing.incidents) == 1
+    saved = list(timing.take_incidents())
+    assert saved[0]["clock"] == "test" and saved[0]["incident_id"] == 2
+    assert not list(timing.take_incidents())
+    assert len(timing.events) == 3 and not timing.stack
+
+
+@pytest.mark.parametrize("home_source", [False, True])
+async def test_motion_zones_are_opt_in_observed_only_and_never_authorize_motion(home_source):
+    from types import SimpleNamespace
+    import numpy as np
+    from backend.home_mapping import HomeMap
+    from backend.home_mission import HomeMission
+    from backend.motion_zones import observed_motion_zones
+    from backend.spatial import ObservedMap
+    worker = SimulationWorker(pace=False, rendering="tiny")
+    try:
+        await asyncio.wrap_future(worker.ready)
+        def check(sim):
+            disabled = worker.spatial_state(include_motion_zones=True)
+            assert disabled["footprint"] is None
+            assert disabled["motion_zones"]["footprint"]["radius_m"] > .2
+            assert disabled["motion_zones"]["sectors"] == []
+            assert not disabled["motion_zones"]["motion_authorized"]
+            worker.spatial_enabled = True
+            worker.spatial_map = ObservedMap(sim.run_id, sim.epoch)
+            worker.spatial_map.cells[:] = 0
+            worker.spatial_map.captured_at = time.monotonic()
+            worker.spatial_map.observation = SimpleNamespace(odometry_m_rad=sim.odometry.tolist())
+            if home_source:
+                worker.home_mission = HomeMission(worker)
+                worker.home_mission.home = HomeMap("scripted-zone-fixture")
+                worker.home_mission.home.evidence[:] = -1
+                worker.home_mission.transform = [0., 0., 0.]
+                worker.home_mission.pose = sim.odometry.tolist()
+                worker.home_mission.sampled_at = time.monotonic()
+                worker.home_mission.validated_at = time.monotonic()
+                worker.home_mission.localization["status"] = "localized"
+            before = sim.ticks, sim.odometry.copy(), worker.spatial_map.cells.copy()
+            assert "motion_zones" not in worker.spatial_state()
+            result = worker.spatial_state(include_motion_zones=True)["motion_zones"]
+            assert result["source"] == ("home_map" if home_source else "rolling_depth_map")
+            assert not result["motion_authorized"] and len(result["sectors"]) == 48
+            assert all(sector["status"] == "clear" for sector in result["sectors"])
+            assert result["beam_stop_distance_m"] == .18
+            assert result["speed_basis"] == "idle_reference"
+            assert 0. < result["valid_for_s"] <= (.75 if home_source else 1.)
+            expired = observed_motion_zones(worker, sim.robot_footprint(), worker.spatial_map.captured_at + 2.)
+            assert expired["stale"] and all(sector["status"] == "unavailable" for sector in expired["sectors"])
+            assert sim.ticks == before[0]
+            np.testing.assert_array_equal(sim.odometry, before[1])
+            np.testing.assert_array_equal(worker.spatial_map.cells, before[2])
+            assert worker.navigation is None
+            if home_source:
+                worker.home_mission.sampled_at -= 1.
+                unavailable = observed_motion_zones(worker, sim.robot_footprint())
+                assert unavailable["reason"].startswith("LOCALIZATION_REQUIRED")
+                assert unavailable["sectors"] == []
+        await worker.call(check)
+    finally:
+        worker.stop()
+        await worker.close()
+
+
+async def test_worker_timing_expiry_is_saved_only_by_background_flush(tmp_path):
+    import json
+    from backend.challenges import get_challenge
+    from backend.navigation import NavigationRuntime
+    from backend.recording import RunRecorder
+    from scripts.navigation_policy import apply
+    worker = SimulationWorker(challenge=get_challenge("park"), rendering="tiny", pace=False)
+    recorder = RunRecorder(tmp_path / "recording")
+    try:
+        await asyncio.wrap_future(worker.ready)
+        await worker.call(lambda sim: recorder.capture(worker))
+        def expire(sim):
+            worker.navigation = NavigationRuntime()
+            apply(worker.navigation, sim, "begin_local_subgoal", {"goal": "Capture expiry timing"})
+            apply(worker.navigation, sim, "replace_motion_buffer", {"segments": [
+                {"kind": "drive", "linear_mps": .1, "angular_radps": 0., "duration_s": 1.}]})
+            worker.navigation.expires_at = time.monotonic() - .01
+            worker.navigation.diagnostics.expires_at_s = worker.navigation.expires_at
+            ticks = sim.ticks
+            worker.navigation.tick(sim)
+            assert not worker.navigation.buffer and not worker.navigation.velocity.any()
+            assert sim.ticks == ticks
+            recorder.capture(worker)
+            return worker.navigation.diagnostics.authorization_id
+        identity = await worker.call(expire)
+        worker.stop()
+        assert not list((recorder.directory / "media").glob("worker-timing-*.json"))
+        await asyncio.to_thread(recorder.flush)
+        files = list((recorder.directory / "media").glob("worker-timing-*.json"))
+        assert len(files) == 1
+        incident = json.loads(files[0].read_text())
+        assert incident["navigation"]["authorization_id"] == identity
+        assert "expired" in incident["navigation"]["stop"]["reason"]
+        assert incident["clock"] == "monotonic" and incident["run_id"] == worker.sim.run_id
+        assert any(event["kind"] == "queue_wait" for event in incident["events"])
+        assert any(event.get("phase") == "safety.check_clearance" for event in incident["events"])
+        assert any(span["phase"] == "navigation.tick" for span in incident["active_spans"])
+        assert all(event.get("self_s", 0.) <= event.get("duration_s", 0.) + 1e-9 for event in incident["events"])
+        samples = [json.loads(line) for line in (recorder.directory / "trajectory.jsonl").read_text().splitlines()]
+        assert any(f"media/{files[0].name}" in sample.get("worker_timing_files", []) for sample in samples)
+        score = await asyncio.to_thread(recorder.finish, {"real_model": False})
+        assert score["worker_timing"] == {"scope": "Bounded stop-centered worker wall-time snapshots",
+            "incidents": 1, "omitted": 0, "dropped": 0, "limit": 128}
+    finally:
+        recorder.stream.close()
+        worker.stop()
+        await worker.close()
+
+
+async def test_worker_stop_during_buffer_update_is_not_an_execution_failure(monkeypatch):
+    from backend.challenges import get_challenge
+    from backend.continuous_navigation import ContinuousNavigation
+    from backend.navigation import NavigationRuntime
+    from scripts.navigation_policy import apply
+    from backend.worker_timing import timed
+    worker = SimulationWorker(challenge=get_challenge("park"), rendering="tiny", pace=False)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        def check(sim):
+            worker.navigation = NavigationRuntime()
+            apply(worker.navigation, sim, "begin_local_subgoal", {"goal": "Stop during renewal"})
+            apply(worker.navigation, sim, "replace_motion_buffer", {"segments": [
+                {"kind": "drive", "linear_mps": .1, "angular_radps": 0., "duration_s": 1.}]})
+            worker.continuous = ContinuousNavigation([[0., 0.], [1., 0.]])
+            @timed("fixture.renewal")
+            def interrupted(current):
+                sim.stop()
+                raise MotionError("CANCELLED", "Navigation was stopped")
+            monkeypatch.setattr(worker, "_update_continuous", lambda: interrupted(worker))
+            before = sim.ticks
+            worker._tick_navigation()
+            assert sim.ticks == before and sim.cancel.is_set()
+            assert worker.navigation.status == worker.continuous.status == "cancelled"
+            assert worker.navigation.reason.startswith("CANCELLED:")
+            assert not worker.navigation.buffer and not worker.navigation.velocity.any()
+            incident = worker.worker_timing.incidents[-1]
+            assert incident["navigation"]["stop"]["initiator"] == "external_stop"
+            assert any(event.get("error_code") == "CANCELLED" for event in incident["events"])
+        await worker.call(check)
+    finally:
+        worker.stop()
+        await worker.close()
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_navigation_progress_and_stop_survive_nonempty_read_queue(interrupted):
+    from concurrent.futures import Future
+    from backend.challenges import get_challenge
+    from backend.navigation import NavigationRuntime
+    from scripts.navigation_policy import apply
+    worker = SimulationWorker(challenge=get_challenge("park"), rendering="tiny", pace=True)
+    requests = []
+    try:
+        await asyncio.wrap_future(worker.ready)
+
+        def begin(sim):
+            sim.width, sim.height = 160, 120
+            worker.navigation = NavigationRuntime()
+            apply(worker.navigation, sim, "begin_local_subgoal", {"goal": "Bounded drive under read pressure"})
+            apply(worker.navigation, sim, "replace_motion_buffer", {"segments": [
+                {"kind": "drive", "linear_mps": .1, "angular_radps": 0., "duration_s": 1.}] * 2})
+
+            def read(sim):
+                threading.Event().wait(.01)
+                return sim.ticks, sim.odometry.copy()
+
+            for _ in range(80):
+                future = Future()
+                requests.append(future)
+                worker.queue.put((future, read))
+
+        await worker.call(begin)
+        if interrupted:
+            await asyncio.wrap_future(requests[10])
+            worker.stop()
+        snapshots = await asyncio.gather(*(asyncio.wrap_future(request) for request in requests))
+        assert snapshots[30][0] > snapshots[0][0], "Read requests starved the physics executor"
+        if interrupted:
+            assert snapshots[-1][0] == snapshots[30][0]
+            assert not worker.navigation.buffer and not worker.navigation.velocity.any()
+        else:
+            assert snapshots[-1][0] > snapshots[30][0], worker.navigation.reason
+            assert snapshots[-1][1][0] > .015
+            assert worker.navigation.status in {"running", "awaiting_feedback"}, worker.navigation.reason
+            if worker.navigation.status == "awaiting_feedback":
+                assert not worker.navigation.buffer and not worker.navigation.velocity.any()
+                assert "expired" in worker.navigation.reason or "exhausted" in worker.navigation.reason
+    finally:
+        worker.stop()
+        await worker.close()
+
+
 async def test_ros_session_rejects_stale_commands_and_latches_watchdog():
     from backend.ros_navigation import RosNavigationSession, RosStart, RosVelocity
     worker = SimulationWorker(pace=False)

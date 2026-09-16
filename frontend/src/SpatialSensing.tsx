@@ -3,8 +3,10 @@ import { createPortal } from 'react-dom';
 import { Crosshair, Map, Maximize2, Minus, Scan, X } from 'lucide-react';
 import { RobotControlSlot } from './RobotControlSurface';
 import { usePreference } from './Preferences';
+import type { SpatialTelemetry } from './types';
 
 type SpatialState = {
+  motion_zones?:SpatialTelemetry['motion_zones'];
   power?: {on: boolean; mode: 'off' | 'idle' | 'working'};
   enabled: boolean; paused: boolean; error: string | null;
   frame: { sequence: number; simulated_time_s: number; rgb_url: string; depth_url: string } | null;
@@ -18,10 +20,12 @@ type SpatialState = {
     replans?: number; handoffs?: number; maximum_update_gap_s?: number} | null;
 };
 
-export function SpatialSensing({ runId, epoch, connected, busy, request, hudHost }: {
+export function SpatialSensing({ runId, epoch, connected, busy, request, hudHost, onTelemetry, showMotionZones = false }: {
   runId: string; epoch: number; connected: boolean; busy: boolean;
   request: (path: string, body?: unknown) => Promise<unknown>;
   hudHost?: HTMLElement | null;
+  onTelemetry?: (value:SpatialTelemetry) => void;
+  showMotionZones?:boolean;
 }) {
   const [state, setState] = useState<SpatialState | null>(null);
   const [pair, setPair] = useState<{ sequence: number; rgb: string; depth: string } | null>(null);
@@ -37,7 +41,7 @@ export function SpatialSensing({ runId, epoch, connected, busy, request, hudHost
   const [clock, setClock] = useState(() => performance.now());
   const [selectedLabel, setSelectedLabel] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
-  const [minimized, setMinimized] = useState(false);
+  const [minimized, setMinimized] = useState(true);
   const dialog = useRef<HTMLDialogElement>(null);
   const details = useRef<HTMLDetailsElement>(null);
   const labelBoxes = useRef<{id: string; left: number; top: number; width: number; height: number}[]>([]);
@@ -65,6 +69,7 @@ export function SpatialSensing({ runId, epoch, connected, busy, request, hudHost
     let sequence = -1;
     let loadingPair = false;
     let pollInterval = 750;
+    let telemetry:SpatialTelemetry = {run_id:runId,episode_epoch:epoch,received_at_ms:null,enabled:null,paused:false,error:null,frame:null,map:null};
     const controller = new AbortController();
     async function loadPair(frame: NonNullable<SpatialState['frame']>) {
       loadingPair = true;
@@ -109,25 +114,35 @@ export function SpatialSensing({ runId, epoch, connected, busy, request, hudHost
     }
     async function poll() {
       try {
-        const response = await fetch('/api/spatial', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]) });
+        const response = await fetch('/api/spatial', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+          headers:showMotionZones ? {'X-Milo-Motion-Zones':'1'} : undefined });
         if (!response.ok) throw new Error('Spatial sensor unavailable');
         const data: SpatialState = await response.json();
         if (!active) return;
         setState(data);
         pollInterval = data.power?.mode === 'off' ? 5000 : data.power?.mode === 'idle' ? 2000 : 750;
-        setReceivedAt(performance.now());
+        const received = performance.now();
+        setReceivedAt(received);
+        telemetry = {run_id:runId,episode_epoch:epoch,received_at_ms:received,enabled:data.enabled,paused:data.paused,error:data.error,motion_zones:data.motion_zones,
+          frame:data.frame ? {sequence:data.frame.sequence,simulated_time_s:data.frame.simulated_time_s} : null,
+          map:data.map ? {age_s:data.map.age_s,stale:data.map.stale,observed_floor_cells:data.map.observed_floor_cells,obstacle_cells:data.map.obstacle_cells} : null};
+        onTelemetry?.(telemetry);
         setSensorError('');
         if (!data.enabled) { setPair(null); setFrameError(''); }
         else if (data.power?.on !== false && data.frame && sequence !== data.frame.sequence && !loadingPair) void loadPair(data.frame);
       } catch (failure) {
-        if (active) setSensorError(failure instanceof Error ? failure.message : String(failure));
+        if (active) {
+          const message = failure instanceof Error ? failure.message : String(failure);
+          setSensorError(message);
+          onTelemetry?.({...telemetry,error:message});
+        }
       } finally {
         if (active) timer = setTimeout(poll, pollInterval);
       }
     }
     void poll();
     return () => { active = false; clearTimeout(timer); controller.abort(); };
-  }, [connected, revision, pending, runId, epoch]);
+  }, [connected, revision, pending, runId, epoch, onTelemetry, showMotionZones]);
 
   useEffect(() => () => {
     if (pair) for (const url of [pair.rgb, pair.depth]) { URL.revokeObjectURL(url); urls.current.delete(url); }

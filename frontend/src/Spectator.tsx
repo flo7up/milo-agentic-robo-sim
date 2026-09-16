@@ -2,15 +2,23 @@ import { useEffect, useRef, useState } from 'react';
 import { MousePointer2 } from 'lucide-react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import type { LiveState, ManualPlacement } from './types';
-import { enhancedLighting, visualGeometry, visualMaterial, type GraphicsQuality } from './sceneGraphics';
+import type { LiveState, ManualPlacement, SpatialTelemetry } from './types';
+import { MovementZoneOverlay } from './movementZones';
+import { detailRobotVisual, enhancedLighting, visualGeometry, visualMaterial, type GraphicsQuality } from './sceneGraphics';
 import { usePreference } from './Preferences';
 
-export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState; axes: boolean; enabled: boolean; onPlace: (placement: ManualPlacement) => Promise<void> }) {
+export function Spectator({ state, axes, enabled, onPlace, showZones = false, telemetry, connected = true }: {
+  state: LiveState; axes: boolean; enabled: boolean; onPlace: (placement: ManualPlacement) => Promise<void>;
+  showZones?:boolean;telemetry?:SpatialTelemetry | null;connected?:boolean;
+}) {
   const host = useRef<HTMLDivElement>(null);
   const current = useRef(state);
   const axesVisible = useRef(axes);
   const options = useRef({ enabled, onPlace });
+  const zoneOptions=useRef({showZones,telemetry,connected});
+  zoneOptions.current={showZones,telemetry,connected};
+  const [zoneStatus,setZoneStatus]=useState('Unavailable');
+  const [zoneHint,setZoneHint]=useState('');
   const interaction = useRef({ select: () => {}, cancel: () => {} });
   const [selected, setSelected] = useState(false);
   const [preview, setPreview] = useState<[number, number] | null>(null);
@@ -92,10 +100,13 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     scene.add(world);
     const robotRoot = new THREE.Group();
     world.add(robotRoot);
+    const movementZones=new MovementZoneOverlay();
+    world.add(movementZones.group);
     const axisHelper = new THREE.AxesHelper(.7);
     world.add(axisHelper);
     const links = new Map<string, THREE.Group>();
     const meshes: THREE.Mesh[] = [];
+    const robotDetails: (() => void)[] = [];
     const textures = new Map<string, THREE.Texture>();
     const textureLoader = new THREE.TextureLoader();
     for (const asset of current.current.geometry) {
@@ -116,6 +127,7 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
       mesh.castShadow = dimensions[2] > .01;
       mesh.receiveShadow = true;
       mesh.userData.robot = asset.key.startsWith(`${current.current.robot_body_id}:`);
+      if (mesh.userData.robot) robotDetails.push(detailRobotVisual(mesh, asset));
       mesh.position.fromArray(asset.position);
       mesh.quaternion.fromArray(asset.quaternion);
       let link = links.get(asset.key);
@@ -207,6 +219,11 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
       renderer.domElement.setPointerCapture(event.pointerId);
     }
     function pointerMove(event: PointerEvent) {
+      if(!drag && zoneOptions.current.showZones && movementZones.group.visible) {
+        cast(event);
+        const hit=raycaster.intersectObjects([...movementZones.meshes.values()])[0];
+        setZoneHint(hit?.object.userData.hint ?? '');
+      }
       if (drag?.pointer === event.pointerId) {
         event.stopImmediatePropagation();
         if (new THREE.Vector2(event.clientX, event.clientY).distanceTo(drag.screen) < 4 && !drag.moved) return;
@@ -265,6 +282,7 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     resize.observe(element);
     let frameId = 0;
     let placements = current.current.manual_placements;
+    let previousZoneState='';
     const animate = () => {
       if (drag && (!options.current.enabled || drag.source.observation_seq !== current.current.observation.seq)) cancel();
       const positioned = placements !== current.current.manual_placements;
@@ -278,6 +296,10 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
         }
       }
       axisHelper.visible = axesVisible.current;
+      const zoneState=movementZones.update(current.current,zoneOptions.current.telemetry,zoneOptions.current.showZones && !drag,zoneOptions.current.connected);
+      if(previousZoneState!==zoneState) {previousZoneState=zoneState;setZoneStatus(zoneState);}
+      renderer.domElement.dataset.zoneState=zoneState;
+      renderer.domElement.dataset.zoneCount=String(movementZones.group.visible ? movementZones.meshes.size : 0);
       outline.visible = isSelected;
       if (isSelected) outline.update();
       if (!drag) controls.update();
@@ -299,8 +321,10 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
       renderer.domElement.removeEventListener('keydown', keyDown);
       resize.disconnect();
       controls.dispose();
+      movementZones.dispose();
       outline.geometry.dispose();
       (outline.material as THREE.Material).dispose();
+      robotDetails.forEach(dispose => dispose());
       for (const mesh of meshes) {
         mesh.geometry.dispose();
         (mesh.material as THREE.Material).dispose();
@@ -314,7 +338,16 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
     };
   }, [state.run_id, quality]);
   return <div className="spectator-shell">
+    <div className="spectator-stage">
     <div className="spectator" ref={host} />
+    {showZones && <div className="movement-zone-legend" aria-label="Movement zone legend">
+      <div>{[['clear','Map-clear'],['restricted','Restricted'],['unknown','Unknown'],['unavailable','Unavailable']].map(([kind,label])=><span key={kind}><i data-zone={kind}/>{label}</span>)}</div>
+      <strong>{zoneStatus} / geometry only</strong>
+      {telemetry?.motion_zones && <span>Map radius {(telemetry.motion_zones.planning_radius_m+(telemetry.motion_zones.map_margin_m ?? 0)).toFixed(2)} m / includes footprint margin</span>}
+      <span>{telemetry?.motion_zones ? `Footprint ${telemetry.motion_zones.footprint.radius_m.toFixed(2)} m / beam stop ${telemetry.motion_zones.beam_stop_distance_m.toFixed(2)} m at ${telemetry.motion_zones.preview_speed_mps.toFixed(2)} m/s${telemetry.motion_zones.speed_basis==='idle_reference' ? ' reference' : ''}` : 'Zone telemetry unavailable'}</span>
+      {state.navigation?.diagnostics?.stop && <span>Stop: {state.navigation.diagnostics.stop.reason.split(':')[0]}</span>}
+      {zoneHint && <span className="movement-zone-hint">{zoneHint}</span>}
+    </div>}
     <div className="placement-toolbar">
       <button className="icon-button" aria-label="Select robot" aria-pressed={selected} disabled={!enabled || placing}
         title={enabled ? selected ? 'Deselect robot' : 'Select robot to reposition' : 'Manual control is required to reposition'}
@@ -329,5 +362,13 @@ export function Spectator({ state, axes, enabled, onPlace }: { state: LiveState;
         {mode === 'standard' ? 'Standard' : 'Enhanced'}</button>)}
     </div>}
     {error && <div className="placement-error" role="alert">{error}</div>}
+    </div>
+    {showZones && telemetry?.motion_zones && <details className="movement-zone-readings"><summary>Zone readings / center travel</summary>
+      <p>{telemetry.motion_zones.source} / {telemetry.motion_zones.reason}</p>
+      <table><thead><tr><th>Direction</th><th>0.25 m</th><th>0.50 m</th><th>1.00 m</th></tr></thead><tbody>
+        {Array.from({length:16},(_,sector)=><tr key={sector}><th>{(sector*22.5).toFixed(1)} deg</th>
+          {telemetry.motion_zones!.sectors.filter(zone=>zone.sector===sector).map(zone=><td key={zone.outer_m} title={zone.reason}>{zoneStatus==='Observed' ? zone.status : zoneStatus}</td>)}
+        </tr>)}
+      </tbody></table></details>}
   </div>;
 }

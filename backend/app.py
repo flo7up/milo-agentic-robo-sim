@@ -279,11 +279,11 @@ async def test_result_replay_media(batch_id: str, trial_index: int, name: str):
 
 
 @app.get("/api/spatial")
-async def spatial_state(response: Response):
+async def spatial_state(response: Response, request: Request):
     response.headers["Cache-Control"] = "no-store"
     worker = lab.worker
     try:
-        return await worker.call(lambda sim: worker.spatial_state())
+        return await worker.call(lambda sim: worker.spatial_state(include_motion_zones=request.headers.get("x-milo-motion-zones") == "1"))
     except RuntimeError as error:
         if worker.closed or worker is not lab.worker:
             raise HTTPException(409, "Spatial sensor episode changed; refresh state") from error
@@ -718,10 +718,11 @@ async def run_instruction(instruction: RunInstruction):
 @app.get("/api/mission/capabilities")
 async def mission_capabilities():
     from backend.experiment_variants import variant_snapshot
+    from backend.mission import MissionPlan
     settings = AgentStart(run_id="capability", episode_epoch=0, execution_mode="luna_continuous", goal="capability",
         unified_mission=True, images_per_request=2)
     return {"version": 1, "unified_mission": True, "observed_map_version": 1, "backends": ["builtin"],
-        "task_kinds": ["explore", "object", "room", "place"], "image_slots": 2,
+        "task_kinds": MissionPlan.model_json_schema()["properties"]["kind"]["enum"], "image_slots": 2,
         "review_policy": "bounded_stopped_checkpoints", "qualification": "experimental",
         "architecture": variant_snapshot(settings, None)["architecture"]}
 

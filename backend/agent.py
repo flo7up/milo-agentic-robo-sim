@@ -257,9 +257,12 @@ class FoundryModel:
         mode = getattr(self, "execution_mode", "single_step")
         composer = getattr(self, "skill_composer", False)
         if getattr(self, "unified_mission", False):
-            from backend.mission_supervisor import INSTRUCTIONS as mission_instructions, tools as mission_tools
-            return await self.client.responses.create(model=profile.deployment, instructions=mission_instructions + "\nUser goal: " + goal,
-                input=inputs, tools=mission_tools(), parallel_tool_calls=False,
+            from backend.mission_supervisor import instructions_for, tools as mission_tools
+            brief = json.loads(inputs[-1]["content"][0]["text"])
+            actions = brief.get("available_actions")
+            frontiers = ((brief.get("observation") or {}).get("spatial") or {}).get("frontiers", [])
+            return await self.client.responses.create(model=profile.deployment, instructions=instructions_for(brief) + "\nUser goal: " + goal,
+                input=inputs, tools=mission_tools(actions, [item["frontier_id"] for item in frontiers]), parallel_tool_calls=False,
                 tool_choice={"type": "function", "name": "guide_mission"}, reasoning={"effort": reasoning},
                 max_output_tokens=2048, store=False)
         return await self.client.responses.create(
@@ -417,7 +420,11 @@ class BudgetedModel:
         if budget["requests"] >= budget["max_requests"] or budget["tokens"] >= budget["max_tokens"]:
             raise InferenceLimit("Luna task budget reached; robot returned to idle")
         budget["requests"] += 1
-        response = await self.model.respond(profile, reasoning, goal, inputs)
+        try:
+            response = await self.model.respond(profile, reasoning, goal, inputs)
+        except BaseException:
+            budget["usage_unknown"] = True
+            raise
         self.controller._check_live(self.worker, self.settings)
         if self.controller.state["session_id"] != self.session_id:
             raise asyncio.CancelledError
@@ -1375,14 +1382,16 @@ class AgentController:
         except InferenceLimit as error:
             self.state.update(phase="completed", error=None, message=str(error))
             self._set_outcome("limited", str(error))
-        except TimeoutError:
+        except TimeoutError as error:
+            from backend.mission import MissionInferenceTimeout
             if (self.evaluation_budget or settings.unified_mission) and ((session_timeout and session_timeout.expired()) or time.monotonic() >= self.session_deadline):
                 self.state.update(phase="completed", error=None, message="Evaluation time budget exhausted; robot stopped")
                 if self.state.get("local_model"):
                     self.state["local_model"].update(phase="completed", success=False)
                 self._set_outcome("limited", self.state["message"])
             else:
-                self.state.update(phase="error", error="Inference or session timed out; robot stopped")
+                self.state.update(phase="error", error=str(error) if isinstance(error, MissionInferenceTimeout)
+                    else "Inference or session timed out; robot stopped")
         except APIStatusError as error:
             self.state.update(phase="error", error=f"Foundry HTTP {error.status_code}. Check deployment, access, quota, and model capabilities.")
         except APIConnectionError:

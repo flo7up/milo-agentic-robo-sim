@@ -42,6 +42,7 @@ def observed_context(cells, origin, resolution, pose, *, identity, run_id, epoch
     revision = hashlib.sha256(crop.astype(np.int16).tobytes() + repr((identity, frame, cropped_origin, resolution * scale)).encode()).hexdigest()[:16]
     return ObservedMapContext(map_id=identity, revision=revision, run_id=run_id, episode_epoch=epoch,
         source_sequence=sequence, captured_at=captured_at, age_s=now-captured_at, frame=frame,
+        snapshot_built_at_monotonic_s=now,
         localization=localization, scope="overview" if overview else "local", width=crop.shape[1], height=crop.shape[0],
         resolution_m=resolution * scale, origin_m=cropped_origin, cells=crop.ravel().tolist(),
         robot_pose_m_rad=list(pose), camera_yaw_rad=camera_yaw, destinations=list(destinations)[:24],
@@ -85,6 +86,8 @@ def render_observed_map(context: ObservedMapContext):
             draw.line((robot, (robot[0]+length*math.cos(angle), robot[1]-length*math.sin(angle))), fill=color, width=3)
     draw.text((12, 509), "White free | Dark occupied | Gray unknown", fill="black")
     draw.text((12, 525), "Blue robot | Red view | Green travelled | Pink planned", fill="black")
+    if context.trail_truncated:
+        draw.text((12, 539), "Recent travelled segment only / older samples dropped", fill="black")
     encoded = BytesIO()
     image.save(encoded, format="PNG")
     return encoded.getvalue()

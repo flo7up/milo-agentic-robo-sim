@@ -2,6 +2,8 @@
 
 Version: `household-curriculum-v1`, authorized 2026-09-13. This is an evaluation curriculum for the existing wheeled PyBullet robot, not a claim of implemented household autonomy or a model-training recipe. The [performance ledger](DESIGN_PERFORMANCE.md) records measured outcomes separately.
 
+The consolidated [use-case specification](USE_CASE_SPECIFICATION.md) provides stable `UC-*` references, acceptance-profile bindings and explicit qualification gaps. Use it for new requirements and test discussions; this curriculum retains historical progression plans and their original scope. It does not establish current implementation or performance status.
+
 ## User Requirements
 
 Confirmed 2026-09-14. The user requires varied natural-language tasks without a dedicated motion program for each task, smooth continuous movement, and new instructions while another task is running. Examples are circling an observed table, following a selected person and driving a figure eight around two observed objects. These examples are acceptance targets, not claims of current qualification.
