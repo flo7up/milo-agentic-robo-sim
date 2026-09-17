@@ -51,6 +51,7 @@ class HomeMap:
         self.environment_id = environment_id
         self.memory_environment_id = environment_id
         self.environment_revision = "legacy"
+        self.frame_revision = "1"
         self.profile_id = None
         self.name = "Unsaved home"
         self.origin = np.array([-20., -20.])
@@ -372,7 +373,10 @@ class MapStore(SpatialMemoryStore):
         data.update(name=name.strip(), revision=home.revision + 1, updated_unix_s=time.time())
         profile_id = home.profile_id or self.selected_profile(home.memory_environment_id, home.environment_revision)["profile_id"]
         home.profile_id = profile_id
-        self.bind_map(home, frame_revision=scope.frame_revision if scope else "1")
+        if scope and (home.identity, profile_id, home.memory_environment_id, home.environment_revision) != (
+                scope.map_id, scope.profile_id, scope.environment_id, scope.environment_revision):
+            raise ValueError("MAP_SCOPE_MISMATCH: cannot save another profile's map")
+        self.bind_map(home, frame_revision=scope.frame_revision if scope else home.frame_revision)
         with self.connect() as connection:
             if scope:
                 self._check_scope(connection, scope)
@@ -401,8 +405,9 @@ class MapStore(SpatialMemoryStore):
         home = HomeMap.restore(json.loads(row[0]))
         home.profile_id, home.environment_revision = profile_id, environment_revision
         with self.connect() as connection:
-            row = connection.execute("SELECT environment_id FROM memory_map_scopes WHERE map_id=?", (map_id,)).fetchone()
+            row = connection.execute("SELECT environment_id, frame_revision FROM memory_map_scopes WHERE map_id=?", (map_id,)).fetchone()
         home.memory_environment_id = row[0] if row else home.environment_id
+        home.frame_revision = row[1] if row else "1"
         return home
 
     def remember_object(self, observation, image):

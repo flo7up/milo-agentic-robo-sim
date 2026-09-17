@@ -56,8 +56,10 @@ class MemoryObservation(StrictModel):
         numbers = self.pose_m_rad + (self.position_m or []) + (self.head_rad or [])
         if not all(math.isfinite(value) for value in numbers):
             raise ValueError("Memory positions must be finite")
-        if not self.metric_valid and self.position_m is not None:
+        if (not self.metric_valid or self.pose_frame != "map") and self.position_m is not None:
             raise ValueError("Unlocalized sightings cannot invent a metric position")
+        if self.metric_valid and self.pose_frame != "map":
+            raise ValueError("Metric memory requires a localized map frame")
         if self.kind in {"room", "object"} and not self.label.strip():
             raise ValueError("Semantic evidence requires a label")
         if self.kind == "search" and not self.target.strip():
@@ -174,13 +176,15 @@ class SpatialMemoryStore:
             connection.execute("INSERT OR IGNORE INTO memory_map_scopes VALUES (?, ?, ?, ?, ?)", (home.identity, *expected))
         home.profile_id = profile_id
 
-    def open_context(self, home, run_id, episode_epoch, *, environment_id=None, frame_revision="1"):
+    def open_context(self, home, run_id, episode_epoch, *, environment_id=None, frame_revision=None):
         environment_id = environment_id or getattr(home, "memory_environment_id", home.environment_id)
+        frame_revision = frame_revision or getattr(home, "frame_revision", "1")
         self.bind_map(home, environment_id=environment_id, frame_revision=frame_revision)
         scope = MemoryScope(environment_id=environment_id, environment_revision=home.environment_revision,
             profile_id=home.profile_id, map_id=home.identity, frame_revision=frame_revision,
             run_id=run_id, episode_epoch=episode_epoch, context_id=str(uuid4()))
         with self.connect() as connection:
+            connection.execute("UPDATE memory_contexts SET active=0 WHERE profile_id=?", (scope.profile_id,))
             connection.execute("INSERT INTO memory_contexts VALUES (?, ?, ?, 1)", (scope.context_id, scope.profile_id, scope.model_dump_json()))
         return scope
 
@@ -207,13 +211,15 @@ class SpatialMemoryStore:
         connection.execute("INSERT OR IGNORE INTO memory_evidence VALUES (?, ?)", (identity, image))
         return identity
 
-    def ingest(self, scope, observation, image=None, *, allow_new_entity=False, event_id=None):
+    def ingest(self, scope, observation, image=None, *, allow_new_entity=False, event_id=None, validate=None):
         observation = MemoryObservation.model_validate(observation)
         key = hashlib.sha256(json.dumps([scope.run_id, scope.episode_epoch, observation.sequence,
             observation.frame_ref, observation.kind, observation.source_key]).encode()).hexdigest()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._check_scope(connection, scope)
+            if validate and not validate():
+                raise ValueError("STALE_MEMORY_CONTEXT: observation authority was revoked")
             previous = connection.execute("SELECT document FROM memory_events WHERE profile_id=? AND ingestion_key=?", (scope.profile_id, key)).fetchone()
             if previous:
                 return json.loads(previous[0])
@@ -233,9 +239,10 @@ class SpatialMemoryStore:
                 "environment_id": scope.environment_id, "environment_revision": scope.environment_revision,
                 "profile_id": scope.profile_id, "run_id": scope.run_id, "episode_epoch": scope.episode_epoch,
                 "evidence_id": evidence_id, "image_sha256": evidence_id, "identity_verified": False, "confidence_calibrated": False,
+                "arrival_verified": False,
                 "requires_revalidation": not observation.metric_valid or observation.requires_revalidation, "absence_supported": False}
             if observation.kind == "room":
-                record.update(place_id=observation.place_id or entity_id, kind="room", evidence=observation.description, review_status="tentative", room_matches=observation.room_matches)
+                record.update(place_id=observation.place_id, kind="room", evidence=observation.description, review_status="tentative", room_matches=observation.room_matches)
             if observation.kind in {"room", "object"}:
                 collection = "rooms" if observation.kind == "room" else "objects"
                 url = f"/api/home/{scope.map_id}/{collection}/{identity}/image.png"
@@ -256,6 +263,8 @@ class SpatialMemoryStore:
                     last_distance_m=distance, last_duration_s=observation.duration_s, path_m=observation.path_m,
                     last_observed_unix_s=observation.observed_unix_s, evidence_id=identity, source=observation.source)
                 connection.execute("INSERT INTO memory_entities VALUES (?, ?, 'connection', ?) ON CONFLICT(profile_id, entity_id) DO UPDATE SET document=excluded.document", (scope.profile_id, connection_id, json.dumps(belief)))
+            if validate and not validate():
+                raise ValueError("STALE_MEMORY_CONTEXT: observation authority changed before commit")
             return record
 
     @staticmethod
@@ -269,6 +278,7 @@ class SpatialMemoryStore:
             "status": "conflicting_labels" if len(labels) > 1 else "tentative", "identity_verified": False,
             "confidence": record["confidence"], "confidence_calibrated": False,
             "position_m": record.get("position_m"), "pose_m_rad": record["pose_m_rad"], "place_id": record.get("place_id"),
+            "pose_frame": record["pose_frame"],
             "map_id": scope.map_id, "frame_revision": scope.frame_revision,
             "requires_revalidation": record["requires_revalidation"], "last_observed_unix_s": record["observed_unix_s"],
             "evidence_id": record["observation_id"], "image_evidence_id": record["evidence_id"],
@@ -281,26 +291,27 @@ class SpatialMemoryStore:
         limit = min(64, max(1, limit))
         with self.connect() as connection:
             self._check_scope(connection, scope)
-            entities = [json.loads(row[0]) for row in connection.execute("SELECT document FROM memory_entities WHERE profile_id=? ORDER BY json_extract(document, '$.last_observed_unix_s') DESC", (scope.profile_id,))]
-            events = [json.loads(row[0]) for row in connection.execute("SELECT document FROM memory_events WHERE profile_id=? AND kind IN ('search', 'entrance') ORDER BY observed_unix_s DESC LIMIT ?", (scope.profile_id, limit * 4))]
-            rooms = [item for item in entities if item["kind"] == "room"]
-            objects = [item for item in entities if item["kind"] == "object" and (not target or target.casefold() in item["label"].casefold())]
-            connections = [item for item in entities if item["kind"] == "connection"]
-            search = [item for item in events if item.get("kind") == "search" and (not target or item["target"].casefold() == target.casefold())]
-            for item in entities:
+            counts = dict(connection.execute("SELECT kind, count(*) FROM memory_entities WHERE profile_id=? GROUP BY kind", (scope.profile_id,)))
+            groups = {}
+            for kind in ("room", "object", "connection"):
+                groups[kind] = [json.loads(row[0]) for row in connection.execute(
+                    "SELECT document FROM memory_entities WHERE profile_id=? AND kind=? AND (?='' OR kind!='object' OR instr(lower(json_extract(document, '$.label')),lower(?))>0) ORDER BY json_extract(document, '$.last_observed_unix_s') DESC LIMIT ?",
+                    (scope.profile_id, kind, target, target, limit))]
+            events = [json.loads(row[0]) for row in connection.execute("SELECT document FROM memory_events WHERE profile_id=? AND kind IN ('search', 'entrance') AND (?='' OR lower(json_extract(document,'$.target'))=lower(?)) ORDER BY observed_unix_s DESC LIMIT ?", (scope.profile_id, target, target, limit * 2))]
+            for item in [item for group in groups.values() for item in group]:
                 age = time.time() - item["last_observed_unix_s"]
                 item["age_s"] = age if age >= 0 else None
-            return {"scope": scope.model_dump(), "rooms": rooms[:limit], "objects": objects[:limit],
-                "connections": connections[:limit], "search_history": search[:limit],
+            return {"scope": scope.model_dump(), "rooms": groups["room"], "objects": groups["object"],
+                "connections": groups["connection"], "search_history": [item for item in events if item.get("kind") == "search"][:limit],
                 "entrances": [item for item in events if item.get("kind") == "entrance"][:limit],
-                "counts": {"rooms": len(rooms), "objects": len(objects), "connections": len(connections)},
-                "truncated": any(len(items) > limit for items in (rooms, objects, connections, search)),
+                "counts": {"rooms": counts.get("room", 0), "objects": counts.get("object", 0), "connections": counts.get("connection", 0)},
+                "truncated": any(count > limit for count in counts.values()) or len(events) >= limit,
                 "source": "observation_memory", "motion_authorized": False}
 
     def lookup_room(self, scope, query):
-        summary = self.memory_summary(scope, limit=64)
-        query = query.strip().casefold()
-        return [room for room in summary["rooms"] if room["entity_id"] == query or any(query in label.casefold() for label in room["labels"])][:8]
+        with self.connect() as connection:
+            self._check_scope(connection, scope)
+            return [json.loads(row[0]) for row in connection.execute("SELECT document FROM memory_entities WHERE profile_id=? AND kind='room' AND (entity_id=? OR EXISTS(SELECT 1 FROM json_each(json_extract(document,'$.labels')) WHERE instr(lower(value),lower(?))>0)) ORDER BY json_extract(document,'$.last_observed_unix_s') DESC LIMIT 8", (scope.profile_id, query.strip(), query.strip()))]
 
     def find_object_sightings(self, scope, query, pose=None):
         summary = self.memory_summary(scope, target=query, limit=64)
@@ -310,9 +321,13 @@ class SpatialMemoryStore:
             inspections = [json.loads(row[0]) for row in connection.execute("SELECT document FROM memory_events WHERE profile_id=? AND kind='search' AND observed_unix_s>=? ORDER BY observed_unix_s DESC LIMIT 128", (scope.profile_id, now - 300.))]
         candidates = []
         for item in summary["objects"]:
-            distance = math.dist(pose[:2], item["pose_m_rad"][:2]) if pose else None
+            compatible = not item["requires_revalidation"] and item.get("pose_frame", "map") == "map" and item["map_id"] == scope.map_id and item["frame_revision"] == scope.frame_revision
+            distance = math.dist(pose[:2], item["pose_m_rad"][:2]) if pose and compatible else None
             recent = any(record.get("target", "").casefold() == query.strip().casefold()
-                and record.get("result") == "not_seen" and record.get("visibility") == "adequate"
+                and record.get("result") == "not_seen" and compatible and record.get("frame", "map") == "map"
+                and record.get("frame_revision") == scope.frame_revision and record.get("head_rad") is not None and item.get("head_rad") is not None
+                and max(abs(first-second) for first, second in zip(record["head_rad"], item["head_rad"])) <= .1
+                and abs(math.atan2(math.sin(record["pose_m_rad"][2]-item["pose_m_rad"][2]), math.cos(record["pose_m_rad"][2]-item["pose_m_rad"][2]))) <= .1
                 and record["observed_unix_s"] >= item["last_observed_unix_s"]
                 and math.dist(record["pose_m_rad"][:2], item["pose_m_rad"][:2]) <= .25 for record in inspections)
             candidates.append({**item, "viewpoint_distance_m": distance, "recently_inspected": recent,
@@ -336,6 +351,13 @@ class SpatialMemoryStore:
                 belief = json.loads(document)
                 belief.update(requires_revalidation=True, status="requires_revalidation")
                 connection.execute("UPDATE memory_entities SET document=? WHERE profile_id=? AND entity_id=?", (json.dumps(belief), scope.profile_id, identity))
+            row = connection.execute("SELECT document FROM maps WHERE map_id=?", (scope.map_id,)).fetchone()
+            if row:
+                document = json.loads(row[0])
+                for place in document["places"]:
+                    place["requires_revalidation"] = True
+                document["frontier_attempts"] = {}
+                connection.execute("UPDATE maps SET document=? WHERE map_id=?", (json.dumps(document), scope.map_id))
 
     def checkpoint(self, scope, home, name):
         if not name.strip() or len(name) > 80 or home.identity != scope.map_id or home.profile_id != scope.profile_id:
@@ -344,6 +366,9 @@ class SpatialMemoryStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._check_scope(connection, scope)
+            linked = {place["place_id"] for place in document["places"]}
+            if connection.execute("SELECT 1 FROM memory_entities WHERE profile_id=? AND json_extract(document,'$.place_id') IS NOT NULL AND json_extract(document,'$.place_id') NOT IN (SELECT value FROM json_each(?)) LIMIT 1", (scope.profile_id, json.dumps(sorted(linked)))).fetchone():
+                raise ValueError("CHECKPOINT_PENDING: an observation viewpoint has not been published into the map")
             snapshot = {"map": document, "scope": scope.model_dump(), "entities": [json.loads(row[0]) for row in connection.execute("SELECT document FROM memory_entities WHERE profile_id=?", (scope.profile_id,))],
                 "event_ids": [row[0] for row in connection.execute("SELECT event_id FROM memory_events WHERE profile_id=?", (scope.profile_id,))],
                 "reviews": dict(connection.execute("SELECT reviews.event_id, reviews.document FROM memory_reviews reviews JOIN memory_events events ON reviews.event_id=events.event_id WHERE events.profile_id=?", (scope.profile_id,)).fetchall())}
@@ -377,6 +402,10 @@ class SpatialMemoryStore:
             connection.execute("INSERT INTO maps VALUES (?, ?, 1, ?, ?, ?)", (map_id, document["environment_id"], json.dumps(document), profile_id, revision))
             connection.execute("INSERT INTO memory_map_scopes VALUES (?, ?, ?, ?, ?)", (map_id, environment_id, revision, profile_id, snapshot["scope"]["frame_revision"]))
             event_ids = {identity: str(uuid4()) for identity in snapshot["event_ids"]}
+            for place in document["places"]:
+                if place.get("evidence_id") in event_ids:
+                    place["evidence_id"] = event_ids[place["evidence_id"]]
+            connection.execute("UPDATE maps SET document=? WHERE map_id=?", (json.dumps(document), map_id))
             for old_id, new_id in event_ids.items():
                 event = connection.execute("SELECT frame_revision, ingestion_key, kind, entity_id, observed_unix_s, document, evidence_id FROM memory_events WHERE event_id=?", (old_id,)).fetchone()
                 record = json.loads(event[5])

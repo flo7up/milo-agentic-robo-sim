@@ -95,7 +95,7 @@ class Lab:
         self.agent.record_sessions = self.recording_enabled
         self.agent.recording_root = self.recording_root
 
-    async def reset(self, challenge_id=None, orbit_target=None, orbit_direction=None, environment=None, reuse_saved_map=None, environment_instance_id=None):
+    async def reset(self, challenge_id=None, orbit_target=None, orbit_direction=None, environment=None, reuse_saved_map=None, environment_instance_id=None, *, restore_knowledge=False):
         async with self.lock:
             await self.agent.halt("Episode reset")
             await self.finish_home_recording("episode_reset")
@@ -128,7 +128,9 @@ class Lab:
             if saved_home and reuse_map:
                 await replacement.home_command(HomeRequest(run_id=replacement.latest["run_id"], episode_epoch=self.epoch,
                     action="load_map", map_id=saved_home["map_id"]))
-            await configure_memory(replacement, instance_id=instance_id, fresh=not reuse_map, name="Fresh exploration" if not reuse_map else "Default knowledge", reuse=reuse_map)
+            fresh_knowledge = challenge_id is not None and not reuse_map and not restore_knowledge
+            await configure_memory(replacement, instance_id=instance_id, fresh=fresh_knowledge,
+                name="Fresh exploration" if fresh_knowledge else "Default knowledge", reuse=not fresh_knowledge)
             if spatial_enabled:
                 await replacement.configure_spatial(SpatialSettings(run_id=replacement.latest["run_id"],
                     episode_epoch=self.epoch, enabled=True))
@@ -178,7 +180,7 @@ async def lifespan(app):
         lab.preference_error = "Saved preferences are unavailable; the original store was left unchanged."
     selection = ChallengeLoad.model_validate(saved_scene or {"challenge_id": "bench"})
     await lab.reset(selection.challenge_id, selection.orbit_target, selection.orbit_direction,
-        selection.environment, selection.reuse_saved_map, selection.environment_instance_id)
+        selection.environment, selection.reuse_saved_map, selection.environment_instance_id, restore_knowledge=True)
     if saved_scene is not None:
         lab.worker.stop()
         await lab.worker.hold_stopped()

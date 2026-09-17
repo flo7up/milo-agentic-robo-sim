@@ -62,9 +62,9 @@ def test_cancellation_requires_actual_motion_and_stale_rejection():
     assert not score_attempt("cancel", metrics)["passed"]
 
 
-def test_benchmark_map_preserves_geometry_and_original_document():
+def test_benchmark_map_preserves_geometry_and_original_document(tmp_path):
     from backend.home_mapping import HomeMap
-    from scripts.benchmark_household import HOME_ID, benchmark_map
+    from scripts.benchmark_household import HOME_ID, benchmark_map, write_map_copy
     home = HomeMap("shared_apartment_v1")
     home.evidence[180:220, 180:225] = -2
     home.places = [{"place_id": HOME_ID, "kind": "destination", "name": "Home", "pose_m_rad": [0., 0., 0.]}]
@@ -74,6 +74,11 @@ def test_benchmark_map_preserves_geometry_and_original_document():
     assert digest(document) == before
     assert derived["evidence"] == document["evidence"] and derived["visits"] == document["visits"]
     assert len(derived["places"]) == 2 and derived["places"][-1]["pose_m_rad"] == [.7, 0., 0.]
+    store = write_map_copy(tmp_path / "fixture.sqlite3", derived)
+    assert digest(store.load(derived["map_id"], derived["environment_id"]).document()) == digest(derived)
+    import json
+    with store.connect() as connection:
+        assert connection.execute("SELECT document FROM maps").fetchone()[0] == json.dumps(derived, allow_nan=False)
 
 
 async def test_missing_room_prerequisite_is_recorded_without_starting_physics(tmp_path):

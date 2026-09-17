@@ -3,7 +3,7 @@ import math
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
+from copy import copy, deepcopy
 from uuid import uuid4
 from typing import Literal
 
@@ -30,6 +30,7 @@ class MemoryRequest(StrictModel):
     visibility_limits: str = Field(default="", max_length=500)
     inspection_scope: Literal["viewpoint", "surface", "entrance"] = "viewpoint"
     object_bounds: list[float] | None = Field(default=None, min_length=4, max_length=4)
+    entity_id: str | None = Field(default=None, min_length=1, max_length=80)
 
 
 class MemorySession:
@@ -38,6 +39,8 @@ class MemorySession:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spatial-memory")
         self.pending = deque()
         self.active = True
+        self.observation_lock = asyncio.Lock()
+        self.closing = None
         self.error = None
         self.summary = {"scope": scope.model_dump(), "rooms": [], "objects": [], "connections": [],
             "search_history": [], "entrances": [], "counts": {}, "motion_authorized": False}
@@ -45,7 +48,7 @@ class MemorySession:
     def submit(self, function, *arguments, **keywords):
         while self.pending and self.pending[0].done():
             completed = self.pending.popleft()
-            if completed.exception():
+            if not completed.cancelled() and completed.exception() and not isinstance(completed.exception(), ValueError):
                 self.error = str(completed.exception())
         if not self.active or len(self.pending) >= 128:
             raise ValueError("MEMORY_WRITE_UNAVAILABLE: context closed or persistence queue full")
@@ -59,16 +62,18 @@ class MemorySession:
         self.pending.append(future)
         return future
 
-    def observe(self, observation, image=None, *, allow_new_entity=False, event_id=None):
-        return self.submit(self.store.ingest, self.scope, observation, image, allow_new_entity=allow_new_entity, event_id=event_id)
+    def observe(self, observation, image=None, *, allow_new_entity=False, event_id=None, validate=None):
+        return self.submit(self.store.ingest, self.scope, observation, image, allow_new_entity=allow_new_entity, event_id=event_id,
+            validate=validate)
 
     def observe_record(self, kind, record, image):
+        belief = next((item for item in self.summary.get("rooms", []) if item.get("place_id") == record.get("place_id")), None) if kind == "room" else None
         item = MemoryObservation(kind=kind, source_key=(record.get("place_id") or json_key(record.get("object_bounds", []))) + ":" + str(record.get("room_matches")),
             source="operator_camera" if record.get("source") == "operator_annotation" else "luna_camera",
             sequence=record["spatial_sequence"], frame_ref=record.get("frame_ref", str(record["spatial_sequence"])),
             observed_unix_s=record["observed_unix_s"], pose_m_rad=record.get("pose_m_rad", [0., 0., 0.]),
             head_rad=record.get("head_rad"), label=record["label"], description=record.get("evidence", ""),
-            confidence=record["confidence"], entity_id=record.get("place_id"), place_id=record.get("place_id"),
+            confidence=record["confidence"], entity_id=belief["entity_id"] if belief else record.get("place_id"), place_id=record.get("place_id"),
             position_m=record.get("position_m"), room_matches=record.get("room_matches"))
         return self.observe(item, image, allow_new_entity=kind == "room", event_id=record["observation_id"])
 
@@ -93,14 +98,20 @@ class MemorySession:
         return copied.revision
 
     async def close(self):
-        if not self.active:
-            return
-        self.active = False
-        future = self.executor.submit(self.store.close_context, self.scope)
+        if self.closing is None:
+            self.active = False
+            async def finish():
+                future = self.executor.submit(self.store.close_context, self.scope)
+                try:
+                    await asyncio.wrap_future(future)
+                finally:
+                    await asyncio.to_thread(self.executor.shutdown, wait=True, cancel_futures=True)
+            self.closing = asyncio.create_task(finish())
         try:
-            await asyncio.wrap_future(future)
-        finally:
-            await asyncio.to_thread(self.executor.shutdown, wait=True, cancel_futures=True)
+            await asyncio.shield(self.closing)
+        except asyncio.CancelledError:
+            await self.closing
+            raise
 
 
 def json_key(value):
@@ -114,6 +125,7 @@ async def configure_memory(worker, *, instance_id=None, profile_id=None, fresh=F
     if worker.latest.get("busy") or home.active:
         raise ValueError("MEMORY_BUSY: finish or stop the current task before switching knowledge")
     previous = worker.memory
+    expected = worker.stop_revision, worker.task_revision
     if previous:
         await persist_memory(worker)
         await previous.flush()
@@ -136,7 +148,7 @@ async def configure_memory(worker, *, instance_id=None, profile_id=None, fresh=F
         selected = await asyncio.to_thread(store.load, saved["map_id"], home.environment_id,
             profile_id=profile["profile_id"], environment_revision=descriptor["revision"])
     imported = []
-    if selected is None and not fresh and not profile_id and reuse and home.home and home.home.environment_revision == "legacy":
+    if selected is None and not fresh and not profile_id and reuse and home.home and home.home.environment_revision == "legacy" and getattr(home.home, "legacy_import_approved", False):
         selected = await worker.call(lambda sim: deepcopy(home.home))
         for kind in ("room", "object"):
             records = await asyncio.to_thread(store.room_observations if kind == "room" else store.object_observations, selected.identity)
@@ -152,8 +164,6 @@ async def configure_memory(worker, *, instance_id=None, profile_id=None, fresh=F
     seed = selected or HomeMap(home.environment_id)
     seed.profile_id, seed.environment_revision = profile["profile_id"], descriptor["revision"]
     seed.memory_environment_id = descriptor["environment_id"]
-    if previous:
-        await previous.close()
     scope = await asyncio.to_thread(store.open_context, seed, worker.latest["run_id"], worker.epoch)
     session = MemorySession(store, scope)
     try:
@@ -168,8 +178,9 @@ async def configure_memory(worker, *, instance_id=None, profile_id=None, fresh=F
         rooms = await asyncio.to_thread(store.room_observations, seed.identity)
         objects = await asyncio.to_thread(store.object_observations, seed.identity)
         def install(sim):
-            if worker.closed:
-                raise ValueError("STALE_MEMORY_CONTEXT: worker closed during profile selection")
+            if (worker.closed or worker.memory is not previous or expected != (worker.stop_revision, worker.task_revision)
+                    or home.active or worker.inference_owner):
+                raise ValueError("STALE_MEMORY_CONTEXT: authority changed during profile selection")
             home.invalidate("Knowledge profile changed; fresh localization required")
             home.home, home.task, home.workflow = selected, None, None
             home.room_records, home.object_records = rooms, objects
@@ -189,6 +200,8 @@ async def configure_memory(worker, *, instance_id=None, profile_id=None, fresh=F
             worker.memory_descriptor, worker.memory_profile = descriptor, profile
             worker.memory_catalog = [item for item in catalog if item["profile_id"] == profile["profile_id"]]
         await worker.call(install)
+        if previous:
+            await previous.close()
         await asyncio.to_thread(store.select_profile, descriptor["environment_id"], descriptor["revision"], profile["profile_id"])
         return await memory_state(worker)
     except BaseException:
@@ -204,6 +217,7 @@ async def persist_memory(worker):
     home = await worker.call(lambda sim: deepcopy(worker.home_mission.home))
     if home is None or not home.scan_count or not worker.home_mission.allow_expansion:
         return
+    home.places[:] = [place for place in home.places if not place.get("mission_id")]
     revision = await session.persist(home)
     catalog = await asyncio.to_thread(session.store.catalog)
     def apply(sim):
@@ -228,9 +242,18 @@ async def memory_state(worker):
         "generation": worker.memory_descriptor["generation"], "scenario_id": worker.memory_descriptor["scenario_id"]}
 
 
-async def record_observation(worker, *, context_id, kind, label="", description="", target="", result="inconclusive",
+async def record_observation(worker, **arguments):
+    session = worker.memory
+    if session is None:
+        raise ValueError("STALE_MEMORY_CONTEXT: no active knowledge profile")
+    async with session.observation_lock:
+        return await _record_observation(worker, **arguments)
+
+
+async def _record_observation(worker, *, context_id, kind, label="", description="", target="", result="inconclusive",
                              visibility="unknown", visibility_limits="", inspection_scope="viewpoint", bounds=None,
-                             entity_id=None, selected_evidence=None, confidence=.5, place_id=None, source="luna_camera"):
+                             entity_id=None, selected_evidence=None, confidence=.5, place_id=None, source="luna_camera",
+                             model_observation=None, mission=None):
     from backend.home_mapping import transform_pose
     from backend.spatial import measure_visible_region
     session = worker.memory
@@ -239,6 +262,7 @@ async def record_observation(worker, *, context_id, kind, label="", description=
     if kind not in {"room", "object", "search", "entrance"}:
         raise ValueError("Only the worker can report executed pathway evidence")
     expected = worker.stop_revision, worker.task_revision
+    frame_transform = tuple(worker.home_mission.transform) if worker.home_mission.transform is not None else None
     def capture(sim):
         if (worker.memory is not session or not session.active or sim.cancel.is_set() or expected != (worker.stop_revision, worker.task_revision)
                 or (worker.home_mission and worker.home_mission.active) or (worker.continuous and worker.continuous.active)):
@@ -250,6 +274,16 @@ async def record_observation(worker, *, context_id, kind, label="", description=
         if paired is None:
             raise ValueError("MEMORY_EVIDENCE_REQUIRED: capture paired camera/depth first")
         sensor, image = paired
+        if model_observation is not None:
+            if (model_observation.run_id != sensor.run_id or model_observation.episode_epoch != sensor.episode_epoch
+                    or list(model_observation.odometry_m_rad) != list(sensor.odometry_m_rad)
+                    or list(model_observation.head_rad) != list(sensor.head_rad)
+                    or model_observation.simulated_time_s != sensor.simulated_time_s
+                    or sim.frames.get(model_observation.frame_ref) != image):
+                raise ValueError("STALE_OBSERVATION: report requires its original paired camera image")
+        if mission is not None:
+            worker._mission_read_guard(sim, worker._mission_read_authority(mission))
+            mission.check((sim.run_id, sim.epoch, *expected))
         if (sensor.run_id != sim.run_id or sensor.episode_epoch != sim.epoch or not 0 <= time.monotonic()-sensor.captured_at <= 15.
                 or math.dist(sensor.odometry_m_rad[:2], sim.odometry[:2]) > .05):
             raise ValueError("STALE_OBSERVATION: memory requires the paired current viewpoint")
@@ -273,27 +307,65 @@ async def record_observation(worker, *, context_id, kind, label="", description=
             if item.get("source_key") == source_key and item.get("last_source_sequence") == sensor.sequence
             and item.get("last_run_id") == session.scope.run_id), None)
         linked = place_id or (previous.get("place_id") if previous else None)
+        associated = entity_id or (previous.get("entity_id") if previous else None)
+        if linked and localized:
+            existing_place = next((item for item in home.home.places if item["place_id"] == linked), None)
+            if existing_place and math.dist(existing_place["pose_m_rad"][:2], pose[:2]) > .2:
+                linked = None
+        if localized and kind == "room" and not linked:
+            room = next((item for item in session.summary.get("rooms", []) if item["label"] == label
+                and not item["requires_revalidation"] and math.dist(item["pose_m_rad"][:2], pose[:2]) <= .2), None)
+            if room:
+                linked, associated = room.get("place_id"), room["entity_id"]
+        staged_place = None
         if localized and kind in {"room", "object"} and not linked:
             try:
-                place = home.home.add_place(label[:60] + " " + str(uuid4())[:8], "room" if kind == "room" else "destination", pose, sim.robot_footprint()["radius_m"])
-                place.update(source="camera_room_hypothesis" if kind == "room" else "object_observation_viewpoint", identity_status="tentative")
-                linked = place["place_id"]
+                draft = copy(home.home)
+                draft.places, draft.edges = list(home.home.places), list(home.home.edges)
+                staged_place = draft.add_place(label[:60] + " " + str(uuid4())[:8], "room" if kind == "room" else "destination", pose, sim.robot_footprint()["radius_m"])
+                staged_place.update(source="camera_room_hypothesis" if kind == "room" else "object_observation_viewpoint", identity_status="tentative")
+                linked = staged_place["place_id"]
             except ValueError:
                 pass
-        if linked and not any(place["place_id"] == linked for place in home.home.places):
+        if linked and staged_place is None and (home.home is None or not any(place["place_id"] == linked for place in home.home.places)):
             raise ValueError("UNKNOWN_PLACE: sighting viewpoint belongs to another map")
         item = MemoryObservation(kind=kind, source_key=source_key,
             source=source, sequence=sensor.sequence, frame_ref=str(sensor.sequence),
             observed_unix_s=time.time()-(time.monotonic()-sensor.captured_at), pose_m_rad=pose,
             pose_frame="map" if localized else "wheel_odometry", head_rad=sensor.head_rad, label=label,
-            description=description, confidence=confidence, entity_id=entity_id, place_id=linked,
+            description=description, confidence=confidence, entity_id=associated, place_id=linked,
             position_m=position, metric_valid=localized, target=target, result=result,
             visibility=visibility, visibility_limits=visibility_limits, inspection_scope=inspection_scope)
-        return session.observe(item, image)
-    future = await worker.call(capture)
+        def still_current():
+            return (worker.memory is session and session.active and not worker.closed and not sim.cancel.is_set()
+                and expected == (worker.stop_revision, worker.task_revision)
+                and frame_transform == (tuple(home.transform) if home.transform is not None else None))
+        return session.observe(item, image, validate=still_current), staged_place
+    future, staged_place = await worker.call(capture)
     record = await asyncio.wrap_future(future)
-    if worker.memory is not session or not session.active or worker.closed:
-        raise ValueError("STALE_MEMORY_CONTEXT: memory write completed for an obsolete context")
+    def publish(sim):
+        if (worker.memory is not session or not session.active or worker.closed or sim.cancel.is_set()
+                or expected != (worker.stop_revision, worker.task_revision)):
+            raise ValueError("STALE_MEMORY_CONTEXT: memory write completed for an obsolete context")
+        home = worker.home_mission.home
+        if frame_transform != (tuple(worker.home_mission.transform) if worker.home_mission.transform is not None else None):
+            raise ValueError("STALE_MEMORY_CONTEXT: localization changed before publication")
+        if staged_place and home and home.identity == session.scope.map_id and record["place_id"] == staged_place["place_id"]:
+            if not any(place["place_id"] == staged_place["place_id"] for place in home.places):
+                staged_place.update(memory_entity_id=record["entity_id"], evidence_id=record["observation_id"])
+                home.places.append(staged_place)
+                home.annotations_dirty = True
+        if kind == "room" and record not in worker.home_mission.room_records:
+            worker.home_mission.room_records.insert(0, record)
+            del worker.home_mission.room_records[100:]
+        if kind == "object" and record not in worker.home_mission.object_records:
+            worker.home_mission.object_records.insert(0, record)
+            del worker.home_mission.object_records[64:]
+        if home and record.get("place_id") and not record["requires_revalidation"]:
+            for place in home.places:
+                if place["place_id"] == record["place_id"] and math.dist(place["pose_m_rad"][:2], record["pose_m_rad"][:2]) <= .2:
+                    place.update(requires_revalidation=False, memory_entity_id=record["entity_id"])
+    await worker.call(publish)
     return record
 
 
@@ -309,9 +381,16 @@ async def lookup_memory(worker, kind, query):
     elif kind == "get_search_history":
         records = await asyncio.wrap_future(session.submit(session.store.search_history, session.scope, query))
     else:
-        return {"status": "memory_summary", "summary": deepcopy(session.summary), "motion_authorized": False}
+        summary = deepcopy(session.summary)
+        summary["scope"] = {key: summary["scope"][key] for key in ("profile_id", "map_id", "frame_revision")}
+        summary["connections"] = [{key: value for key, value in item.items() if key != "path_m"} for item in summary["connections"]]
+        return {"status": "memory_summary", "summary": summary, "motion_authorized": False}
     if worker.memory is not session or not session.active:
         raise ValueError("STALE_MEMORY_CONTEXT: memory read belongs to an obsolete selection")
+    now = time.time()
+    for item in records:
+        observed = item.get("last_observed_unix_s", item.get("observed_unix_s", now))
+        item["age_s"] = now-observed if now >= observed else None
     return {"status": kind, "records": records, "motion_authorized": False}
 
 
@@ -326,15 +405,17 @@ async def memory_command(worker, request):
         return await record_observation(worker, context_id=request.context_id, kind=request.kind,
             label=request.label, description=request.description, target=request.query, result=request.result,
             inspection_scope=request.inspection_scope, visibility="partial", visibility_limits=request.visibility_limits,
-            bounds=request.object_bounds, source="operator_camera")
+            bounds=request.object_bounds, source="operator_camera", entity_id=request.entity_id)
     if worker.latest.get("busy") or worker.home_mission.active or worker.inference_owner:
         raise ValueError("MEMORY_BUSY: stop the active task before changing knowledge")
     if request.action == "checkpoint":
-        await persist_memory(worker)
-        copied = await worker.call(lambda sim: deepcopy(worker.home_mission.home))
-        if copied is None:
-            raise ValueError("MAP_REQUIRED: observe a map before saving a checkpoint")
-        await asyncio.wrap_future(session.submit(session.store.checkpoint, session.scope, copied, request.name))
+        async with session.observation_lock:
+            await persist_memory(worker)
+            copied = await worker.call(lambda sim: deepcopy(worker.home_mission.home))
+            if copied is None:
+                raise ValueError("MAP_REQUIRED: observe a map before saving a checkpoint")
+            copied.places[:] = [place for place in copied.places if not place.get("mission_id")]
+            await asyncio.wrap_future(session.submit(session.store.checkpoint, session.scope, copied, request.name))
         return await memory_state(worker)
     if request.action == "fork_checkpoint":
         fork = await asyncio.to_thread(session.store.fork_snapshot, session.scope.environment_id,
@@ -363,6 +444,10 @@ async def rotate_memory_context(worker):
 def track_memory_travel(home):
     worker, session = home.worker, home.worker.memory
     if not session or not home.pose or home.localization["status"] != "localized":
+        return
+    if (worker.sim.cancel.is_set() or home.captured_at is None or not 0 <= time.monotonic()-home.captured_at <= 1.
+            or worker.latest.get("proximity", {}).get("collisions")):
+        home.memory_path, home.memory_origin = [], None
         return
     pose = home.pose
     if home.memory_path and math.dist(pose[:2], home.memory_path[-1]) > .5:

@@ -93,6 +93,7 @@ class HomeMission:
         if session:
             home.profile_id, home.environment_revision = session.scope.profile_id, session.scope.environment_revision
             home.memory_environment_id = session.scope.environment_id
+            home.frame_revision = session.scope.frame_revision
         return home
 
     @property
@@ -101,6 +102,7 @@ class HomeMission:
 
     def fail(self, reason, status="failed"):
         worker = self.worker
+        self.memory_path, self.memory_origin = [], None
         if self.workflow and self.workflow["status"] in {"navigating_to_room", "awaiting_room_report", "returning"}:
             self.workflow.update(status=status, reason=reason)
         was_active = self.active
@@ -531,6 +533,8 @@ class HomeMission:
         place = next((place for place in self.home.places if place["place_id"] == identity), None)
         if place is None:
             raise ValueError("UNKNOWN_PLACE: select an existing named destination")
+        if place.get("requires_revalidation"):
+            raise ValueError("MEMORY_REVALIDATION_REQUIRED: place belongs to incompatible spatial evidence")
         return place
 
     def room_view_matches(self, pose, head):
@@ -619,7 +623,8 @@ class HomeMission:
                     timing_failure = worker.continuous.reason.startswith(("BUFFER_EXPIRED:", "BUFFER_EMPTY:", "MOTION_LEASE_EXPIRED:"))
                     if not timing_failure and task["kind"] == "explore" and not task.get("single_frontier") and task["frontier_id"]:
                         task.setdefault("rejected_frontiers", []).append(task["frontier_id"])
-                        self.home.mark_frontier(task["frontier_id"])
+                        if not getattr(worker, "memory", None):
+                            self.home.mark_frontier(task["frontier_id"])
                         task["target_m"] = None
                 worker.continuous = None
             if task["target_m"] is not None and math.dist(self.pose[:2], task["target_m"]) <= .15:
@@ -695,7 +700,8 @@ class HomeMission:
                 if task["kind"] != "explore" or task.get("single_frontier") or task["retries"] >= 2:
                     raise
                 task.setdefault("rejected_frontiers", []).append(task["frontier_id"])
-                self.home.mark_frontier(task["frontier_id"])
+                if not getattr(worker, "memory", None):
+                    self.home.mark_frontier(task["frontier_id"])
                 task["target_m"] = None
                 task["retries"] += 1
                 task["reason"] = "Selecting another frontier after map rejection: " + str(error)
@@ -825,6 +831,8 @@ class HomeMission:
             for place in home.places:
                 column, row = home.indices(place["pose_m_rad"][:2])
                 reachable = bool(components is not None and component and home.inside([column, row]) and components[row, column] == component)
+                if place.get("requires_revalidation"):
+                    reachable = False
                 result["places"].append({**place, "reachable": reachable,
                     "identity_status": place.get("identity_status", "operator_named_unreviewed")})
             result["room_graph"] = {"map_id": home.identity, "frame": "map", "timestamp_unix_s": time.time(),

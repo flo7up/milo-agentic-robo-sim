@@ -373,7 +373,7 @@ async def test_home_parking_redirect_clearance_evidence(tmp_path, monkeypatch, r
 
     monkeypatch.setattr(SimulationWorker, "_verify_navigation_rest", inspect_rest)
     try:
-        await test_unified_visual_object_approach_and_automatic_return(tmp_path, "redirect", record_property)
+        await test_unified_visual_object_approach_and_automatic_return(tmp_path, "redirect", record_property, False)
     finally:
         record_property("home_parking_clearance", json.dumps(snapshots))
     assert snapshots

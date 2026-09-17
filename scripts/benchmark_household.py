@@ -169,11 +169,15 @@ def benchmark_map(document):
 
 
 def write_map_copy(path, document):
-    from backend.home_mapping import MapStore
+    from backend.home_mapping import HomeMap, MapStore
     store = MapStore(path)
+    profile = store.selected_profile(document["environment_id"])
     with store.connect() as connection:
-        connection.execute("INSERT INTO maps VALUES (?, ?, ?, ?)",
-            (document["map_id"], document["environment_id"], document["revision"], json.dumps(document, allow_nan=False)))
+        connection.execute("INSERT INTO maps (map_id, environment_id, revision, document, profile_id, environment_revision) VALUES (?, ?, ?, ?, ?, 'legacy')",
+            (document["map_id"], document["environment_id"], document["revision"], json.dumps(document, allow_nan=False), profile["profile_id"]))
+    home = HomeMap.restore(document)
+    home.profile_id = profile["profile_id"]
+    store.bind_map(home)
     return store
 
 

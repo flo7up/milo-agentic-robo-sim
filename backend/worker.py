@@ -1116,6 +1116,11 @@ class SimulationWorker:
         return await self.call(operation)
 
     async def record_mission_room(self, mission, sensor, image, observation, decision):
+        if self.memory:
+            from backend.memory_session import record_observation
+            return await record_observation(self, context_id=self.memory.scope.context_id, kind="room",
+                label=decision.room_label, description=decision.evidence_text, confidence=decision.room_confidence,
+                selected_evidence=(sensor, image), model_observation=observation, mission=mission)
         from backend.home_mapping import transform_pose
         from uuid import uuid4
         import hashlib

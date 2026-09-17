@@ -88,6 +88,23 @@ def test_knowledge_profiles_checkpoint_restart_and_obsolete_api_context():
         assert client.get("/api/home").json()["localization"]["status"] == "unlocalized"
 
 
+def test_fresh_knowledge_is_not_recreated_on_reset_or_restart():
+    with TestClient(app) as client, client.websocket_connect("/api/live") as socket:
+        socket.receive_json()
+        response = client.post("/api/challenges/load", json={"challenge_id": "park", "reuse_saved_map": False,
+            "environment_instance_id": "restart-isolation-fixture"})
+        assert response.status_code == 200
+        initial = client.get("/api/memory").json()
+        assert client.post("/api/reset", json={}).status_code == 200
+        reset = client.get("/api/memory").json()
+        assert reset["scope"]["profile_id"] == initial["scope"]["profile_id"]
+        assert reset["scope"]["context_id"] != initial["scope"]["context_id"]
+    with TestClient(app) as client:
+        restored = client.get("/api/memory").json()
+        assert restored["scope"]["profile_id"] == initial["scope"]["profile_id"]
+        assert restored["scope"]["environment_id"] == "restart-isolation-fixture"
+
+
 def test_robot_power_preserves_scene_blocks_work_and_resumes_only_to_idle():
     with TestClient(app) as client:
         initial = client.get("/api/state").json()

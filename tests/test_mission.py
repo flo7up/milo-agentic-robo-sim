@@ -797,8 +797,9 @@ async def test_mission_half_turn_stays_in_place_refreshes_view_and_obeys_stop(tm
         await worker.close()
 
 
-@pytest.mark.parametrize("stop_phase", [None, "reply", "return", pytest.param("redirect", id="task-change-cabinet-to-home")])
-async def test_unified_visual_object_approach_and_automatic_return(tmp_path, stop_phase, record_property):
+@pytest.mark.parametrize("stop_phase,with_memory", [(None, False), ("reply", False), ("return", False),
+    pytest.param("redirect", False, id="task-change-cabinet-to-home"), pytest.param(None, True, id="persistent-memory")])
+async def test_unified_visual_object_approach_and_automatic_return(tmp_path, stop_phase, record_property, with_memory):
     import asyncio
     import base64
     from io import BytesIO
@@ -876,6 +877,9 @@ async def test_unified_visual_object_approach_and_automatic_return(tmp_path, sto
     try:
         await asyncio.wrap_future(worker.ready)
         worker.home_mission = HomeMission(worker, MapStore(tmp_path / "maps.sqlite3"))
+        if with_memory:
+            from backend.memory_session import configure_memory
+            await configure_memory(worker, instance_id="object-integration-fixture")
         if stop_phase == "redirect":
             request = {"run_id": worker.sim.run_id, "episode_epoch": worker.epoch}
             await worker.scan_continuous(ContinuousScan(**request, compact_arms=True))
@@ -956,6 +960,15 @@ async def test_unified_visual_object_approach_and_automatic_return(tmp_path, sto
             if event["title"] in {"Mission capability feedback", "Internal controller failure"}]}
         assert controller.mission.phase == "completed", controller.trace()
         assert set(controller.mission.receipts) == {"target", "return"}
+        if with_memory:
+            await worker.memory.flush()
+            assert worker.memory.error is None, worker.memory.error
+            sightings = worker.memory.store.object_observations(worker.memory.scope.map_id)
+            assert len(sightings) == 2, sightings
+            assert len({item["entity_id"] for item in sightings}) == 1
+            assert all(item["image_sha256"] and item["position_m"] and not item["identity_verified"] for item in sightings)
+            assert sightings[0]["spatial_sequence"] > sightings[1]["spatial_sequence"]
+            assert worker.memory.summary["objects"][0]["observation_count"] == 2
         assert np.linalg.norm(worker.sim.odometry[:2]) <= .15
         assert not worker.sim.proximity_sensors().collisions
         assert len(replies) == 4

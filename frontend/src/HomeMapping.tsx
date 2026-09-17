@@ -11,7 +11,7 @@ export type HomeState = {
   coverage: { free_m2: number; visited_cells: number; scan_count: number } | null;
   task: { status: string; reason: string; segments: number; retries: number; visited_frontiers: number } | null;
   error: string | null;
-  objects?: { observation_id: string; label: string; position_m: number[]; confidence: number;
+  objects?: { observation_id: string; label: string; position_m: number[] | null; confidence: number;
     observed_unix_s: number; currently_observed: boolean; supporting_images: string[] }[];
   expansion_allowed?: boolean;
   room_verification?: { status: string; identity_verified: boolean };
@@ -237,7 +237,7 @@ export function HomeMapping({ runId, epoch, connected, busy, stopped, request }:
         <ul>{state.objects.slice(0, objectLimit).map(observation => <li key={observation.observation_id}>
           <a href={observation.supporting_images[0]} target="_blank" rel="noreferrer"><img src={observation.supporting_images[0]} loading="lazy" alt={`Evidence for ${observation.label}`} /></a>
           <div><strong>{observation.label}</strong><span>{observation.currently_observed ? 'Currently observed' : 'Last seen'} / {new Date(observation.observed_unix_s * 1000).toLocaleString()}</span>
-            <small>{observation.position_m.map(value => value.toFixed(2)).join(', ')} m / {(observation.confidence * 100).toFixed(0)}% reported confidence</small></div>
+            <small>{observation.position_m ? `${observation.position_m.map(value => value.toFixed(2)).join(', ')} m` : 'Position unverified'} / {(observation.confidence * 100).toFixed(0)}% reported confidence</small></div>
         </li>)}</ul>
         {state.objects.length > objectLimit && <div className="home-map-toolbar"><button onClick={() => setObjectLimit(value => value + 5)}>Show more</button><button onClick={() => setObjectLimit(state.objects!.length)}>View all</button></div>}
       </details>}
