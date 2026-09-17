@@ -181,6 +181,65 @@ async def test_room_report_is_persisted_as_tentative_paired_evidence(tmp_path, f
         await worker.close()
 
 
+async def test_find_during_motion_stops_then_identifies_from_fresh_view(tmp_path, monkeypatch):
+    from backend.challenges import get_challenge
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.mission_supervisor import MappedReviewOperation
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(challenge=get_challenge("kitchen_bathroom"), rendering="enhanced", pace=True)
+    replies = [{"action": "plan", "plan": {"kind": "room", "target": "Kitchen", "completion": "identify"}},
+        {"action": "explore"},
+        {"action": "identify_target", "evidence_text": "Scripted moving view of kitchen fixtures"},
+        {"action": "identify_target", "evidence_text": "Scripted fresh stopped view of cooking appliances"}]
+    model = ScriptedModel([model_response("guide_mission", json.dumps(reply), call_id=f"find-moving-{index}")
+        for index, reply in enumerate(replies)])
+    controller = controller_for(model)
+    original_review = MappedReviewOperation.review
+    contacts = []
+    async def review_after_motion(mapped):
+        async with asyncio.timeout(25.):
+            while True:
+                result = await mapped.poll()
+                assert result["task"]["status"] == "running", result
+                if mapped.mission.objective.travel_m >= .15:
+                    break
+                await asyncio.sleep(.05)
+        mapped.reviewed_at = time.monotonic()-15.
+        return await original_review(mapped)
+    monkeypatch.setattr(MappedReviewOperation, "review", review_after_motion)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "moving-find.sqlite3"))
+        original_tick = worker.home_mission.tick
+        def tick():
+            original_tick()
+            contacts.extend(worker.sim.proximity_sensors().collisions)
+        monkeypatch.setattr(worker.home_mission, "tick", tick)
+        controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
+            map_context=True, images_per_request=2, mission_budget_s=90., max_turns=4, max_model_requests=4))
+        await asyncio.wait_for(controller.task, 100.)
+        assert controller.state["error"] is None, [event for event in controller.trace()["events"]
+            if event["title"] == "Internal controller failure"] or controller.state
+        assert controller.mission.phase == "completed" and len(model.inputs) == 4
+        moving = json.loads(model.inputs[2][-1]["content"][0]["text"])
+        stopped = json.loads(model.inputs[3][-1]["content"][0]["text"])
+        assert moving["mission"]["operation_id"] and not moving["mission"]["receipts"]
+        assert stopped["mission"]["operation_id"] is None and not stopped["mission"]["receipts"]
+        receipt = controller.mission.receipts["target"]
+        assert receipt["spatial_sequence"] == stopped["sensing"]["source_sequence"] > moving["sensing"]["source_sequence"]
+        assert receipt["evidence_text"] == replies[3]["evidence_text"] and not receipt["arrival_verified"]
+        deferred = [event for event in controller.trace()["events"] if event["title"] == "Moving mission decision deferred"]
+        assert len(deferred) == 1 and deferred[0]["payload"]["discarded_action"] == "identify_target"
+        assert not contacts and worker.latest["stopped"] and not controller.active
+        frozen = await worker.call(lambda sim: (sim.ticks, sim.odometry.tolist()))
+        await asyncio.sleep(.2)
+        assert await worker.call(lambda sim: (sim.ticks, sim.odometry.tolist())) == frozen
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
 class DelayedReviewModel(ScriptedModel):
     def __init__(self, duration=60.):
         replies = [{"action": "plan", "plan": {"kind": "room", "target": "Bathroom"}},

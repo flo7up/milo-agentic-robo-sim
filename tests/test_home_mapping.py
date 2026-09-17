@@ -145,6 +145,49 @@ def test_mapped_clearance_reuses_only_current_grid_and_checks_same_trajectory(tm
     assert calls == [.3, .4, .4]
 
 
+def test_clearance_distance_cache_matches_fresh_masks_and_invalidates(monkeypatch):
+    from backend import home_mapping
+    home = HomeMap("distance-cache")
+    home.evidence[185:220, 185:220] = -2
+    original = home_mapping.distance_transform_edt
+    calls = []
+    def measured(mask):
+        calls.append(1)
+        return original(mask)
+    monkeypatch.setattr(home_mapping, "distance_transform_edt", measured)
+    def check(radius, obstacles=()):
+        known = home.cells == 0
+        if obstacles:
+            indices = home.indices(obstacles)
+            indices = indices[home.inside(indices)]
+            known[indices[:, 1], indices[:, 0]] = False
+        expected = known & (original(np.pad(known, 1))[1:-1, 1:-1] * home.resolution_m > radius + home.resolution_m)
+        np.testing.assert_array_equal(home.allowed(radius, obstacles), expected)
+    check(.3)
+    check(.4)
+    home.evidence[190, 190] = -10
+    check(.3)
+    assert len(calls) == 1
+    check(.3, [[.5, 0.]])
+    assert len(calls) == 2
+    check(.4, [[.5, 0.], [.5, 0.]])
+    assert len(calls) == 2
+    check(.3)
+    assert len(calls) == 3
+    home.evidence[205, 205] = 4
+    check(.3)
+    assert len(calls) == 4
+    home.evidence[206, 206] = 0
+    check(.3)
+    assert len(calls) == 5
+    home.evidence[206, 206] = -1
+    check(.3)
+    assert len(calls) == 6
+    home.resolution_m = .2
+    check(.3)
+    assert len(calls) == 6
+
+
 def test_map_odometry_transform_round_trip():
     pose, transform = [1., 2., .4], [3., -2., 1.2]
     np.testing.assert_allclose(transform_pose(transform_pose(pose, transform), inverse_pose(transform)), pose)

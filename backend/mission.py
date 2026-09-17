@@ -7,18 +7,36 @@ from uuid import uuid4
 from pydantic import Field, model_validator
 
 from backend.contracts import StrictModel
+from backend.movement import MovementStep
 
 
 class MissionPlan(StrictModel):
-    kind: Literal["explore", "object", "room", "place", "circuit"]
+    kind: Literal["explore", "object", "room", "place", "circuit", "movement"]
     target: str = Field(default="", max_length=160,
         description="Short target label, at most 160 characters, e.g. Bathroom with toilet and sink. Do not copy the full task or its stages; the original user goal remains available.")
     return_home: bool = False
     circle_direction: Literal["clockwise", "counterclockwise"] = "clockwise"
+    movements: list[MovementStep] = Field(default_factory=list, max_length=8,
+        description="For movement tasks only: ordered signed drive distances (+forward/-backward) or turn angles (+left/counterclockwise, -right/clockwise). One complete spin is 2*pi radians; preserve requested repetitions.")
+    completion: Literal["identify", "arrive"] = Field(default="arrive",
+        description="Use identify for find/locate/spot an object or room: stop when identified in the current camera. Use arrive for go to/approach/get close/enter/move inside. Explicit arrival requirements take precedence over find.")
+
+    @model_validator(mode="after")
+    def completion_contract(self):
+        if self.kind == "movement":
+            if not self.movements or sum(abs(step.distance_m) for step in self.movements) > 4. or sum(abs(step.angle_rad) for step in self.movements) > 6*math.pi:
+                raise ValueError("Movement plan requires 1-8 steps, at most 4 m travel and 3 full turns total")
+            if self.return_home:
+                raise ValueError("Describe return motion as explicit movement steps")
+        elif self.movements:
+            raise ValueError("Movement steps require kind=movement")
+        if self.completion == "identify" and self.kind not in {"object", "room"}:
+            raise ValueError("Visual identification applies only to object or room tasks")
+        return self
 
 
 class MissionDecision(StrictModel):
-    action: Literal["plan", "explore", "navigate_frontier", "circle", "select_object", "approach_object", "verify_object", "navigate_place", "observe_room", "report_observation", "look", "turn", "wait", "finish", "lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"]
+    action: Literal["plan", "execute_movement", "explore", "navigate_frontier", "circle", "select_object", "approach_object", "verify_object", "identify_target", "navigate_place", "observe_room", "report_observation", "look", "turn", "wait", "finish", "lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"]
     plan: MissionPlan | None = None
     object_goal_id: str | None = None
     object_label: str = Field(default="", max_length=60)
@@ -51,9 +69,9 @@ class MissionDecision(StrictModel):
     def required_evidence(self):
         if self.action == "plan" and self.plan is None:
             raise ValueError("Planning requires the requested mission stages")
-        if self.action == "plan" and self.plan.kind == "explore" and self.plan.target.strip():
+        if self.plan is not None and self.plan.kind == "explore" and self.plan.target.strip():
             raise ValueError("Exploration-only plans must have an empty target. Finding and verifying a kitchen or other room requires kind=room; object and named-place goals require their corresponding kind.")
-        if self.action in {"select_object", "verify_object", "circle"}:
+        if self.action in {"select_object", "verify_object", "circle"} or (self.action == "identify_target" and self.object_bounds is not None):
             bounds = self.object_bounds
             if not bounds or not all(0 <= value <= 1 for value in bounds) or bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
                 raise ValueError("Object selection requires a current normalized image box")
@@ -67,6 +85,8 @@ class MissionDecision(StrictModel):
             raise ValueError("Select an exact currently supplied frontier identity")
         if self.action == "report_observation" and not self.evidence_text.strip():
             raise ValueError("Observation reporting requires current visual evidence")
+        if self.action == "identify_target" and not self.evidence_text.strip():
+            raise ValueError("Target identification requires current visual evidence")
         if self.search_target is not None and self.action != "report_observation":
             raise ValueError("Search evidence belongs to a current observation report")
         if self.room_label is not None or self.room_confidence is not None:
@@ -307,7 +327,9 @@ class Mission:
         if required not in self.receipts or (self.plan.return_home and "return" not in self.receipts):
             raise ValueError("Requested mission stages are not verified")
         self.phase = "completed"
-        self.reason = "Requested mission stages verified; independent evaluation remains separate"
+        self.reason = ("Target identified in the current camera; no approach or entry requested"
+            + ("; returned Home" if self.plan.return_home else "")
+            if self.plan.completion == "identify" else "Requested mission stages verified; independent evaluation remains separate")
 
     def finish(self, phase, reason):
         if phase not in self.terminal:

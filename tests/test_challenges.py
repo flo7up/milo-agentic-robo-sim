@@ -120,11 +120,12 @@ def test_inspection_shelf_case_is_distinct_from_yellow_target_without_geometry_c
 
 
 def test_presets_have_distinct_goals_and_private_geometry():
-    assert set(PRESETS) == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit"}
+    assert set(PRESETS) == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "movement_practice"}
     for preset in PRESETS.values():
         assert preset.goal and preset.objectives
         assert "objects" not in preset.public()
         assert "floor_size_m" not in preset.public()
+        assert "movement_program" not in preset.public()
         assert preset.category in {"Navigation", "Perception", "Manipulation"}
         assert all(isinstance(label, str) for label in preset.public()["objectives"])
         assert any(item.get("marker") for item in preset.scene())

@@ -45,10 +45,32 @@ after target verification. Keep reason to one short sentence and do not expose p
 """
 
 TASK_INSTRUCTIONS = {
-    "plan": """Use plan exactly once while mission.plan is null. Classify explore, object, room, place or circuit and preserve
-return_home. Use a target noun phrase <=160 characters (e.g. Kitchen with stove and oven), not a completion claim or full goal.
-A room-finding goal is kind=room even when exploration is needed to reach it. Example: find the kitchen ->
-{"action":"plan","plan":{"kind":"room","target":"Kitchen with cooking appliances","return_home":false}}.
+    "plan": """While mission.plan is null, include plan in your FIRST guide_mission call together with one useful
+action from available_actions. This accepts the plan and executes that action under the normal worker checks, without
+another plan-only round trip. Use action=plan alone only when no first action is yet justified.
+Classify explore, object, room, place, circuit or movement and preserve return_home only when explicitly requested.
+For explicit base motions (spin on the spot, rotate N times, forward/backward a distance), use kind=movement and
+action=execute_movement with an ordered plan.movements list. Drive distance_m is signed: positive forward,
+negative backward WITHOUT turning around. Turn angle_rad is positive left/counterclockwise, negative right/clockwise.
+One full spin is 6.283185307179586 radians; three spins are 18.84955592153876. If no direction is given, use left.
+Example: move 1 metre forward then backward -> movements=[{"kind":"drive","distance_m":1},{"kind":"drive","distance_m":-1}].
+Preserve order and repetitions; do not replace requested motion with exploration, a half-turn or a furniture circuit.
+Use a short target description and return_home=false. Limits: 8 steps, 1.5 m per drive, 4 m total travel, 3 full turns
+total. Report unsupported movements rather than silently truncating. The worker runs the measured sequence and stops.
+Set plan.completion=identify for plain find/locate/spot/show-me an object or room. Stop at the first confident CURRENT
+visual identification using identify_target; do not approach it, enter it, inspect its surroundings or keep touring.
+Set plan.completion=arrive for go to/visit/approach/get close to an object, or enter/move inside a room.
+Explicit arrival clauses take precedence: "find the kitchen and enter fully" is arrive, not identify.
+Examples: "find the TV" -> object/identify; "come close to the TV" -> object/arrive;
+"find the kitchen" -> room/identify; "move inside the kitchen" -> room/arrive.
+Use a target noun phrase <=160 characters (e.g. Kitchen with stove and oven), not a completion claim or full goal.
+A room-finding goal is kind=room even when exploration is needed to reach it. Example when exploration is needed:
+{"action":"explore","plan":{"kind":"room","target":"Kitchen with cooking appliances","completion":"identify","return_home":false}}.
+For a visible find target, use identify_target with current evidence_text and, for an object, its normalized object_bounds.
+For a visible object to approach, use select_object with its current image box and an object/arrive plan. For a remembered target,
+use lookup_room or find_object_sightings with the corresponding plan. For a circuit, use circle with the current
+image box and matching circuit direction. Do not approach or verify an object before selecting its current goal ID.
+After plan acceptance omit plan and keep the accepted goal; all subsequent receipt and freshness requirements remain.
 Use kind=explore with target="" only when exploration itself is the entire goal, with no semantic target to find or verify.
 A circuit is a measured lap, not object approach; preserve clockwise/counterclockwise. Do not simplify unsupported goals.""",
     "room": """Identify the requested room from current visible fixtures, not a label or scenario name. A sink alone is not
@@ -64,13 +86,23 @@ image box. Check shape and support, not color alone. Inspect before selecting wh
 circle_direction. The local worker measures the full lap and settling. Do not approximate a lap with in-place turns or confuse
 approach with circling. Inspect first when the object box is uncertain. A measured lap is not independent semantic identity proof.""",
     "explore": "Explore observed reachable space within the approved mission budget. Unknown or closed areas remain unverified.",
+    "movement": """Execute the accepted ordered movements with execute_movement once. The worker measures each
+distance or full turn and stops after the sequence; do not send one tool per motor update or repeat a completed step.
+Blocked/unknown space or lost sensors stops the sequence. No path search, target identification or extra finish needed.""",
+    "identify": """This is a FIND-ONLY task. As soon as the requested target is confidently identified in the CURRENT
+head image, use identify_target with concise evidence_text. For an object include its normalized [left,top,right,bottom]
+object_bounds. For a room cite distinguishing fixtures; a sink alone is not kitchen evidence. This ends the find task
+at the current position: no approach, room entry, arrival scan, extra look or finish call is required. If not yet visible,
+search using the observed map and memory, or look/turn for a justified new view. A saved sighting, room label, vague
+guess or old image is not current identification. Do not claim success from memory alone. Return Home only if requested.""",
 }
 
 MEMORY_INSTRUCTIONS = """When observation.spatial.memory is available, lookup_room, find_object_sightings,
 get_search_history and get_exploration_summary query only the active knowledge profile. memory_query defaults to the mission target.
 These are historical observations, not current visibility, room identity, clearance or arrival proof. Use a returned compatible
 place_id with navigate_place to revisit a remembered room or object observation viewpoint, then reacquire from the current image.
-Never navigate records marked requires_revalidation. Old object locations require new select_object and verify_object evidence.
+Never navigate records marked requires_revalidation. For completion=identify, stop with identify_target once visible;
+for completion=arrive, old object locations require new select_object and verify_object evidence.
 report_observation may include search_target, search_result, inspection_scope and visibility_limits for the actual current view.
 Entering a room or not seeing the target does not mean the whole room was searched or that the object is absent.
 Avoid repeating a recently inspected unchanged viewpoint without a concrete new reason; transit and fresh views remain allowed.
@@ -80,17 +112,19 @@ An explore reason mentioning a remembered target does not retarget generic explo
 def instructions_for(brief):
     plan = (brief.get("mission") or {}).get("plan")
     memory = (brief.get("observation") or {}).get("spatial", {}).get("memory")
-    return INSTRUCTIONS + "\n" + TASK_INSTRUCTIONS[plan["kind"] if plan else "plan"] + ("\n" + MEMORY_INSTRUCTIONS if memory else "")
+    task = "identify" if plan and plan.get("completion") == "identify" else plan["kind"] if plan else "plan"
+    return INSTRUCTIONS + "\n" + TASK_INSTRUCTIONS[task] + ("\n" + MEMORY_INSTRUCTIONS if memory else "")
 
 
 def tools(actions=None, frontier_ids=()):
     schema = MissionDecision.model_json_schema()
     selected = actions if actions is not None else schema["properties"]["action"]["enum"]
     fields = {"action", "reason"}
-    parameters = {"plan": {"plan"}, "explore": {"objective_duration_s", "objective_travel_m", "map_view"},
+    parameters = {"plan": {"plan"}, "execute_movement": set(), "explore": {"objective_duration_s", "objective_travel_m", "map_view"},
         "navigate_frontier": {"frontier_id", "objective_duration_s", "objective_travel_m", "map_view"},
         "select_object": {"object_label", "object_bounds"}, "approach_object": {"object_goal_id", "approach_side"},
         "verify_object": {"object_goal_id", "object_bounds"}, "circle": {"object_label", "object_bounds", "circle_direction"},
+        "identify_target": {"object_bounds", "evidence_text"},
         "navigate_place": {"place_id"}, "observe_room": {"place_id", "room_matches", "evidence_text"},
         "report_observation": {"evidence_text", "room_label", "room_confidence", "search_target", "search_result", "inspection_scope", "visibility_limits"},
         "lookup_room": {"memory_query"}, "find_object_sightings": {"memory_query"}, "get_search_history": {"memory_query"},
@@ -195,17 +229,31 @@ def authority(worker):
 
 def available_actions(mission, observation, object_state):
     if mission.plan is None:
-        return ["plan"]
+        actions = ["plan", "report_observation", "look", "turn", "wait", "explore", "select_object", "circle", "identify_target", "execute_movement"]
+        spatial = observation.spatial or {}
+        if spatial.get("frontiers"):
+            actions.append("navigate_frontier")
+        if any(place.get("reachable") for place in spatial.get("places", [])):
+            actions.append("navigate_place")
+        if spatial.get("memory"):
+            actions.extend(["lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"])
+        return actions
+    if mission.plan.kind == "movement":
+        return ["execute_movement"] if not mission.receipts else ["finish"]
     actions = ["report_observation", "look", "turn", "wait", "explore"]
     if (observation.spatial or {}).get("memory"):
         actions.extend(["lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"])
     if not mission.operation and mission.plan.kind in {"room", "place", "explore"} and (observation.spatial or {}).get("frontiers"):
         actions.append("navigate_frontier")
+    identifying = mission.plan.completion == "identify"
+    if identifying:
+        actions.append("identify_target")
     if mission.plan.kind == "object":
-        actions.append("select_object")
+        if not identifying:
+            actions.append("select_object")
         if any(place.get("reachable") and place.get("source") == "object_observation_viewpoint" for place in (observation.spatial or {}).get("places", [])):
             actions.append("navigate_place")
-        if object_state:
+        if object_state and not identifying:
             actions.extend(["approach_object", "verify_object"])
     elif mission.plan.kind == "circuit":
         actions.append("circle")
@@ -213,12 +261,27 @@ def available_actions(mission, observation, object_state):
         places = (observation.spatial or {}).get("places", [])
         if any(place.get("reachable") and (mission.plan.kind != "room" or place.get("kind") == "room") for place in places):
             actions.append("navigate_place")
-        if mission.plan.kind == "room" and mission.target_id:
+        if mission.plan.kind == "room" and mission.target_id and not identifying:
             actions.append("observe_room")
     receipt = "exploration" if mission.plan.kind == "explore" else "target"
     if receipt in mission.receipts and (not mission.plan.return_home or "return" in mission.receipts or receipt == "exploration"):
         actions.append("finish")
     return actions
+
+
+def accept_initial_action(mission, decision, observation):
+    if decision.action == "plan" or decision.plan is None:
+        return
+    if mission.plan is not None:
+        if mission.plan != decision.plan:
+            raise ValueError("Keep the accepted mission plan")
+        return
+    proposed = SimpleNamespace(plan=decision.plan, operation=None, target_id=None, receipts={})
+    if decision.action not in available_actions(proposed, observation, None):
+        raise ValueError("First action is unavailable for the requested mission kind or current observation")
+    if decision.action == "circle" and decision.circle_direction != decision.plan.circle_direction:
+        raise ValueError("First circuit action must preserve the requested direction")
+    mission.configure(decision.plan)
 
 
 async def mapped_operation(controller, worker, settings, action, *, place_id=None, frontier_id=None, returning=False):
@@ -493,7 +556,10 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
             controller.navigation_reply(decision.reason, source="controller" if local_exploration else "model")
         overview = decision.map_view == "overview"
         try:
+            accept_initial_action(mission, decision, observation)
             if decision.action in {"lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"}:
+                if mission.plan is None:
+                    raise ValueError("Interpret the requested mission before querying memory")
                 if decision.action not in payload["available_actions"]:
                     raise ValueError("MEMORY_UNAVAILABLE: no active knowledge context")
                 last = await lookup_memory(worker, decision.action, decision.memory_query or (mission.plan.target if mission.plan else ""))
@@ -529,6 +595,23 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
                     last = {"status": "planned", "plan": mission.plan.model_dump()}
             elif mission.plan is None:
                 raise ValueError("Interpret the requested mission before execution")
+            elif decision.action == "execute_movement":
+                if mission.plan.kind != "movement":
+                    raise ValueError("Measured movement requires a movement plan")
+                from backend.movement import execute_movements
+                token = mission.begin("navigating", authority(worker))
+                last = await execute_movements(controller, worker, settings, mission)
+                controller._check_live(worker, settings)
+                mission.end_operation(token, authority(worker), "target")
+                mission.receipts["target"].update(last)
+            elif decision.action == "identify_target":
+                token = mission.begin("inspecting", authority(worker))
+                last = await worker.identify_mission_target(mission, sensor, image, observation, decision)
+                controller._check_live(worker, settings)
+                mission.end_operation(token, authority(worker))
+                mission.receipts["target"] = {**last, "operation_id": token, "verified_at": time.monotonic()}
+                controller._trace("policy", "Target identified in current camera", {"mission_id": mission.identity, "result": last})
+                controller.navigation_reply(last["evidence_text"], source="model")
             elif decision.action == "report_observation":
                 if not 0 <= time.monotonic()-sensor.captured_at <= 15.:
                     raise ValueError("Observation report expired; inspect current evidence")
@@ -593,6 +676,8 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
             elif decision.action in {"select_object", "approach_object", "verify_object"}:
                 if mission.plan.kind != "object":
                     raise ValueError("Object capabilities require an object mission")
+                if mission.plan.completion == "identify":
+                    raise ValueError("Find-only tasks use identify_target from the current camera; approach was not requested")
                 if decision.action == "select_object":
                     mission.receipts.pop("target", None)
                     mission.receipts.pop("return", None)
@@ -624,6 +709,8 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
                 if mission.plan.kind == "place":
                     mission.receipts["target"] = {"place_id": decision.place_id, "verified_at": time.monotonic()}
             elif decision.action == "observe_room":
+                if mission.plan.completion == "identify":
+                    raise ValueError("Find-only room tasks use identify_target without requiring entry")
                 if mission.plan.kind != "room" or not mission.target_id or decision.place_id != mission.target_id:
                     raise ValueError("Navigate to the requested room before inspecting it")
                 last = await worker.home_command(HomeRequest(run_id=settings.run_id, episode_epoch=settings.episode_epoch,
@@ -662,6 +749,8 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
             mission.rejections = 0
         except (ValueError, MotionError) as error:
             controller._check_live(worker, settings)
+            if mission.plan and mission.plan.kind == "movement":
+                raise
             await mapped.close(str(error))
             mission.operation = None
             mission.rejections += 1

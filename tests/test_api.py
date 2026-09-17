@@ -1274,7 +1274,7 @@ def test_challenge_loading_resets_scene_goal_progress_and_preserves_model_config
         initial = client.get("/api/state").json()
         assert initial["challenge"] is None
         presets = client.get("/api/challenges").json()
-        assert {preset["id"] for preset in presets} == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit"}
+        assert {preset["id"] for preset in presets} == {"park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "movement_practice"}
         assert all("objects" not in preset for preset in presets)
         config = {"endpoint": "https://test.openai.azure.com", "models": [
             {"id": "model", "label": "Model", "deployment": "test-model"}]}

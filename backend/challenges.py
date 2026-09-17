@@ -4,10 +4,11 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from backend.contracts import BatterySensor, StrictModel
+from backend.movement import MovementStep
 
 
 ChallengeId = Literal["bench", "park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery",
-                      "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit"]
+                      "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "movement_practice"]
 Vector3 = Annotated[list[float], Field(min_length=3, max_length=3)]
 
 
@@ -67,6 +68,7 @@ class Challenge(StrictModel):
     search_target: str | None = None
     ordered_objectives: bool = False
     orbit: OrbitTask | None = None
+    movement_program: list[MovementStep] = Field(default_factory=list)
     floor_size_m: Annotated[list[Annotated[float, Field(ge=4, le=20)]], Field(min_length=2, max_length=2)] = Field(default_factory=lambda: [6, 6])
 
     def public(self):
@@ -98,6 +100,23 @@ class Challenge(StrictModel):
 
 
 PRESETS = {
+    "movement_practice": Challenge(id="movement_practice", title="Movement Practice", skill="Measured movement sequences",
+        floor_size_m=[8, 8], initial_head_pitch=.45,
+        goal="Move 1 meter straight forward, stop, then move 1 meter straight backward without turning around and stop. Finally spin one full turn counterclockwise on the spot and stop. Keep the arms folded and hold still for half a second after each step.",
+        objects=[
+            {"name": "back_wall", "size": [.1, 7.8, 1.], "position": [3.9, 0., .5], "color": [.65, .72, .70, 1.]},
+            {"name": "practice_west_wall", "size": [.1, 7.8, 1.], "position": [-3.9, 0., .5], "color": [.75, .77, .72, 1.]},
+            {"name": "practice_north_wall", "size": [7.8, .1, 1.], "position": [0., 3.9, .5], "color": [.75, .77, .72, 1.]},
+            {"name": "practice_south_wall", "size": [7.8, .1, 1.], "position": [0., -3.9, .5], "color": [.75, .77, .72, 1.]},
+            *[{"name": f"practice_mark_{index}", "size": [.025, 2.4, .002], "position": [float(index), 0., .001],
+                "color": [.3, .45, .5, 1.], "marker": True} for index in range(-2, 3)],
+            {"name": "practice_front_landmark", "size": [.35, .7, .9], "position": [1.8, 2.1, .45], "color": [.25, .5, .45, 1.]},
+            {"name": "practice_side_landmark", "size": [.65, .35, .7], "position": [.7, -2., .35], "color": [.65, .45, .2, 1.]},
+            {"name": "practice_landmark", "size": [.4, .4, .8], "position": [-2.8, 2.8, .4], "color": [.75, .3, .4, 1.]}],
+        movement_program=[MovementStep(kind="drive", distance_m=1.), MovementStep(kind="drive", distance_m=-1.),
+            MovementStep(kind="turn", angle_rad=2*math.pi)],
+        objectives=[Objective(label=label, body="robot", center=[0., 0., 0.], size=[1., 1.], color=[.3, .5, .6, 1.],
+            require_lift=False, visible_zone=False) for label in ("Forward 1 metre and stop", "Backward 1 metre and stop", "Spin once counterclockwise on the spot and stop")]),
     "local_park": Challenge(
         id="local_park", title="Local Model Parking", skill="Fine-tuned navigation / green-bay parking",
         goal="Drive into the green floor bay and stop. Keep clear of the posts and walls.", initial_head_pitch=.45,
@@ -687,6 +706,54 @@ class ChallengeProgress:
         self.orbit_lap = False
         self.orbit_contact = False
         self.orbit_dwell_s = 0.
+        self.movement_stage = 0
+        self.movement_start = None
+        self.movement_previous = None
+        self.movement_angle = 0.
+        self.movement_dwell = 0.
+        self.movement_failed = False
+
+    def _update_movement(self, measurement, simulated_time_s):
+        position, heading = measurement["position_xy"], measurement["heading_rad"]
+        elapsed = max(0., simulated_time_s-self.last_time)
+        self.last_time = simulated_time_s
+        self.movement_failed |= measurement["contact"] or not measurement["grounded"]
+        if self.movement_previous is not None:
+            previous_position, previous_heading = self.movement_previous
+            angle = math.atan2(math.sin(heading-previous_heading), math.cos(heading-previous_heading))
+            if math.dist(position, previous_position) > max(.01, elapsed*.55) or abs(angle) > max(.01, elapsed*.6):
+                self.movement_failed = True
+            self.movement_angle += angle
+        self.movement_previous = (list(position), heading)
+        if self.movement_start is None:
+            self.movement_start = (list(position), heading)
+        index = min(self.movement_stage, len(self.challenge.movement_program)-1)
+        step = self.challenge.movement_program[index]
+        start, start_heading = self.movement_start
+        forward = (position[0]-start[0])*math.cos(start_heading)+(position[1]-start[1])*math.sin(start_heading)
+        lateral = -(position[0]-start[0])*math.sin(start_heading)+(position[1]-start[1])*math.cos(start_heading)
+        eligible = (abs(forward-step.distance_m) <= .04 and abs(lateral) <= .04 and abs(self.movement_angle) <= .08
+            if step.kind == "drive" else abs(self.movement_angle-step.angle_rad) <= .08 and math.dist(position, start) <= .03)
+        if (step.kind == "turn" and (math.dist(position, start) > .03
+            or self.movement_angle*math.copysign(1., step.angle_rad) < -.08
+            or abs(self.movement_angle) > abs(step.angle_rad)+.08)) or (step.kind == "drive" and
+            (abs(lateral) > .04 or abs(self.movement_angle) > .08
+            or forward*math.copysign(1., step.distance_m) < -.04 or abs(forward) > abs(step.distance_m)+.04)):
+            self.movement_failed = True
+        resting = measurement["speed"] < .025 and measurement["angular_speed"] < .15
+        self.movement_dwell = self.movement_dwell + elapsed if eligible and resting and not self.movement_failed else 0.
+        if self.movement_stage < len(self.challenge.movement_program) and self.movement_dwell >= .5:
+            self.movement_stage += 1
+            if self.movement_stage < len(self.challenge.movement_program):
+                self.movement_start = (list(position), heading)
+                self.movement_angle = self.movement_dwell = 0.
+        complete = self.movement_stage == len(self.challenge.movement_program) and eligible and resting and not self.movement_failed
+        progress = [{"label": objective.label, "complete": ordinal < self.movement_stage and not self.movement_failed,
+            "detail": "Movement interrupted by contact or drift" if self.movement_failed else "Complete" if ordinal < self.movement_stage else "Pending"}
+            for ordinal, objective in enumerate(self.challenge.objectives)]
+        self.status = {**self.challenge.public(), "status": "failed" if self.movement_failed else "completed" if complete else "in_progress",
+            "completed_objectives": sum(item["complete"] for item in progress), "progress": progress}
+        return self.status
 
     def _update_orbit(self, measurement, simulated_time_s):
         task = self.challenge.orbit
@@ -763,6 +830,8 @@ class ChallengeProgress:
         return self.status
 
     def update(self, measurements, held, simulated_time_s=0, travel_m=0):
+        if self.challenge.movement_program:
+            return self._update_movement(measurements["robot"], simulated_time_s)
         if self.challenge.orbit:
             return self._update_orbit(measurements["robot"], simulated_time_s)
         if self.challenge.id == "pedestrian_crossing":

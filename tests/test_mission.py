@@ -356,7 +356,8 @@ async def test_exploration_plan_cannot_disable_requested_luna_supervision(tmp_pa
         assert json.loads(model.inputs[-1][-1]["content"][0]["text"])["mission"]["plan"]["kind"] == ("room" if bad_target else "explore")
         if bad_target:
             correction = json.loads(model.inputs[1][-1]["content"][0]["text"])
-            assert correction["mission"]["plan"] is None and correction["available_actions"] == ["plan"]
+            assert correction["mission"]["plan"] is None
+            assert {"plan", "execute_movement"} <= set(correction["available_actions"])
             assert "kind=room" in correction["last_execution"]["reason"]
         assert worker.home_mission.task is None
         assert worker.latest["stopped"] and not controller.active
@@ -649,7 +650,7 @@ def test_mission_reports_current_fixtures_without_unlocking_arrival_or_replannin
     from backend.mission_supervisor import available_actions
     mission = Mission("run", 0, 0, 0, deadline=60., clock=lambda: 0.)
     observation = SimpleNamespace(spatial={"places": [{"place_id": "home", "kind": "place", "reachable": True}]})
-    assert available_actions(mission, observation, None) == ["plan"]
+    assert {"plan", "execute_movement"} <= set(available_actions(mission, observation, None))
     mission.configure(MissionPlan(kind="room", target="Bathroom with toilet and sink"))
     assert available_actions(mission, observation, None) == ["report_observation", "look", "turn", "wait", "explore"]
     report = MissionDecision(action="report_observation", evidence_text="Visible oven and worktop suggest a kitchen")
@@ -673,7 +674,8 @@ async def test_mission_recovers_starting_room_report_then_executes_next_action(t
     from backend.worker import SimulationWorker
     from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
     evidence = "Starting room appears to be a kitchen: visible oven, cabinets and worktop."
-    plan = {"kind": "room", "target": "Bathroom with toilet and sink", "return_home": False, "circle_direction": "clockwise"}
+    plan = {"kind": "room", "target": "Bathroom with toilet and sink", "return_home": False, "circle_direction": "clockwise",
+        "completion": "arrive", "movements": []}
     replies = [{"action": "plan", "plan": plan},
         {"action": "observe_room", "room_matches": False, "evidence_text": evidence}]
     if repeat_plan:
@@ -693,7 +695,7 @@ async def test_mission_recovers_starting_room_report_then_executes_next_action(t
         deadline = controller.mission.deadline
         await asyncio.wait_for(controller.task, 70.)
         payloads = [json.loads(inputs[-1]["content"][0]["text"]) for inputs in model.inputs]
-        assert payloads[0]["available_actions"] == ["plan"]
+        assert {"plan", "execute_movement"} <= set(payloads[0]["available_actions"])
         assert all("plan" not in payload["available_actions"] for payload in payloads[1:])
         assert "report_observation" in payloads[2]["last_execution"]["reason"]
         assert all(payload["mission"]["plan"] == plan for payload in payloads[1:])

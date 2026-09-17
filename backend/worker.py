@@ -332,6 +332,8 @@ class SimulationWorker:
     def _tick_navigation(self):
         self.navigation_tick_at = time.monotonic() + .05
         try:
+            if getattr(self, "movement_guard", None) is not None:
+                self.movement_guard(self.sim)
             if self.continuous and self.continuous.active:
                 self._update_continuous()
             self.navigation.tick(self.sim)
@@ -343,7 +345,8 @@ class SimulationWorker:
                 if self.continuous and self.continuous.active:
                     self.continuous.status, self.continuous.reason = "cancelled", self.navigation.reason
             else:
-                self.navigation.fail(self.sim, "EXECUTION_FAILED: Navigation worker stopped.")
+                self.navigation.fail(self.sim, str(error) if getattr(self, "movement_guard", None) is not None
+                    else "EXECUTION_FAILED: Navigation worker stopped.")
                 if self.continuous and self.continuous.active:
                     self.continuous.status, self.continuous.reason = "blocked", f"Execution stopped: {type(error).__name__}"
         self._publish_navigation()
@@ -1114,6 +1117,51 @@ class SimulationWorker:
                 observation = observation.model_copy(update={"spatial": {**observation.spatial, "frontiers": candidates[:4]}})
             return sensor, image, observation
         return await self.call(operation)
+
+    async def identify_mission_target(self, mission, sensor, image, observation, decision):
+        import hashlib
+        expected = self._mission_read_authority(mission)
+        def validate(sim):
+            self._mission_read_guard(sim, expected)
+            mission.check(expected[:4])
+            if not mission.plan or mission.plan.completion != "identify" or mission.plan.kind not in {"object", "room"}:
+                raise ValueError("Visual identification cannot complete an approach or room-entry task")
+            if decision.action != "identify_target" or not decision.evidence_text.strip():
+                raise ValueError("Target identification requires current visual evidence")
+            if mission.plan.kind == "object" and decision.object_bounds is None:
+                raise ValueError("Object identification requires its current image box")
+            if ((self.home_mission and self.home_mission.active) or (self.continuous and self.continuous.active)
+                    or mission.objective and mission.objective.status == "active"):
+                raise ValueError("Stop the active route and identify from a fresh stopped view")
+            current = sim.observe(render=False)
+            heading = current.odometry_m_rad[2] - sensor.odometry_m_rad[2]
+            if (sensor.run_id != sim.run_id or sensor.episode_epoch != sim.epoch
+                    or not 0 <= time.monotonic()-sensor.captured_at <= 15.
+                    or observation.run_id != sensor.run_id or observation.episode_epoch != sensor.episode_epoch
+                    or list(observation.odometry_m_rad) != list(sensor.odometry_m_rad)
+                    or list(observation.head_rad) != list(sensor.head_rad)
+                    or observation.simulated_time_s != sensor.simulated_time_s
+                    or sim.frames.get(observation.frame_ref) != image
+                    or math.dist(current.odometry_m_rad[:2], sensor.odometry_m_rad[:2]) > .05
+                    or abs(math.atan2(math.sin(heading), math.cos(heading))) > .05
+                    or max(abs(actual-previous) for actual, previous in zip(current.head_rad, sensor.head_rad)) > .05):
+                raise ValueError("Target identification requires the original current camera at the unchanged viewpoint")
+            return {"status": "target_identified", "completion": "identify", "target": mission.plan.target,
+                "evidence_text": decision.evidence_text, "object_bounds": decision.object_bounds,
+                "observation_seq": observation.seq, "spatial_sequence": sensor.sequence, "frame_ref": observation.frame_ref,
+                "source_run_id": sensor.run_id, "source_episode_epoch": sensor.episode_epoch,
+                "image_sha256": hashlib.sha256(image).hexdigest(),
+                "identity_verified": False, "arrival_verified": False, "motion_authorized": False,
+                "source": "model_reported_current_camera"}
+        result = await self.call(validate)
+        if self.memory:
+            from backend.memory_session import record_observation
+            record = await record_observation(self, context_id=self.memory.scope.context_id, kind=mission.plan.kind,
+                label=mission.plan.target[:60], description=decision.evidence_text, bounds=decision.object_bounds,
+                selected_evidence=(sensor, image), model_observation=observation, mission=mission)
+            result["memory_observation_id"] = record["observation_id"]
+            await self.call(validate)
+        return result
 
     async def record_mission_room(self, mission, sensor, image, observation, decision):
         if self.memory:

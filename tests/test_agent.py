@@ -1316,6 +1316,14 @@ if __name__ == "__main__":
         async def respond(self, profile, reasoning, goal, inputs):
             if getattr(self, "unified_mission", False):
                 self.inputs.append(inputs)
+                from backend.challenges import get_challenge
+                import math
+                practice = get_challenge("movement_practice")
+                if goal in {practice.goal, "Spin three times around on the spot."}:
+                    steps = [step.model_dump() for step in practice.movement_program] if goal == practice.goal else [
+                        {"kind": "turn", "angle_rad": 6*math.pi}]
+                    return model_response("guide_mission", json.dumps({"action": "execute_movement",
+                        "plan": {"kind": "movement", "target": "Scripted movement fixture", "movements": steps}}), call_id="movement")
                 if len(self.inputs) == 1:
                     return model_response("guide_mission", json.dumps({"action": "plan", "plan": {"kind": "explore"},
                         "reason": "Scripted unified mission fixture"}), call_id="mission-plan")

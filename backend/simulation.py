@@ -152,9 +152,10 @@ class BulletSimulation:
             crossing["yielded"] |= crossing["yield_s"] >= .4
             measurement.update(pedestrian_contact=crossing["contact"], yielded=crossing["yielded"],
                                pedestrian_passed=crossing["elapsed_s"] >= 4.)
-        if challenge.orbit:
-            position = bullet.getBasePositionAndOrientation(self.robot, physicsClientId=self.client)[0]
-            measurements["robot"].update(position_xy=list(position[:2]), contact=bool(self.proximity_sensors().collisions))
+        if challenge.orbit or challenge.movement_program:
+            position, orientation = bullet.getBasePositionAndOrientation(self.robot, physicsClientId=self.client)
+            measurements["robot"].update(position_xy=list(position[:2]), contact=bool(self.proximity_sensors().collisions),
+                heading_rad=bullet.getEulerFromQuaternion(orientation)[2])
         if challenge.search_target:
             target = next(item["id"] for item in self.objects if item["name"] == challenge.search_target)
             target_position = np.array(bullet.getBasePositionAndOrientation(target, physicsClientId=self.client)[0])

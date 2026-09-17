@@ -1,5 +1,5 @@
 import {test, expect} from '@playwright/test';
-import {mkdtemp, readFile, realpath, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, realpath, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import type {LiveState, NavigationDiagnostics} from '../src/types';
@@ -863,5 +863,107 @@ test('unified mission shows actual observed map input and Stop revokes the share
   await writeFile('../.runtime/recording-settings-v1/browser-recording.json',JSON.stringify({evidence:'scripted_inference_real_physics',
     destination:recording.run_directory,samples:score.samples,complete:score.complete_recording,archive_id:batch.id},null,2));
   await expect(composer).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
+test('movement practice renders, completes a measured sequence and stops a custom spin', async ({page,request}) => {
+  test.setTimeout(240000);
+  const errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));
+  await request.post('/api/preferences',{data:{exploration_budget:150,max_model_requests:2,recording_enabled:false}});
+  await page.setViewportSize({width:1440,height:1000});
+  await page.goto('/');
+  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+  const menu=page.getByRole('dialog',{name:'Load challenge',exact:true});
+  const selector=menu.getByRole('combobox',{name:'Predefined challenge',exact:true});
+  await selector.selectOption('movement_practice');
+  await menu.getByRole('combobox',{name:'Map source',exact:true}).selectOption('none');
+  await menu.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await expect(menu).toBeHidden();
+  await expect(page.getByRole('heading',{name:'Movement Practice',exact:true})).toBeVisible();
+  const canvas=page.locator('.spectator canvas');
+  const colors=()=>canvas.evaluate((surface:HTMLCanvasElement)=>{
+    const context=surface.getContext('webgl2')!;
+    const data=new Uint8Array(surface.width*surface.height*4);
+    context.readPixels(0,0,surface.width,surface.height,context.RGBA,context.UNSIGNED_BYTE,data);
+    const distinct=new Set<string>();
+    for(let offset=0;offset<data.length;offset+=160) distinct.add(`${data[offset]},${data[offset+1]},${data[offset+2]}`);
+    return distinct.size;
+  });
+  await expect.poll(colors).toBeGreaterThan(30);
+  if(process.env.MILO_CAPTURE_PREVIEWS==='1') {
+    const encoded=await canvas.evaluate((surface:HTMLCanvasElement)=>{
+      const original=document.createElement('canvas');original.width=surface.width;original.height=surface.height;
+      const originalContext=original.getContext('2d')!;originalContext.drawImage(surface,0,0);
+      const data=originalContext.getImageData(0,0,surface.width,surface.height).data;
+      let left=surface.width,right=0,top=surface.height,bottom=0;
+      for(let row=0;row<surface.height;row+=2) for(let column=0;column<surface.width;column+=2) {
+        const offset=(row*surface.width+column)*4;
+        if(Math.max(...[0,1,2].map(channel=>Math.abs(data[offset+channel]-data[channel])))<=8) continue;
+        left=Math.min(left,column);right=Math.max(right,column);top=Math.min(top,row);bottom=Math.max(bottom,row);
+      }
+      left=Math.max(0,left-20);right=Math.min(surface.width,right+20);
+      top=Math.max(0,top-20);bottom=Math.min(surface.height,bottom+20);
+      const cropWidth=Math.max(1,right-left),cropHeight=Math.max(1,bottom-top);
+      const image=document.createElement('canvas');image.width=480;image.height=300;
+      const context=image.getContext('2d')!;
+      context.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--cp-surface-soft').trim();
+      context.fillRect(0,0,480,300);
+      const scale=Math.min(480/cropWidth,300/cropHeight);
+      context.drawImage(original,left,top,cropWidth,cropHeight,(480-cropWidth*scale)/2,(300-cropHeight*scale)/2,cropWidth*scale,cropHeight*scale);
+      return image.toDataURL('image/webp',.9).split(',')[1];
+    });
+    const directory=new URL('../public/scenario-previews/',import.meta.url);
+    await mkdir(directory,{recursive:true});
+    await writeFile(new URL('movement_practice.webp',directory),Buffer.from(encoded,'base64'));
+  }
+  for(const width of [1440,390,320]) {
+    await page.setViewportSize({width,height:1000});
+    await expect.poll(colors).toBeGreaterThan(30);
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await canvas.scrollIntoViewIfNeeded();
+    await page.screenshot({path:`../.runtime/movement-practice-v1/scene-${width}.png`});
+    await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+    if(process.env.MILO_CAPTURE_PREVIEWS!=='1') {
+      await expect(menu.getByAltText('Scene preview: Movement Practice')).toHaveJSProperty('naturalWidth',480);
+    }
+    expect(await menu.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+    await page.screenshot({path:`../.runtime/movement-practice-v1/picker-${width}.png`});
+    await menu.getByRole('button',{name:'Close challenge menu',exact:true}).click();
+  }
+  await page.setViewportSize({width:1440,height:1000});
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect.poll(async()=>(await(await request.get('/api/agent')).json()).mission?.phase,{timeout:150000}).toBe('completed');
+  await expect.poll(async()=>(await(await request.get('/api/agent')).json()).active).toBe(false);
+  const completed:LiveState=await(await request.get('/api/state')).json();
+  expect(completed.agent.error).toBeNull();
+  expect(completed.challenge?.status).toBe('completed');
+  expect(completed.challenge?.completed_objectives).toBe(3);
+  expect(completed.agent.inference_budget?.requests).toBe(1);
+  expect(completed.stopped).toBe(true);
+  await page.screenshot({path:'../.runtime/movement-practice-v1/completed.png'});
+  const resetting=page.waitForResponse(response=>response.url().endsWith('/api/reset') && response.request().method()==='POST');
+  await page.getByRole('button',{name:'Reset episode',exact:true}).click();
+  expect((await resetting).ok()).toBe(true);
+  await expect.poll(async()=>(await(await request.get('/api/state')).json()).run_id).not.toBe(initial.run_id);
+  const reset:LiveState=await(await request.get('/api/state')).json();
+  await expect(page.locator('.viewport-footer')).toContainText(`Epoch ${reset.episode_epoch}`);
+  const composer=page.getByRole('textbox',{name:'New run instruction',exact:true});
+  await expect(composer).toBeEnabled();
+  await composer.fill('Spin three times around on the spot.');
+  const starting=page.waitForResponse(response=>response.url().endsWith('/api/mission/start') && response.request().method()==='POST');
+  await page.getByRole('button',{name:'Send instruction',exact:true}).click();
+  expect((await starting).ok()).toBe(true);
+  await expect(page.getByRole('log',{name:'Run conversation',exact:true})).toContainText('Spin three times around on the spot.');
+  await expect.poll(async()=>{
+    const state:LiveState=await(await request.get('/api/state')).json();
+    const rotation=state.snapshot.poses.find(pose=>pose.key===`${state.robot_body_id}:-1`)!.quaternion;
+    return Math.abs(2*Math.atan2(rotation[2],rotation[3]));
+  },{timeout:60000}).toBeGreaterThan(.15);
+  await page.getByRole('button',{name:'Stop',exact:true}).click();
+  await expect.poll(async()=>(await(await request.get('/api/agent')).json()).active).toBe(false);
+  const stopped:LiveState=await(await request.get('/api/state')).json();
+  expect(stopped.agent.mission?.phase).toBe('cancelled');expect(stopped.stopped).toBe(true);
+  expect((await(await request.get('/api/state')).json()).snapshot).toEqual(stopped.snapshot);
   expect(errors).toEqual([]);
 });

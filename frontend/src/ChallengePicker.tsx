@@ -21,6 +21,7 @@ const scenarioNotes: Record<ChallengeId, { summary: string; completion: string }
   pedestrian_crossing: { summary: 'A walking person crosses the robot\'s route before a green parking bay.', completion: 'Yield without contact, let the person cross, then park fully in the bay.' },
   flat_kitchen: { summary: 'A furnished five-room flat with a central hallway and multiple doorways. Find the kitchen.', completion: 'Park fully inside the kitchen and remain at rest for half a simulated second.' },
   furniture_circuit: { summary: 'A spacious room with a table, sofa, chair and floor lamp. Choose one object to circle.', completion: 'Complete a lap in the selected direction without contact, then stop near the circuit start.' },
+  movement_practice: { summary: 'An open movement course with one-meter floor markings.', completion: 'Move one meter forward, reverse one meter without turning, then spin counterclockwise once. Stop after each step.' },
 };
 
 function ScenarioImage({ id, title }: { id: string; title: string }) {
