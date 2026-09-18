@@ -669,6 +669,24 @@ def test_frontier_ranking_prefers_useful_forward_progress_without_crossing_unkno
     assert all(len(home.route(pose[:2], candidate["position_m"], .3)) >= 2 for candidate in alternatives)
 
 
+def test_frontier_ranking_softly_prefers_distance_from_visited_trail():
+    home = HomeMap("home")
+    home.evidence[182:219, 182:219] = -2
+    pose = [0., 0., 0.]
+    baseline = home.frontiers(pose, .3)[0]
+    assert baseline["position_m"][0] > .7
+    home.visits[200, 200:204] = 1
+    assert home.frontiers(pose, .3)[0]["position_m"] == baseline["position_m"]
+    rows, columns = np.indices(home.visits.shape)
+    positions = home.origin + (np.stack((columns, rows), axis=-1) + .5) * home.resolution_m
+    travelled = (positions[:, :, 0] >= 0.) & (positions[:, :, 0] <= 1.5) & (np.abs(positions[:, :, 1]) <= .3)
+    home.visits[travelled] = 1
+    novel = home.frontiers(pose, .3)[0]
+    assert novel["distance_from_visited_m"] > baseline["distance_from_visited_m"]
+    assert novel["position_m"] != baseline["position_m"]
+    assert not travelled[tuple(home.indices(novel["position_m"])[::-1])]
+
+
 async def test_named_arrival_holds_measured_velocity_for_full_dwell(tmp_path):
     from types import SimpleNamespace
     import pybullet as bullet
@@ -718,6 +736,20 @@ def test_scan_matching_uses_sensor_returns_and_rejects_missing_data():
     assert quality["matched_fraction"] > .9
     with pytest.raises(ValueError, match="insufficient"):
         home.match_scan({**laser, "ranges_m": [None] * 720}, [1., -.5, .4])
+
+
+def test_scan_matching_rejects_candidates_without_current_footprint_clearance():
+    home = HomeMap("footprint-localization")
+    ranges = [2. + .5 * math.sin(angle * 3) + .2 * math.cos(angle * 5)
+        for angle in np.linspace(-math.pi, math.pi, 720, endpoint=False)]
+    laser = {"origin_m": [.19, 0., .305], "angle_min": -math.pi, "angle_increment": 2 * math.pi / 720,
+        "range_min": .03, "range_max": 8., "ranges_m": ranges}
+    home.observe(laser, [1., -.5, .4], 100.)
+    column, row = home.indices([1.3, -.5])
+    home.evidence[row, column] = 20
+    pose, _ = home.match_scan(laser, [1., -.5, .4], radius_m=.4)
+    position = home.indices(pose[:2])
+    assert home.allowed(.4)[position[1], position[0]]
 
 
 async def test_localization_search_corrects_offset_against_frozen_independent_scan(tmp_path, record_property):

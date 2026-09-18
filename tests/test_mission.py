@@ -46,15 +46,23 @@ def test_semantic_payload_separates_current_task_and_bounded_history(current):
         "observed_map": {"frame": "map", "revision": "revision", "age_s": .2, "geometry_source": "accumulated_sensor_map",
             "cells": [0] * 6400, "trail_m": [[0., 0.]] * 128, "route_m": [[1., 1.]] * 128}}
     original = copy.deepcopy(observation)
-    payload = semantic_payload(observation, mission, None, {"task": task}, ["explore"], {"tokens": 10, "max_tokens": 100})
+    episode_memory = {"frame": "wheel_odometry", "visited_positions_m": [[index, 0.] for index in range(30)],
+        "observed_routes": [{"start_m": [0., 0.], "end_m": [1., 0.]}] * 8,
+        "blocked_actions_here": [{"action": "explore", "status": "blocked"}] * 5,
+        "inspected_heading_sectors_here": [1, 2], "sector_size_deg": 15, "caution": "Measured only"}
+    payload = semantic_payload(observation, mission, None, {"task": task}, ["explore"],
+        {"tokens": 10, "max_tokens": 100}, episode_memory)
     assert observation == original
     assert payload["observation"]["frame_ref"] == "1-4.png"
     assert payload["observation"]["odometry_m_rad"] == [1.235, 0, 0]
     assert payload["observation"]["proximity"]["distances"][0]["distance_m"] == .654
     assert payload["observation"]["observed_map"]["age_s"] == .2
     assert payload["budget"]["max_tokens"] == 100
+    retained = payload["observation"]["spatial"]["measured_episode_memory"]
+    assert retained["visited_positions_m"] == episode_memory["visited_positions_m"][-16:]
+    assert len(retained["observed_routes"]) == 6 and len(retained["blocked_actions_here"]) == 4
     text = json.dumps(payload)
-    assert len(text) < 2500
+    assert len(text) < 4000
     assert all(forbidden not in text for forbidden in ("unused-joints", "unused-grippers", "debug-only", "private-scene-name", "cells", "trail_m", "route_m"))
     if current:
         assert payload["observation"]["spatial"]["task"]["reason"] == "Local task active"

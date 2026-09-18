@@ -31,6 +31,8 @@ While a task is running, use explore to continue its current target; do not inte
 Prefer openings into unseen connected areas over points along the same room wall. Do not mistake every frontier for a doorway.
 Avoid revisits unless clearance or the goal requires returning. Never invent coordinates or IDs. Use explore to delegate
 destination choice, or to continue an active task unchanged. Reason text alone cannot steer or retarget a route.
+measured_episode_memory is executed wheel-odometry history: use it to recognize revisits, but never navigate its coordinates
+directly or confuse them with map-frame frontier positions. Necessary backtracking remains allowed.
 The worker owns route generation, footprint/collision checks, fresh sensors, wheel control and short motion leases.
 Read current status separately from recent_failures: recovered historical failures do not mean a running route is blocked.
 Reviews occur at arrival, unresolved blockage, 15 s/2 m checkpoints or before objective expiry. A review does not stop motion.
@@ -168,7 +170,7 @@ def execution_brief(result, mission_id):
     return brief or None
 
 
-def semantic_payload(observation, mission, object_state, last, actions, budget=None):
+def semantic_payload(observation, mission, object_state, last, actions, budget=None, episode_memory=None):
     from backend.feedback import compact_numbers
     spatial = observation.get("spatial") or {}
     task = task_brief(spatial.get("task"), mission.identity)
@@ -193,6 +195,15 @@ def semantic_payload(observation, mission, object_state, last, actions, budget=N
             for frontier in spatial.get("frontiers", [])[:4]],
         "room_observations": [{key: report[key] for key in ("place_id", "label", "evidence", "confidence", "review_status", "arrival_verified")
             if key in report} for report in spatial.get("room_observations", [])[-4:]]}
+    if episode_memory:
+        sensors["spatial"]["measured_episode_memory"] = {
+            "frame": episode_memory.get("frame"),
+            "visited_positions_m": episode_memory.get("visited_positions_m", [])[-16:],
+            "observed_routes": episode_memory.get("observed_routes", [])[-6:],
+            "blocked_actions_here": episode_memory.get("blocked_actions_here", [])[-4:],
+            "inspected_heading_sectors_here": episode_memory.get("inspected_heading_sectors_here", []),
+            "sector_size_deg": episode_memory.get("sector_size_deg"),
+            "caution": episode_memory.get("caution")}
     observed_map = observation.get("observed_map")
     memory = spatial.get("memory")
     if memory:
@@ -487,7 +498,8 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
         if not mapped.identity:
             mission.phase = "interpreting"
         payload = semantic_payload(observation.model_dump(exclude={"observed_map": {"cells"}}), mission,
-            object_state, last, available_actions(mission, observation, object_state), controller.state.get("inference_budget"))
+            object_state, last, available_actions(mission, observation, object_state), controller.state.get("inference_budget"),
+            controller.navigation_memory.summary(observation))
         payload["map_context"] = map_details
         payload["sensing"] = {"source_sequence": sensor.sequence, "captured_at_s": sensor.captured_at,
             "age_s": max(0., time.monotonic() - sensor.captured_at), "clock": "monotonic",

@@ -310,7 +310,7 @@ class HomeMission:
             if request.place_id:
                 seed = self.place(request.place_id)["pose_m_rad"]
             laser = capture_laser(sim)
-            pose, quality = self.home.match_scan(laser, seed)
+            pose, quality = self.home.match_scan(laser, seed, sim.robot_footprint()["radius_m"])
             if worker.stop_revision != stop_revision or worker.task_revision != task_revision or sim.cancel.is_set():
                 raise MotionError("CANCELLED", "Localization was cancelled")
             self.transform = transform_pose(inverse_pose(sim.odometry.tolist()), pose)
