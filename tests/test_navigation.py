@@ -3979,6 +3979,30 @@ def test_continuous_goal_rotates_inside_clearance_before_entering_narrow_path():
         sim.close()
 
 
+def test_mapped_navigation_advances_straight_when_small_turn_is_side_blocked():
+    from types import SimpleNamespace
+    from backend.challenges import get_challenge
+    from backend.continuous_navigation import ContinuousNavigation
+    sim = BulletSimulation(challenge=get_challenge("park"), width=160, height=120)
+    sim.on_tick = None
+    clock = lambda: sim.ticks / 240
+    runtime = NavigationRuntime(clock=clock)
+    controller = ContinuousNavigation([[0., 0.], [1.2, .18]], clock=clock)
+    controller.home_owned = True
+    attempts = []
+    def valid(pose, linear, angular):
+        attempts.append((linear, angular))
+        return linear > 0. and angular == 0.
+    try:
+        controller.start(sim, runtime)
+        controller.update(sim, runtime, SimpleNamespace(captured_at=clock(), max_frame_age_s=1), valid)
+        segment = runtime.buffer[0][0]
+        assert controller.active and segment.linear_mps > 0. and segment.angular_radps == 0.
+        assert attempts[-1][0] > 0. and attempts[-1][1] == 0.
+    finally:
+        sim.close()
+
+
 @pytest.mark.parametrize("direction", [-1, 1])
 def test_validated_navigation_can_drive_smooth_left_and_right_curves(direction):
     from backend.challenges import get_challenge

@@ -189,7 +189,8 @@ test('powered-on chat starts custom missions and redirects only the active sessi
       await new Promise<void>(resolve=>{release=resolve;});
       await route.fulfill({status:409,json:{detail:'Instruction cancelled by Stop'}});
     } else {
-      publish({...live,busy:true,agent:{...live.agent,active:true,session_id:'chat-start',goal:body.goal,execution_mode:'luna_continuous',unified_mission:true}});
+      publish({...live,busy:true,agent:{...live.agent,active:true,session_id:'chat-start',goal:body.goal,execution_mode:'luna_continuous',unified_mission:true,
+        run_messages:[{id:'prior-report',role:'assistant',source:'model',text:'Prior run report.',status:'reported',timestamp:1}]}});
       await route.fulfill({json:{}});
     }
   });
@@ -229,7 +230,9 @@ test('powered-on chat starts custom missions and redirects only the active sessi
     execution_mode:'luna_continuous',navigation_backend:'builtin',images_per_request:2,map_context:true,
     max_model_requests:4,max_model_tokens:22000,mission_budget_s:75,max_turns:9,reasoning:'low'});
   await expect(composer).toHaveValue('');
-  await expect(page.getByRole('log',{name:'Run conversation',exact:true})).toContainText(String(starts[1].goal));
+  const conversation=page.getByRole('log',{name:'Run conversation',exact:true});
+  await expect(conversation).toContainText(String(starts[1].goal));
+  await expect(conversation.locator('.chat-message p')).toHaveText(['Prior run report.',String(starts[1].goal)]);
   await composer.fill('Return to the starting position.');await send.click();
   await expect.poll(()=>redirects.length).toBe(1);
   expect(redirects[0]).toEqual({run_id:initial.run_id,episode_epoch:initial.episode_epoch,session_id:'chat-start',message:'Return to the starting position.'});

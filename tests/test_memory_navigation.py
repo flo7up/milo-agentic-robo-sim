@@ -33,6 +33,40 @@ def tv_bounds(image, details=None):
         float((columns.max() + 1) / width), float((rows.max() + 1) / height)]
 
 
+async def test_repeated_tv_observations_update_one_memory_entity(tmp_path):
+    challenge = get_challenge("park").model_copy(update={"objectives": [], "objects": [
+        {"name": "tv_screen", "size": [.12, .8, .6], "position": [1.5, 0., .65], "color": [.9, .03, .03, 1.]},
+    ]})
+    worker = SimulationWorker(pace=False, challenge=challenge, rendering="tiny")
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "repeated-tv.sqlite3"))
+        await configure_memory(worker, instance_id="repeated-tv-fixture")
+        identity = {"run_id": worker.latest["run_id"], "episode_epoch": worker.epoch}
+        await worker.scan_continuous(ContinuousScan(**identity, compact_arms=True))
+        await worker.home_command(HomeRequest(**identity, action="start_mapping"))
+        paired = await worker.call(lambda sim: next(reversed(worker.spatial_frames.values()))[:2])
+        bounds = tv_bounds(paired[1])
+        first = await record_observation(worker, context_id=worker.memory.scope.context_id, kind="object", label="TV",
+            description="First current-camera TV evidence", bounds=bounds, selected_evidence=paired, source="fixture")
+        def capture_newer(sim):
+            worker._sample_spatial(force=True)
+            worker._sample_spatial(force=True)
+            return next(reversed(worker.spatial_frames.values()))[:2]
+        newer = await worker.call(capture_newer)
+        assert newer[0].sequence > paired[0].sequence
+        shifted = [bounds[0] + .005, bounds[1], bounds[2], bounds[3]]
+        second = await record_observation(worker, context_id=worker.memory.scope.context_id, kind="object", label="tv",
+            description="Second current-camera TV evidence", bounds=shifted, selected_evidence=newer, source="fixture")
+        assert first["observation_id"] != second["observation_id"]
+        assert first["entity_id"] == second["entity_id"] and first["place_id"] == second["place_id"]
+        assert worker.memory.summary["counts"]["objects"] == 1
+        assert worker.memory.summary["objects"][0]["observation_count"] == 2
+        assert len(worker.home_mission.home.places) == 1
+    finally:
+        await worker.close()
+
+
 @pytest.mark.parametrize(("kind", "label", "lookup_action", "place_source"), [
     pytest.param("room", "Kitchen", "lookup_room", "camera_room_hypothesis", id="remembered-kitchen"),
     pytest.param("object", "TV", "find_object_sightings", "object_observation_viewpoint", id="remembered-tv"),
@@ -204,7 +238,9 @@ async def test_reloaded_tv_memory_stages_fresh_object_verification(tmp_path, rec
         assert staging["verified"]
         assert worker.object_goal and worker.object_goal.verified
         await worker.memory.flush()
-        assert len(worker.memory.summary["objects"]) >= 2
+        assert len(worker.memory.summary["objects"]) == 1
+        assert worker.memory.summary["objects"][0]["entity_id"] == remembered["entity_id"]
+        assert worker.memory.summary["objects"][0]["observation_count"] >= 2
         assert not worker.sim.proximity_sensors().collisions
         record_property("tv_memory_recall", json.dumps({"evidence": "scripted_test", "profile_reloaded": True,
             "actions": actions, "staging_verified": True, "fresh_verification": True,

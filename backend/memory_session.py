@@ -119,6 +119,25 @@ def json_key(value):
     return json.dumps(value, separators=(",", ":"))
 
 
+def matching_object(summary, scope, label, position, maximum_distance_m=.3):
+    if position is None or not label.strip():
+        return None
+    normalized = label.strip().casefold()
+    candidates = []
+    for item in summary.get("objects", []):
+        labels = [item.get("label", ""), *item.get("labels", [])]
+        observed = item.get("position_m")
+        if (item.get("requires_revalidation") or item.get("pose_frame") != "map"
+                or item.get("map_id") != scope.map_id or item.get("frame_revision") != scope.frame_revision
+                or normalized not in {value.strip().casefold() for value in labels if isinstance(value, str)}
+                or not isinstance(observed, list) or len(observed) != len(position)):
+            continue
+        distance = math.dist(observed, position)
+        if distance <= maximum_distance_m:
+            candidates.append((distance, item))
+    return min(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
+
+
 async def configure_memory(worker, *, instance_id=None, profile_id=None, fresh=False, name="Default knowledge", reuse=True):
     await worker.home_state()
     home = worker.home_mission
@@ -308,6 +327,10 @@ async def _record_observation(worker, *, context_id, kind, label="", description
             and item.get("last_run_id") == session.scope.run_id), None)
         linked = place_id or (previous.get("place_id") if previous else None)
         associated = entity_id or (previous.get("entity_id") if previous else None)
+        if localized and kind == "object" and associated is None:
+            previous_object = matching_object(session.summary, session.scope, label, position)
+            if previous_object:
+                associated, linked = previous_object["entity_id"], previous_object.get("place_id")
         if linked and localized:
             existing_place = next((item for item in home.home.places if item["place_id"] == linked), None)
             if existing_place and math.dist(existing_place["pose_m_rad"][:2], pose[:2]) > .2:

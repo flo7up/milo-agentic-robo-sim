@@ -372,11 +372,11 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
       <div className="panel-header"><h3><MessageSquare size={17} />Run chat</h3></div>
       <div className="chat-transcript" role="log" aria-label="Run conversation" tabIndex={0}>
         {!hasRun && !agent.run_messages?.length && <p className="empty">No messages yet.</p>}
-        {hasRun && agent.goal && !agent.run_messages?.some(message=>message.role==='user' && message.text===agent.goal) &&
-          <article className="chat-message chat-user"><strong>You / mission instruction</strong><p>{agent.goal}</p></article>}
         {(agent.run_messages ?? []).map(message => <article key={message.id} className={`chat-message chat-${message.role}`}>
           <strong>{message.role === 'user' ? 'You' : message.source === 'model' ? 'Luna' : 'Controller'} / {message.status}</strong>
           <p>{message.text}</p></article>)}
+        {hasRun && agent.goal && !agent.run_messages?.some(message=>message.role==='user' && message.text===agent.goal) &&
+          <article className="chat-message chat-user"><strong>You / mission instruction</strong><p>{agent.goal}</p></article>}
       </div>
     </section>
     </div>

@@ -68,7 +68,7 @@ class Challenge(StrictModel):
     search_target: str | None = None
     ordered_objectives: bool = False
     orbit: OrbitTask | None = None
-    movement_program: list[MovementStep] = Field(default_factory=list)
+    movement_program: list[MovementStep] = Field(default_factory=list, exclude_if=lambda steps: not steps)
     floor_size_m: Annotated[list[Annotated[float, Field(ge=4, le=20)]], Field(min_length=2, max_length=2)] = Field(default_factory=lambda: [6, 6])
 
     def public(self):

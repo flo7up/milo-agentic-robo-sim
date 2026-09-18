@@ -465,9 +465,13 @@ class ContinuousNavigation:
             clearance_speed = math.sqrt(reaction_speed ** 2 + 2 * LINEAR_ACCELERATION_MPS2 * stopping_room) - reaction_speed
             linear = min(linear, clearance_speed, .2 if min(clearances) < 1. else CONTINUOUS_SPEED_MPS)
         if not path_valid(pose, linear, angular):
-            for reduced in (linear * .5, 0.):
-                if path_valid(pose, reduced, angular):
-                    linear = reduced
+            alternatives = [(linear * .5, angular)]
+            if getattr(self, "home_owned", False) and linear > 0. and abs(bearing) < .2:
+                alternatives.append((linear * .5, 0.))
+            alternatives.append((0., angular))
+            for reduced_linear, reduced_angular in alternatives:
+                if path_valid(pose, reduced_linear, reduced_angular):
+                    linear, angular = reduced_linear, reduced_angular
                     break
             else:
                 if replan is not None and self.replans < 2:

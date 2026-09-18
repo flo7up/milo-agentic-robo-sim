@@ -32,6 +32,14 @@ def test_movement_contract_preserves_distance_direction_and_turns():
         MissionPlan(kind="movement", target="Too far", movements=[steps[0]]*5)
 
 
+def test_movement_program_preserves_existing_challenge_serialization():
+    from backend.challenges import get_challenge, shared_apartment
+    assert "movement_program" not in shared_apartment("flat_kitchen").model_dump()
+    practice = get_challenge("movement_practice")
+    assert practice.model_dump()["movement_program"] == [step.model_dump() for step in practice.movement_program]
+    assert "movement_program" not in practice.public()
+
+
 @pytest.mark.parametrize("program", ["out-and-back", "spin", "default", "triple-spin", "clockwise"])
 async def test_requested_movement_executes_measured_sequence(tmp_path, record_property, program):
     import numpy as np

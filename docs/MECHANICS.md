@@ -1,5 +1,19 @@
 # Mechanical Slice
 
+## Movement Practice
+
+The standalone `movement_practice` course has one-meter floor markings and asymmetric off-route landmarks for saved-map relocalization. Select it in the challenge menu. Its fixed scored goal is forward 1 m, backward 1 m without turning around, then one counterclockwise in-place revolution, with at least 0.5 simulated seconds at rest after each stage. Reset retains the selected knowledge profile; loading with no saved-map reuse creates separate knowledge without deleting prior maps.
+
+The unified supervisor interprets an explicit movement request once into an ordered `MissionPlan(kind="movement")`. Signed drive distances preserve true reverse; signed unwrapped angles preserve full and multiple rotations. Supported limits are 1-8 steps, 0.05-1.5 m per drive, at most 4 m absolute travel and three full turns total. Positive angles mean left/counterclockwise; unspecified spin direction defaults left. Unsupported distances or combinations are rejected, not truncated. "Return Home" must be expressed as explicit movement steps in this mode; it is not route planning.
+
+The worker executes the sequence locally at up to 0.15 m/s and 0.5 rad/s through existing bounded navigation buffers. It measures wheel odometry, brakes at each endpoint and waits stationary for 0.6 simulated seconds. Endpoint acceptance is within 0.04 m or 0.08 rad after settling; wheel estimates are not independent world-position accuracy. Each step retains the existing 60-second local deadline, capped by the original mission deadline. No model call is required between motor updates or completed steps.
+
+Each update and worker motion tick requires current authority, localization, fresh paired depth and an observed footprint-clear corridor. The rolling map's existing support-footprint rule is anchored once at the sequence origin, retained for reversing onto the starting footprint, and never expanded along the route. Unknown or occupied cells remain blocked. Lateral drift and pivot translation stop execution. The separate swept whole-body simulator shield, held-object, tilt, floor and beam checks remain active. Stop, reset, takeover, disconnect, sensor loss and task changes revoke motion; failed sequences are not automatically replayed. A first backward move may be refused when the rear corridor has not been observed.
+
+The independent preset scorer uses actual physical pose, speed, grounding and sampled contact, outside model inputs. It requires ordered signed movement, rejects wrong direction, excessive drift, contact and discontinuities, and requires stationary dwell. A custom spin can finish its mission while the preset score fails because it does not follow the fixed forward/reverse/spin task. Custom receipts are explicitly wheel-odometry evidence, not preset success or verified natural-language interpretation.
+
+Five scripted physical sequences cover forward/reverse, one spin, three spins, clockwise motion and the complete preset. Safety cases cover Stop, sensing loss, occupied footprint, changed authority, deadline and unobserved reverse. The browser covers the real scene and preview at 1440/390/320 px, default physical completion, reset/relocalization, chat-submitted spin and Stop. These tests use scripted inference, not paid Luna calls. [Results and preserved failures](DESIGN_PERFORMANCE.md#movement-practice-v1).
+
 ## Proximity Coverage
 
 The eight `proximity.distances` readings are **individual rays**, spaced by pi/4 around the robot base, not sectors or a 360-degree free-space certificate. Each now includes `origin_base_m`: the ray starts where its bearing intersects a fixed nominal base rectangle (half extents 0.18 m forward/back and 0.25 m lateral), at base-relative z = -0.115 m. With the nominal 0.155 m level base height this is approximately 0.04 m above the floor; the actual origin follows measured base position/orientation. The sensor origins do not expand with the arms.

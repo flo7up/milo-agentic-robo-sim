@@ -71,6 +71,21 @@ def observation(kind="room", source_key="first", **values):
         label="Kitchen" if kind == "room" else "Cup", **values)
 
 
+def test_repeated_nearby_object_matches_only_in_the_same_valid_map_frame(tmp_path):
+    from backend.memory_session import matching_object
+    store, _, scope = memory_fixture(tmp_path)
+    existing = {"entity_id": "tv-one", "label": "TV", "labels": ["Television"],
+        "position_m": [1., 2., .8], "pose_frame": "map", "map_id": scope.map_id,
+        "frame_revision": scope.frame_revision, "requires_revalidation": False}
+    summary = {"objects": [existing]}
+    assert matching_object(summary, scope, "tv", [1.1, 2., .8]) == existing
+    assert matching_object(summary, scope, "Television", [1.1, 2., .8]) == existing
+    assert matching_object(summary, scope, "TV", [1.4, 2., .8]) is None
+    assert matching_object(summary, scope, "Monitor", [1.1, 2., .8]) is None
+    assert matching_object({"objects": [{**existing, "requires_revalidation": True}]}, scope, "TV", [1.1, 2., .8]) is None
+    assert matching_object({"objects": [{**existing, "frame_revision": "corrected"}]}, scope, "TV", [1.1, 2., .8]) is None
+
+
 def test_memory_idempotency_beliefs_search_and_stale_context(tmp_path):
     store, home, scope = memory_fixture(tmp_path)
     first = store.ingest(scope, observation())
