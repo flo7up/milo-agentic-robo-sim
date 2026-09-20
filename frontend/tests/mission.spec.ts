@@ -1,11 +1,18 @@
-import {test, expect} from '@playwright/test';
+import {test, expect, type Page} from '@playwright/test';
 import {mkdir, mkdtemp, readFile, realpath, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import type {LiveState, NavigationDiagnostics} from '../src/types';
 
-test.beforeEach(async ({request}) => {
+async function openConfiguration(page: Page) {
+  if (!await page.getByRole('dialog', {name:'Robot configuration',exact:true}).isVisible())
+    await page.getByRole('button', {name:'Robot settings',exact:true}).click();
+}
+
+test.beforeEach(async ({request}, testInfo) => {
   await request.post('/api/test/preferences/reset');
+  if (!testInfo.title.startsWith('hybrid defaults'))
+    await request.post('/api/preferences',{data:{mission_controller:'luna'}});
   await request.post('/api/challenges/load', {data:{challenge_id:'park',reuse_saved_map:false}});
   await request.post('/api/agent/config', {data:{endpoint:'https://test.openai.azure.com',models:[
     {id:'luna',label:'Scripted Luna',deployment:'scripted',reasoning_efforts:['low','medium','high']}]}});
@@ -15,7 +22,7 @@ test('spatial memory drawer creates checkpoints and independent profiles without
   const initial:LiveState=await(await request.get('/api/state')).json();
   const errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));
   await page.goto('/');
-  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   const panel=page.getByRole('region',{name:'Spatial memory',exact:true});
   const profile=panel.getByRole('combobox',{name:'Knowledge profile',exact:true});
   const name=panel.getByRole('textbox',{name:'Knowledge name',exact:true});
@@ -64,7 +71,7 @@ test('spatial memory drawer creates checkpoints and independent profiles without
   await page.getByRole('button',{name:'Save configuration',exact:true}).click();
   await expect(page.getByRole('dialog',{name:'Robot configuration',exact:true})).toBeHidden();
   expect((await(await request.get('/api/state')).json()).snapshot).toEqual(initial.snapshot);
-  await page.reload();await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.reload();await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   await expect(profile).toHaveValue(parent.scope.profile_id);
   await expect(panel).toContainText('2 rooms / 0 objects / 0 pathways');
   const switched=await request.post('/api/challenges/load',{data:{challenge_id:'park',reuse_saved_map:true,environment_instance_id:'isolated-browser-flat'}});
@@ -83,13 +90,13 @@ test('configuration drawer saves then collapses and retains failures beside perm
   const errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));
   const directory=await realpath(await mkdtemp(join(tmpdir(),'milo-configuration-')));
   await page.goto('/');
-  const open=page.getByRole('button',{name:'Open configuration',exact:true});
+  const open=page.getByRole('button',{name:'Robot settings',exact:true});
   const reset=page.getByRole('button',{name:'Reset episode',exact:true});
   const drawer=page.getByRole('dialog',{name:'Robot configuration',exact:true});
   const save=drawer.getByRole('button',{name:'Save configuration',exact:true});
   await expect(drawer).toBeHidden();await expect(reset).toBeVisible();
   await expect(page.locator('.robot-options')).not.toHaveAttribute('open','');
-  await page.getByRole('button',{name:'Minimize Luna console',exact:true}).click();
+  await page.getByRole('button',{name:'Hide assistant details',exact:true}).click();
   await open.click();await expect(drawer).toBeVisible();
   const threshold=drawer.getByRole('spinbutton',{name:'Luna token threshold',exact:true});
   await threshold.fill('64000');
@@ -100,11 +107,11 @@ test('configuration drawer saves then collapses and retains failures beside perm
       const bounds=element.getBoundingClientRect();
       const controls=[...element.querySelectorAll('.run-actions button, .robot-options > summary')]
         .filter(control=>control.getClientRects().length).map(control=>control.getBoundingClientRect());
-      return {right:bounds.right,width:bounds.width,viewport:innerWidth,overflow:element.scrollWidth>element.clientWidth,
+      return {left:bounds.left,right:bounds.right,width:bounds.width,viewport:innerWidth,overflow:element.scrollWidth>element.clientWidth,
         fits:controls.every(control=>control.left>=bounds.left && control.right<=bounds.right),
         overlap:controls.some((control,index)=>controls.slice(index+1).some(other=>control.left<other.right && other.left<control.right && control.top<other.bottom && other.top<control.bottom))};
     });
-    expect(Math.abs(layout.right-width)).toBeLessThan(1);expect(layout.width).toBeLessThanOrEqual(540);
+    expect(Math.abs(layout.left)).toBeLessThan(1);expect(layout.width).toBeLessThanOrEqual(540);
     expect(layout.overflow).toBe(false);expect(layout.fits).toBe(true);expect(layout.overlap).toBe(false);
     await expect(drawer.getByRole('button',{name:'Stop',exact:true})).toBeInViewport();
     await expect(reset).toBeInViewport();await expect(save).toBeInViewport();
@@ -113,7 +120,7 @@ test('configuration drawer saves then collapses and retains failures beside perm
   await save.click();await expect(drawer).toBeHidden();await expect(open).toBeFocused();
   const saved=(await(await request.get('/api/preferences')).json()).preferences;
   expect(saved.max_model_tokens).toBe(64000);expect(saved.recording_directory).toBe(directory);
-  await expect(page.getByRole('button',{name:'Restore Luna console',exact:true})).toBeVisible();
+  await expect(page.getByRole('button',{name:'Show assistant details',exact:true})).toBeVisible();
   await open.click();await expect(threshold).toHaveValue('64000');
   let reject=true;let release:()=>void=()=>{};
   await page.route('**/api/preferences',async route=>{
@@ -141,7 +148,7 @@ test('configuration drawer saves then collapses and retains failures beside perm
 
 test('Qwen configuration saves its bounded local profile and reports validation details', async ({page,request}) => {
   await page.goto('/');
-  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   const drawer=page.getByRole('dialog',{name:'Robot configuration',exact:true});
   await drawer.getByRole('combobox',{name:'Mission controller',exact:true}).selectOption('qwen');
   const saved=page.waitForResponse(response=>response.url().endsWith('/api/agent/config') && response.request().method()==='POST');
@@ -153,7 +160,7 @@ test('Qwen configuration saves its bounded local profile and reports validation 
     provider:'ollama',deployment:'qwen3-vl:4b-instruct-q4_K_M',context_window:16384,configured:true});
   await expect(drawer).toBeHidden();
 
-  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   await page.route('**/api/agent/config',route=>route.fulfill({status:422,json:{detail:[{
     loc:['body','models',3,'context_window'],msg:'Input should be less than or equal to 49152',type:'less_than_equal'}]}}));
   await drawer.getByRole('textbox',{name:'Local model tag',exact:true}).fill('qwen-test-tag');
@@ -175,12 +182,12 @@ test('hybrid defaults keep Qwen operational and give Luna task-only supervision'
     await route.fulfill({status:409,json:{detail:'Baseline payload captured without model inference'}});
   });
   await page.goto('/');
-  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   const drawer=page.getByRole('dialog',{name:'Robot configuration',exact:true});
   await expect(drawer.getByRole('combobox',{name:'Mission controller',exact:true})).toHaveValue('hybrid');
   await drawer.getByRole('button',{name:'Save configuration',exact:true}).click();
   await expect(drawer).toBeHidden();
-  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   await expect(drawer.getByLabel('Luna task supervision readiness')).toContainText('immutable task plan only');
   await drawer.getByRole('button',{name:'Close configuration',exact:true}).click();
   await page.getByRole('button',{name:'Start mission',exact:true}).click();
@@ -208,17 +215,69 @@ test('hybrid defaults keep Qwen operational and give Luna task-only supervision'
   await expect(supervisor).toHaveValue('hybrid');
 });
 
+test('kitchen budget defaults and overrides stay separate from other challenges', async ({page,request}) => {
+  test.setTimeout(90000);
+  await request.post('/api/preferences',{data:{mission_controller:'luna',reasoning:'low',
+    turns:20,max_model_requests:12,max_model_tokens:100000}});
+  expect((await request.post('/api/challenges/load',{data:{challenge_id:'flat_kitchen',reuse_saved_map:false}})).ok()).toBe(true);
+  let payload:Record<string,unknown>|null=null;
+  await page.route('**/api/mission/start',async route=>{
+    payload=route.request().postDataJSON();
+    await route.fulfill({status:409,json:{detail:'Budget captured without inference'}});
+  });
+  await page.goto('/');
+  const panel=page.locator('.regression-panel');
+  await panel.locator(':scope > summary').click();
+  await expect(panel.getByRole('button',{name:'Start baseline',exact:true})).toHaveAttribute('title',/144 primary model requests and 960,000 primary tokens/);
+  const kitchen=panel.locator('.regression-cases > li').last();
+  await expect(kitchen).toContainText('180 s / 60 requests / 400,000 tokens');
+  for(const width of [1440,390]) {
+    await page.setViewportSize({width,height:1000});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    expect(await kitchen.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+  }
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect.poll(()=>payload).not.toBeNull();
+  expect(payload).toMatchObject({max_turns:60,max_model_requests:60,max_model_tokens:400000,mission_budget_s:180});
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
+  const drawer=page.getByRole('dialog',{name:'Robot configuration',exact:true});
+  const tokens=drawer.getByRole('spinbutton',{name:'Luna token threshold',exact:true});
+  const requests=drawer.getByRole('spinbutton',{name:'Luna request limit',exact:true});
+  await expect(tokens).toHaveValue('400000');
+  await expect(requests).toHaveValue('60');
+  await tokens.fill('450000');
+  await requests.fill('48');
+  await drawer.getByRole('button',{name:'Save configuration',exact:true}).click();
+  const saved=(await(await request.get('/api/preferences')).json()).preferences;
+  expect(saved).toMatchObject({max_model_tokens:100000,max_model_requests:12,turns:20,
+    kitchen_max_model_tokens:450000,kitchen_max_model_requests:48});
+  await page.reload();
+  payload=null;
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect.poll(()=>payload).not.toBeNull();
+  expect(payload).toMatchObject({max_turns:60,max_model_requests:48,max_model_tokens:450000});
+  expect((await request.post('/api/challenges/load',{data:{challenge_id:'park',reuse_saved_map:false}})).ok()).toBe(true);
+  await expect(page.getByRole('heading',{name:'Park in the Bay',exact:true})).toBeVisible();
+  payload=null;
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect.poll(()=>payload).not.toBeNull();
+  expect(payload).toMatchObject({max_turns:20,max_model_requests:12,max_model_tokens:100000});
+  const current:LiveState=await(await request.get('/api/state')).json();
+  expect(current.agent.active).toBe(false);
+  expect(current.agent.input_tokens+current.agent.output_tokens).toBe(0);
+});
+
 test('regression includes four parking starts with distinct loadable scene previews', async ({page,request}) => {
   test.setTimeout(90000);
   const initial:LiveState=await(await request.get('/api/state')).json();
-  expect(initial.regression?.suite_id).toBe('observable-navigation-v2');
+  expect(initial.regression?.suite_id).toBe('observable-navigation-v3');
   expect(initial.regression?.cases.slice(0,4).map(entry=>entry.challenge_id)).toEqual(['park','park_left','park_right','park_far']);
   await page.goto('/');
   const panel=page.locator('.regression-panel');
   await expect(panel.locator(':scope > summary')).toContainText('8 cases · 20 min mission budget');
   await panel.locator(':scope > summary').click();
   await expect(panel.locator('.regression-cases > li')).toHaveCount(8);
-  await expect(panel.getByRole('button',{name:'Start baseline',exact:true})).toHaveAttribute('title',/96 primary model requests and 640,000 primary tokens/);
+  await expect(panel.getByRole('button',{name:'Start baseline',exact:true})).toHaveAttribute('title',/144 primary model requests and 960,000 primary tokens/);
   for(const image of await panel.locator('.regression-cases > li:nth-child(-n+4) img').all()) {
     await expect.poll(()=>image.evaluate(element=>(element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
   }
@@ -228,14 +287,14 @@ test('regression includes four parking starts with distinct loadable scene previ
     await panel.screenshot({path:`../.runtime/parking-variations-v1/suite-${width}.png`});
   }
   for(const identifier of ['park_left','park_right','park_far']) {
-    await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
-    const dialog=page.getByRole('dialog',{name:'Load challenge',exact:true});
+    await page.getByRole('button',{name:'Load scenario',exact:true}).click();
+    const dialog=page.getByRole('dialog',{name:'Load scenario',exact:true});
     await dialog.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption(identifier);
     await dialog.getByRole('combobox',{name:'Map source',exact:true}).selectOption('none');
     await expect(dialog.locator('.scenario-thumbnail img')).toHaveAttribute('src',`/scenario-previews/${identifier}.webp`);
     await expect(dialog.locator('.scenario-thumbnail')).toHaveAttribute('data-state','ready');
     const loaded=page.waitForResponse(response=>response.url().endsWith('/api/challenges/load')&&response.request().method()==='POST');
-    await dialog.getByRole('button',{name:'Load challenge',exact:true}).click();
+    await dialog.getByRole('button',{name:'Load selected scenario',exact:true}).click();
     const response=await loaded;
     expect(response.ok()).toBe(true);
     const loadedState:LiveState=await response.json();
@@ -245,7 +304,7 @@ test('regression includes four parking starts with distinct loadable scene previ
   }
   await expect.poll(async()=>(await(await request.get('/api/preferences')).json()).preferences.challenge_selection?.challenge_id).toBe('park_far');
   await page.reload();
-  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+  await page.getByRole('button',{name:'Load scenario',exact:true}).click();
   await expect(page.getByRole('combobox',{name:'Predefined challenge',exact:true})).toHaveValue('park_far');
   const current:LiveState=await(await request.get('/api/state')).json();
   expect(current.agent.active).toBe(false);
@@ -292,7 +351,7 @@ test('recording settings save local folders and preserve failed drafts without m
   const blocked=join(directory,'not-a-folder');await writeFile(blocked,'preserve');
   const initial:LiveState=await(await request.get('/api/state')).json();
   const errors:string[]=[];page.on('pageerror',error=>errors.push(error.message));
-  await page.goto('/');await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await page.goto('/');await openConfiguration(page);
   const panel=page.getByRole('region',{name:'Test run recording',exact:true});
   const folder=panel.getByRole('textbox',{name:'Recording folder',exact:true});
   const enabled=panel.getByRole('switch',{name:'Record test runs',exact:true});
@@ -301,7 +360,7 @@ test('recording settings save local folders and preserve failed drafts without m
   await folder.fill(target);await enabled.uncheck();await save.click();
   await expect(panel.getByRole('status',{name:'Recording status',exact:true})).toHaveText('Recording off');
   await expect(folder).toHaveValue(target);
-  await page.reload();await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.reload();await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   await expect(folder).toHaveValue(target);await expect(enabled).not.toBeChecked();
   await folder.fill(blocked);await save.click();await expect(panel.getByRole('alert')).toContainText('writable local folder');
   await expect(folder).toHaveValue(blocked);
@@ -400,7 +459,7 @@ test('idle chat honors readiness and settings while stop words never start infer
   const send=page.getByRole('button',{name:'Send instruction',exact:true});
   await composer.fill('Inspect the doorway.');
   await expect(send).toBeEnabled();
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await openConfiguration(page);
   const budget=page.getByRole('spinbutton',{name:'Luna token threshold',exact:true});
   await budget.fill('0');await expect(send).toBeDisabled();await budget.fill('12000');
   await page.locator('.mission-diagnostics > summary').click();
@@ -410,7 +469,7 @@ test('idle chat honors readiness and settings while stop words never start infer
   await expect(page.getByLabel('Instruction availability')).toContainText('Luna mission profile');
   await composer.fill('STOP!');await expect(send).toBeEnabled();await send.click();
   await expect.poll(()=>commands).toEqual(['stop']);await expect(composer).toHaveValue('');
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();await profile.selectOption('unified');
+  await openConfiguration(page);await profile.selectOption('unified');
   await page.locator('.agent-connection > summary').click();
   await page.getByRole('textbox',{name:'Luna deployment',exact:true}).fill('unapplied');
   await page.getByRole('button',{name:'Close configuration',exact:true}).click();
@@ -433,7 +492,7 @@ test('viewport-first console keeps setup compact and token budget adjustable wit
   const consolePanel=page.getByRole('region',{name:'LLM control',exact:true});
   await expect(page.getByRole('button',{name:'Start mission',exact:true})).toBeEnabled();
   await expect(page.getByRole('dialog')).toHaveCount(0);
-  await expect(page.getByRole('button',{name:'Choose challenge',exact:true})).toBeVisible();
+  await expect(page.getByRole('button',{name:'Load scenario',exact:true})).toBeVisible();
   await expect(page.getByRole('textbox',{name:'Robot goal',exact:true})).toBeHidden();
   await expect(page.getByRole('tabpanel',{name:'Conversation',exact:true})).toBeVisible();
   await expect(page.getByRole('region',{name:'Motion diagnostics',exact:true})).toBeHidden();
@@ -448,9 +507,11 @@ test('viewport-first console keeps setup compact and token budget adjustable wit
         readoutBottom:readout.bottom,consoleTop:consolePanel.top,overflow:document.documentElement.scrollWidth>innerWidth};
     });
     expect(layout.overflow).toBe(false);
-    expect(Math.abs(layout.worldWidth-layout.consoleWidth)).toBeLessThan(2);
+    if(width<1100) expect(Math.abs(layout.worldWidth-layout.consoleWidth)).toBeLessThan(2);
+    else expect(layout.worldWidth).toBeGreaterThan(layout.consoleWidth);
     expect(layout.readoutTop).toBeGreaterThanOrEqual(layout.worldBottom-1);
-    expect(layout.consoleTop).toBeGreaterThanOrEqual(layout.readoutBottom-1);
+    if(width<1100) expect(layout.consoleTop).toBeGreaterThanOrEqual(layout.readoutBottom-1);
+    else expect(layout.consoleTop).toBeLessThan(layout.worldBottom);
     await expect(page.getByRole('button',{name:'Stop',exact:true})).toBeInViewport();
     await expect(page.locator('.spectator canvas')).toBeInViewport();
     await expect.poll(async()=>page.locator('.spectator canvas').evaluate((canvas:HTMLCanvasElement)=>{
@@ -468,18 +529,21 @@ test('viewport-first console keeps setup compact and token budget adjustable wit
   await canvas.hover({position:{x:80,y:220}});
   await page.mouse.wheel(0,120);
   await expect.poll(()=>canvas.evaluate((element:HTMLCanvasElement)=>element.toDataURL())).not.toBe(beforeOrbit);
+  await expect(page.getByLabel('Live telemetry summary')).toBeHidden();
+  await page.locator('.live-telemetry > summary').click();
+  await expect(page.getByLabel('Live telemetry summary')).toBeVisible();
   await page.locator('.live-telemetry > summary').click();
   await expect(page.getByRole('definition').filter({hasText:'Not reported'})).toHaveCount(0);
   await expect(page.getByLabel('Live telemetry summary')).toBeHidden();
-  await page.getByRole('button',{name:'Minimize Luna console',exact:true}).click();
+  await page.getByRole('button',{name:'Hide assistant details',exact:true}).click();
   await expect(page.getByRole('tablist',{name:'Robot inspector'})).toBeHidden();
   await expect(page.getByRole('button',{name:'Start mission',exact:true})).toBeEnabled();
-  await page.getByRole('button',{name:'Restore Luna console',exact:true}).click();
-  await page.getByRole('tab',{name:'Telemetry',exact:true}).click();
+  await page.getByRole('button',{name:'Show assistant details',exact:true}).click();
+  await page.getByRole('tab',{name:'Details',exact:true}).click();
   await expect(page.getByRole('region',{name:'Motion diagnostics',exact:true})).toBeVisible();
   await page.locator('.sensor-panel > summary').click();
   await expect(page.getByRole('region',{name:'Collision and distance sensors',exact:true})).toBeVisible();
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await openConfiguration(page);
   const slider=page.getByRole('slider',{name:'Luna token budget',exact:true});
   const exact=page.getByRole('spinbutton',{name:'Luna token threshold',exact:true});
   await exact.fill('50000');
@@ -492,7 +556,7 @@ test('viewport-first console keeps setup compact and token budget adjustable wit
   await expect.poll(()=>sent.length).toBe(1);
   expect(sent[0].max_model_tokens).toBe(52000);
   await page.reload();
-  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   await expect(exact).toHaveValue('52000');
   expect(errors).toEqual([]);
   const after=await(await request.get('/api/state')).json();
@@ -501,7 +565,7 @@ test('viewport-first console keeps setup compact and token budget adjustable wit
   await expect(consolePanel).toBeVisible();
 });
 
-test('Luna usage and thresholds stay visible beside controls across viewports', async ({page,request}) => {
+test('model usage stays visible and limits are disclosed across viewports', async ({page,request}) => {
   const initial:LiveState=await(await request.get('/api/state')).json();
   const live:LiveState={...initial,agent:{...initial.agent,session_id:'usage-test',active:false,
     input_tokens:104932,output_tokens:1341,
@@ -509,13 +573,13 @@ test('Luna usage and thresholds stay visible beside controls across viewports', 
   let publish:(value:LiveState)=>void=()=>{};
   await page.routeWebSocket('**/api/live',socket=>{publish=value=>socket.send(JSON.stringify(value));publish(live);});
   await page.goto('/');
-  const usage=page.getByRole('group',{name:'Luna usage and limits',exact:true});
-  await expect(usage).toContainText('106,273 / 100,000');
-  await expect(usage).toContainText('9 / 12');
-  await expect(usage).toHaveAttribute('data-limit-reached','true');
+  const usage=page.getByRole('region',{name:'Model activity',exact:true});
+  await expect(usage).toContainText('106,273');
+  await expect(usage.getByRole('button',{name:'Model calls: view details',exact:true})).toContainText('9');
+  await expect(usage).toContainText('Run limit reached');
   for(const width of [1440,850,390,320]) {
     await page.setViewportSize({width,height:1000});
-    await page.locator('.agent-section').scrollIntoViewIfNeeded();
+    await usage.scrollIntoViewIfNeeded();
     await expect(usage).toBeInViewport();
     await expect(page.getByRole('button',{name:'Stop',exact:true})).toBeInViewport();
     expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
@@ -530,7 +594,7 @@ test('Luna usage and thresholds stay visible beside controls across viewports', 
   }
   publish({...live,agent:{...live.agent,input_tokens:1999999,output_tokens:500,
     inference_budget:{...live.agent.inference_budget!,max_tokens:2000000,usage_unknown:true}}});
-  await expect(usage).toContainText('2,000,499 / 2,000,000');
+  await expect(usage).toContainText('2,000,499');
   await expect(usage).toContainText('Usage incomplete');
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
 });
@@ -548,11 +612,11 @@ test('unified mission is the single default even with old saved diagnostic choic
   expect(sent[0]).toMatchObject({unified_mission:true,navigation_backend:'builtin',execution_mode:'luna_continuous',
     map_context:true,mission_local_only:false,images_per_request:2,max_turns:17});
   expect(sent[0]).not.toHaveProperty('continuous_handoff');
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await openConfiguration(page);
   await page.locator('.mission-diagnostics > summary').click();
   await page.getByRole('combobox',{name:'Diagnostic execution profile',exact:true}).selectOption('local');
   await page.reload();
-  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   await page.locator('.mission-diagnostics > summary').click();
   await expect(page.getByRole('combobox',{name:'Diagnostic execution profile',exact:true})).toHaveValue('unified');
 });
@@ -596,7 +660,7 @@ test('motion diagnostics expose buffer timing and sensor loss without authorizin
   const errors:string[]=[];
   page.on('pageerror',error=>errors.push(error.message));
   await page.goto('/');
-  await page.getByRole('tab',{name:'Telemetry',exact:true}).click();
+  await page.getByRole('tab',{name:'Details',exact:true}).click();
   const panel=page.getByRole('region',{name:'Motion diagnostics',exact:true});
   await expect(panel).toContainText('BUFFER_EXPIRED');
   await expect(panel).toContainText('Fresh at receipt');
@@ -678,7 +742,7 @@ test('recorded route failures expose immutable sensor and expiry evidence on dem
   const errors:string[]=[];
   page.on('pageerror',error=>errors.push(error.message));
   await page.goto('/');
-  await page.getByRole('tab',{name:'Trace',exact:true}).click();
+  await page.getByRole('tab',{name:'Model calls',exact:true}).click();
   await page.getByRole('button',{name:'Failures',exact:true}).click();
   await expect(page.locator('.exchange-entry')).toHaveCount(2);
   const policy=page.locator('.exchange-policy');
@@ -724,7 +788,7 @@ test('compact mission panels preserve drafts and report live policy without issu
   const errors:string[]=[];
   page.on('pageerror',error=>errors.push(error.message));
   await page.goto('/');
-  await page.getByRole('tab',{name:'Telemetry',exact:true}).click();
+  await page.getByRole('tab',{name:'Details',exact:true}).click();
   const policy = page.getByLabel('Active policy',{exact:true});
   await expect(policy).toContainText('No active policy');
   await policy.locator(':scope > summary').click();
@@ -759,7 +823,7 @@ test('compact mission panels preserve drafts and report live policy without issu
   await expect(instructions).not.toHaveAttribute('open');
   const composer=page.getByRole('textbox',{name:'New run instruction',exact:true});
   await composer.fill('Retain this unsent follow-up.');
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await openConfiguration(page);
   await expect(page.getByRole('slider',{name:'Luna token budget',exact:true})).toBeDisabled();
   const settings=page.locator('.run-options');
   await expect(settings).toHaveAttribute('open');
@@ -767,9 +831,9 @@ test('compact mission panels preserve drafts and report live policy without issu
   await expect(page.getByRole('spinbutton',{name:'Mission budget',exact:true})).toBeHidden();
   await expect(composer).toHaveValue('Retain this unsent follow-up.');
   await page.getByRole('button',{name:'Close configuration',exact:true}).click();
-  await page.getByRole('tab',{name:'Trace',exact:true}).click();
+  await page.getByRole('tab',{name:'Model calls',exact:true}).click();
   await expect(composer).toBeVisible();
-  await page.getByRole('tab',{name:'Telemetry',exact:true}).click();
+  await page.getByRole('tab',{name:'Details',exact:true}).click();
   await policy.getByText('Reported policy state',{exact:true}).click();
   await expect(policy.locator('pre')).toContainText('scripted-mission');
   publish({...running,agent:{...running.agent,mission:{...running.agent.mission!,objective:{action:'explore',status:'active',remaining_s:4,remaining_travel_m:.8}}}});
@@ -800,6 +864,7 @@ test('power cycling stays idle and task cost limits persist', async ({page, requ
   await page.setViewportSize({width:1440,height:1000});
   await page.goto('/');
   const initial = await (await request.get('/api/state')).json();
+  await openConfiguration(page);
   const power = page.getByRole('switch', {name:'Robot power',exact:true});
   await expect(power).toHaveAttribute('aria-checked','true');
   await power.click();
@@ -814,12 +879,12 @@ test('power cycling stays idle and task cost limits persist', async ({page, requ
   expect(idle.run_id).toBe(initial.run_id);
   expect(idle.agent.active).toBe(false);
   expect(idle.agent.input_tokens).toBe(0);
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await openConfiguration(page);
   await page.getByRole('spinbutton',{name:'Luna request limit',exact:true}).fill('3');
   await page.getByRole('spinbutton',{name:'Luna token threshold',exact:true}).fill('12000');
   await expect.poll(async()=>(await(await request.get('/api/preferences')).json()).preferences.max_model_tokens).toBe(12000);
   await page.reload();
-  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Robot settings',exact:true}).click();
   await expect(page.getByRole('spinbutton',{name:'Luna request limit',exact:true})).toHaveValue('3');
   const sent:Record<string,unknown>[]=[];
   await page.route('**/api/mission/start',route=>{sent.push(route.request().postDataJSON());return route.fulfill({status:409,json:{detail:'Scripted contract capture'}});});
@@ -844,7 +909,7 @@ test('robot controls appear once and stay reachable through dialogs', async ({pa
   const start=page.getByRole('button',{name:'Start mission',exact:true});
   const status=page.getByRole('status',{name:'Robot status',exact:true});
   await expect(start).toBeEnabled();
-  await page.getByRole('tab',{name:'Telemetry',exact:true}).click();
+  await page.getByRole('tab',{name:'Details',exact:true}).click();
   await page.locator('.home-mapping > summary').click();
   await page.locator('.spatial-section > summary').click();
   await expect(page.locator('button.stop-button')).toHaveCount(1);
@@ -854,7 +919,7 @@ test('robot controls appear once and stay reachable through dialogs', async ({pa
     await page.setViewportSize({width,height:1000});
     await expect(start).toHaveCount(1);
     await expect(stop).toHaveCount(1);
-    await expect(page.getByRole('button',{name:'Open configuration',exact:true})).toBeVisible();
+    await expect(page.getByRole('button',{name:'Robot settings',exact:true})).toBeVisible();
     await expect(page.getByRole('button',{name:'Reset episode',exact:true})).toBeVisible();
     await expect(status).toHaveCount(1);
     expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
@@ -879,7 +944,7 @@ test('robot controls appear once and stay reachable through dialogs', async ({pa
   }
   await page.getByRole('button',{name:'Restore head camera',exact:true}).click();
   await page.getByRole('button',{name:'Restore spatial map',exact:true}).click();
-  for(const [opener,name] of [['Expand robot camera','Robot camera'],['Expand spatial map','Spatial map'],['Choose challenge','Load challenge']]) {
+  for(const [opener,name] of [['Expand robot camera','Robot camera'],['Expand spatial map','Spatial map'],['Load scenario','Load scenario']]) {
     await page.getByRole('button',{name:opener,exact:true}).click();
     const dialog=page.getByRole('dialog',{name,exact:true});
     await expect(dialog).toBeVisible();
@@ -891,7 +956,8 @@ test('robot controls appear once and stay reachable through dialogs', async ({pa
     expect(await dialog.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
     await stop.click();
     await expect.poll(async()=>(await(await request.get('/api/state')).json()).stopped).toBe(true);
-    await dialog.getByRole('button',{name:'Open configuration',exact:true}).click();
+    await page.keyboard.press('Escape');
+    await page.getByRole('button',{name:'Robot settings',exact:true}).click();
     const configuration=page.getByRole('dialog',{name:'Robot configuration',exact:true});
     await expect(dialog).not.toBeVisible();await expect(configuration).toBeVisible();
     await expect(configuration.getByRole('button',{name:'Reset episode',exact:true})).toBeVisible();
@@ -901,10 +967,12 @@ test('robot controls appear once and stay reachable through dialogs', async ({pa
     await expect(dialog).not.toBeVisible();
     await expect(page.locator('.observatory > .command-bar')).toHaveCount(1);
   }
-  await page.getByLabel('Robot options',{exact:true}).click();
+  await openConfiguration(page);
+  await page.getByText('Manual control options',{exact:true}).click();
   await page.getByRole('button',{name:'Enable manual control',exact:true}).click();
   await expect.poll(async()=>(await(await request.get('/api/state')).json()).stopped).toBe(false);
-  await page.getByLabel('Robot options',{exact:true}).click();
+  await openConfiguration(page);
+  await page.getByText('Manual control options',{exact:true}).click();
   const before=await(await request.get('/api/state')).json();
   await page.getByRole('button',{name:'Reset episode',exact:true}).click();
   await expect.poll(async()=>(await(await request.get('/api/state')).json()).run_id).not.toBe(before.run_id);
@@ -948,7 +1016,7 @@ test('unified mission shows actual observed map input and Stop revokes the share
   await page.setViewportSize({width:1440,height:1100});
   await page.goto('/');
   const destination=await realpath(await mkdtemp(join(tmpdir(),'milo-recorded-mission-')));
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await openConfiguration(page);
   const recordingPanel=page.getByRole('region',{name:'Test run recording',exact:true});
   await recordingPanel.getByRole('textbox',{name:'Recording folder',exact:true}).fill(destination);
   await recordingPanel.getByRole('button',{name:'Save recording settings',exact:true}).click();
@@ -969,11 +1037,11 @@ test('unified mission shows actual observed map input and Stop revokes the share
   expect(active.run_id).toBe(initial.run_id);expect(active.episode_epoch).toBe(initial.episode_epoch);
   expect(active.agent.goal).toBe(custom);
   await expect(page.getByRole('status',{name:'Run recording',exact:true})).toHaveText('Recording');
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await openConfiguration(page);
   await expect(recordingPanel.getByRole('textbox',{name:'Recording folder',exact:true})).toBeDisabled();
   await expect(recordingPanel.getByRole('switch',{name:'Record test runs',exact:true})).toBeDisabled();
   await page.getByRole('button',{name:'Close configuration',exact:true}).click();
-  await page.getByRole('tab',{name:'Trace',exact:true}).click();
+  await page.getByRole('tab',{name:'Model calls',exact:true}).click();
   await expect(page.getByRole('status',{name:'Robot status',exact:true})).toBeVisible();
   await page.locator('.exchange-entry').filter({has:page.locator('img[alt="Observed map supplied to Luna"]')})
     .first().locator('.exchange-disclosure > summary').click({timeout:70000});
@@ -1002,7 +1070,7 @@ test('unified mission shows actual observed map input and Stop revokes the share
   const catalog=await(await request.get('/api/test-results')).json();
   const batch=catalog.batches.find((entry:{session_id:string})=>entry.session_id===active.agent.session_id);
   expect(batch).toBeTruthy();expect((await request.get(batch.trials[0].replay_url)).ok()).toBe(true);
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
+  await openConfiguration(page);
   await expect(recordingPanel).toContainText(recording.run_directory!);
   await page.context().grantPermissions(['clipboard-read','clipboard-write']);
   await recordingPanel.getByRole('button',{name:'Copy recording path',exact:true}).click();
@@ -1019,12 +1087,12 @@ test('movement practice renders, completes a measured sequence and stops a custo
   await request.post('/api/preferences',{data:{exploration_budget:150,max_model_requests:2,recording_enabled:false}});
   await page.setViewportSize({width:1440,height:1000});
   await page.goto('/');
-  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
-  const menu=page.getByRole('dialog',{name:'Load challenge',exact:true});
+  await page.getByRole('button',{name:'Load scenario',exact:true}).click();
+  const menu=page.getByRole('dialog',{name:'Load scenario',exact:true});
   const selector=menu.getByRole('combobox',{name:'Predefined challenge',exact:true});
   await selector.selectOption('movement_practice');
   await menu.getByRole('combobox',{name:'Map source',exact:true}).selectOption('none');
-  await menu.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await menu.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   await expect(menu).toBeHidden();
   await expect(page.getByRole('heading',{name:'Movement Practice',exact:true})).toBeVisible();
   const canvas=page.locator('.spectator canvas');
@@ -1069,7 +1137,7 @@ test('movement practice renders, completes a measured sequence and stops a custo
     expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
     await canvas.scrollIntoViewIfNeeded();
     await page.screenshot({path:`../.runtime/movement-practice-v1/scene-${width}.png`});
-    await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+    await page.getByRole('button',{name:'Load scenario',exact:true}).click();
     if(process.env.MILO_CAPTURE_PREVIEWS!=='1') {
       await expect(menu.getByAltText('Scene preview: Movement Practice')).toHaveJSProperty('naturalWidth',480);
     }

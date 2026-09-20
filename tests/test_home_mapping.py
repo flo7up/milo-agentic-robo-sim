@@ -712,6 +712,27 @@ def test_frontier_ranking_prefers_useful_forward_progress_without_crossing_unkno
     assert all(len(home.route(pose[:2], candidate["position_m"], .3)) >= 2 for candidate in alternatives)
 
 
+def test_room_search_frontiers_use_only_connected_observations_and_allow_backtracking():
+    home = HomeMap("room-search")
+    home.evidence[180:221, 180:221] = -2
+    home.evidence[185:215, 225:245] = -2
+    original = home.evidence.copy()
+    candidates = home.search_frontiers([0., 0., 0.], .3)
+    assert len(candidates) > 1
+    for candidate in candidates:
+        assert candidate["gain_is_estimate"] and candidate["expected_unseen_m2"] > 0
+        assert candidate["position_m"][0] < 2.1
+        assert home.route([0., 0.], candidate["position_m"], .3)
+    chosen = candidates[0]["frontier_id"]
+    home.mark_frontier(chosen)
+    assert home.search_frontiers([0., 0., 0.], .3)[0]["frontier_id"] != chosen
+    assert all(candidate["frontier_id"] != chosen for candidate in home.search_frontiers([0., 0., 0.], .3, excluded=[chosen]))
+    home.visits[180:221, 180:221] = 1000
+    assert home.search_frontiers([0., 0., 0.], .3)
+    assert home.search_frontiers([0., 0., 0.], .3, obstacles=[[0., 0.]]) == []
+    np.testing.assert_array_equal(home.evidence, original)
+
+
 def test_frontier_ranking_softly_prefers_distance_from_visited_trail():
     home = HomeMap("home")
     home.evidence[182:219, 182:219] = -2

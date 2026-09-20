@@ -187,6 +187,22 @@ async def test_foundry_task_supervision_tool_has_no_operational_action_fields():
     schema = payload["tools"][0]["parameters"]
     assert set(schema["properties"]) == {"status", "plan", "guidance"}
     assert "available_actions" not in json.dumps(payload) and "motor command" in payload["instructions"]
+    assert "Find then approach an object requires kind=object and completion=arrive" in payload["instructions"]
+    assert "Find then enter a room requires kind=room and completion=arrive" in payload["instructions"]
+
+
+def test_named_approach_task_cannot_be_replaced_by_generic_exploration():
+    from backend.challenges import get_challenge
+    from backend.mission import TaskSupervision
+
+    goal = get_challenge("apartment").goal
+    for kind in ("explore", "room"):
+        with pytest.raises(ValueError, match="object plan"):
+            TaskSupervision.model_validate({"status": "aligned", "plan": {
+                "kind": kind, "target": "yellow cube on a short pedestal", "completion": "arrive"}}, context={"goal": goal})
+    review = TaskSupervision.model_validate({"status": "aligned", "plan": {
+        "kind": "object", "target": "yellow cube on a short pedestal", "completion": "arrive"}}, context={"goal": goal})
+    assert review.plan.kind == "object" and review.plan.completion == "arrive"
 
 
 def test_qwen_payload_labels_luna_guidance_non_authoritative():
@@ -443,7 +459,8 @@ async def test_local_mission_pipeline_preserves_worker_authority(tmp_path, endin
         await asyncio.wrap_future(worker.ready)
         worker.home_mission = HomeMission(worker, MapStore(tmp_path / "map.sqlite3"))
         controller.start(worker, start_settings(worker, model_id="qwen", reasoning="none", execution_mode="luna_continuous",
-            unified_mission=True, images_per_request=2, map_context=True, mission_budget_s=45., max_turns=2).model_copy(
+            unified_mission=True, images_per_request=2, map_context=True, mission_budget_s=45.,
+            max_turns=4 if ending in {"invalid", "incomplete"} else 2).model_copy(
                 update={"goal": "Find the Kitchen"}))
         await asyncio.wait_for(entered.wait(), 35.)
         if ending == "stop":
@@ -462,6 +479,11 @@ async def test_local_mission_pipeline_preserves_worker_authority(tmp_path, endin
         if ending == "normal":
             assert len(captured) == 2 and worker.sim.odometry[2] > .1
             assert controller.state["error"] is None, controller.state["error"]
+        elif ending in {"invalid", "incomplete"}:
+            assert len(captured) == 3 and abs(worker.sim.odometry[2]) < .01
+            assert "correction limit" in controller.state["error"]
+            assert controller.state["inference_budget"]["tokens"] == 360
+            assert not controller.state["inference_budget"]["usage_unknown"]
         else:
             assert len(captured) == 1 and abs(worker.sim.odometry[2]) < .01
     finally:
@@ -829,7 +851,8 @@ async def test_grounded_plan_rejection_does_not_authorize_motion(tmp_path):
 
 
 @pytest.mark.parametrize("fault", [None, "stale", "image", "stop"])
-async def test_grounded_find_recovers_with_current_evidence_and_no_approach(tmp_path, monkeypatch, fault):
+@pytest.mark.parametrize("local", [False, True])
+async def test_grounded_find_recovers_with_current_evidence_and_no_approach(tmp_path, monkeypatch, fault, local):
     import asyncio
     import time
     from backend.challenges import get_challenge
@@ -845,7 +868,7 @@ async def test_grounded_find_recovers_with_current_evidence_and_no_approach(tmp_
         for index, reply in enumerate([wrong, plan, corrected, corrected, corrected])])
     model.requires_grounded_plan = True
     worker = SimulationWorker(challenge=get_challenge("park"), rendering="tiny", pace=True)
-    controller = controller_for(model)
+    controller = AgentController(FoundryConfig(), lambda config: model) if local else controller_for(model)
     original = worker.identify_mission_target
     async def identify(mission, sensor, image, observation, decision):
         if fault == "stale":
@@ -860,6 +883,7 @@ async def test_grounded_find_recovers_with_current_evidence_and_no_approach(tmp_
         await asyncio.wrap_future(worker.ready)
         worker.home_mission = HomeMission(worker, MapStore(tmp_path / "identified.sqlite3"))
         controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
+            model_id="qwen" if local else "luna", reasoning="none" if local else "low",
             images_per_request=2, mission_budget_s=60., max_turns=5, max_model_requests=5).model_copy(
                 update={"goal": "Find the green parking bay. Stop without approaching it."}))
         await asyncio.wait_for(controller.task, 70.)
@@ -869,6 +893,11 @@ async def test_grounded_find_recovers_with_current_evidence_and_no_approach(tmp_
         assert payloads[0]["available_actions"] == payloads[1]["available_actions"] == ["plan"]
         assert all("plan" not in payload["available_actions"] and "identify_target" in payload["available_actions"]
             for payload in payloads[2:])
+        assert all((len(inputs) == 1) == local for inputs in model.inputs[2:])
+        assert payloads[2]["last_execution"]["status"] == "planned"
+        reviews = [entry["payload"] for entry in controller.trace()["events"] if entry["title"] == "Mission camera and observed map"]
+        assert all(review["retained_history_pairs"] == 0 and review["history_estimated_bytes"] == 0
+            for review in reviews[2:]) if local else all(review["retained_history_pairs"] for review in reviews[2:])
         assert worker.home_mission.task is None and abs(worker.sim.odometry[0]) < .005
         assert not worker.sim.proximity_sensors().collisions and worker.latest["stopped"]
         if fault:

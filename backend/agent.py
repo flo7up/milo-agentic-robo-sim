@@ -290,6 +290,9 @@ class FoundryModel:
             instructions=("Review only the original robot task request. "
                 "Return one review_task call. Do not choose an available action, destination, coordinate, route, motor command, or completion. "
                 "Preserve explicit task semantics: circle/circuit/orbit means a circuit with the stated direction; approach means object arrival; enter means room arrival. "
+                "Exploration is a search strategy, not the mission kind when a named object or room is the goal. "
+                "Find then approach an object requires kind=object and completion=arrive, even when the goal also says explore rooms. "
+                "Find then enter a room requires kind=room and completion=arrive. Use kind=explore only for exploration without a named target. "
                 "plan.target must be a short noun phrase from the goal, such as 'table' or 'yellow cube', never a copied sentence or the whole instruction. "
                 "Preserve distinguishing attributes within 160 characters. If validation feedback is supplied, correct only the invalid contract without changing the requested task. "
                 "Never add return_home unless the user explicitly requests returning Home or to the start. "
@@ -406,16 +409,31 @@ class OllamaModel:
         message = data.get("message")
         if not isinstance(message, dict) or message.get("role") != "assistant":
             raise ValueError("Ollama returned an invalid assistant response; no motion executed.")
+        mission_error = None
         if unified:
             if message.get("tool_calls"):
                 raise ValueError("Ollama returned tool calls instead of a mission JSON decision; no motion executed.")
+            content = message.get("content", "")
             try:
-                decision = json.loads(message.get("content", ""))
-            except (TypeError, ValueError):
-                raise ValueError("Ollama returned invalid mission JSON; no motion executed.") from None
-            if not isinstance(decision, dict):
-                raise ValueError("Ollama mission decision must be an object; no motion executed.")
-            message = {"role": "assistant", "tool_calls": [{"function": {"name": "guide_mission", "arguments": decision}}]}
+                decision = json.loads(content)
+            except (TypeError, ValueError) as error:
+                decision = None
+                mission_error = {"code": "invalid_json", "reason": "Return one valid JSON object matching the supplied mission schema; no prose or markdown."}
+                if isinstance(error, json.JSONDecodeError):
+                    mission_error["parse_error"] = {"message": error.msg, "line": error.lineno, "column": error.colno}
+            if mission_error is None and not isinstance(decision, dict):
+                mission_error = {"code": "invalid_decision", "reason": "The mission decision must be one JSON object matching the supplied schema."}
+            if data.get("done") is not True or data.get("done_reason") != "stop":
+                mission_error = {**(mission_error or {}), "code": "incomplete_decision",
+                    "reason": "The mission response was incomplete. Return a concise, complete JSON object matching the supplied schema."}
+            if mission_error:
+                # Preserve usage and bounded diagnostics so the executive can charge and
+                # reject this attempt. Never repair malformed text into an executable call.
+                mission_error.update(done_reason=str(data.get("done_reason", ""))[:80],
+                    content_chars=len(content) if isinstance(content, str) else None)
+                message = {"role": "assistant", "content": content[:2000] if isinstance(content, str) else ""}
+            else:
+                message = {"role": "assistant", "tool_calls": [{"function": {"name": "guide_mission", "arguments": decision}}]}
         outputs = []
         if message.get("content"):
             outputs.append({"id": str(uuid4()), "type": "message", "role": "assistant", "status": "completed",
@@ -429,7 +447,7 @@ class OllamaModel:
                 raise ValueError("Ollama returned an invalid tool call; no motion executed.")
             outputs.append({"type": "function_call", "call_id": call.get("id") or str(uuid4()), "name": function["name"],
                             "arguments": json.dumps(function["arguments"])})
-        if not outputs:
+        if not outputs and not mission_error:
             raise ValueError("Ollama returned no answer or action; robot stopped.")
         usage = None
         if data.get("prompt_eval_count") is not None and data.get("eval_count") is not None:
@@ -451,6 +469,7 @@ class OllamaModel:
             "model": data.get("model", profile.deployment), "output": outputs, "tools": [], "tool_choice": "auto",
             "parallel_tool_calls": False, "usage": usage,
             "local_timing": local_timing,
+            **({"local_mission_error": mission_error} if mission_error else {}),
             "status": "completed" if data.get("done") is True and data.get("done_reason") == "stop" else "incomplete"})
 
     async def close(self):

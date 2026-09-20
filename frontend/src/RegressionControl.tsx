@@ -113,6 +113,8 @@ export function RegressionControl({state, connected, request}: {state:LiveState;
   }
   const finished=suite.cases.filter(entry=>['passed','failed','invalid','cancelled','not_run'].includes(entry.status)).length;
   const missionMinutes=Math.ceil(suite.cases.reduce((total,entry)=>total+entry.budget_s,0)/60);
+  const totalRequests=suite.cases.reduce((total,entry)=>total+(entry.max_model_requests??12),0);
+  const totalTokens=suite.cases.reduce((total,entry)=>total+(entry.max_model_tokens??80000),0);
   return <details className="regression-panel" open={expanded} onToggle={event=>setExpanded(event.currentTarget.open)}>
     <summary><ListChecks size={17}/><strong>Regression baseline</strong><span>{suite.active ? `${(suite.current_index ?? 0)+1} / ${suite.cases.length} · ${suite.phase.replaceAll('_',' ')}` : suite.phase==='idle' ? `${suite.cases.length} cases · ${missionMinutes} min mission budget` : `${suite.phase} · ${finished} / ${suite.cases.length}`}</span></summary>
     <section aria-label="Observable regression baseline">
@@ -122,7 +124,7 @@ export function RegressionControl({state, connected, request}: {state:LiveState;
           <option value="hybrid">Qwen + Luna task supervision</option></select></label>
         <label>Reasoning<select aria-label="Baseline reasoning" value={effectiveReasoning} disabled={locked} onChange={event=>setReasoning(event.target.value as Reasoning)}>
           {efforts.map(effort=><option key={effort} value={effort}>{effort}</option>)}</select></label>
-        <button type="button" disabled={locked || !profile?.configured || (selectedModel==='hybrid' && !taskSupervisor?.configured)} onClick={()=>void start()} title={`Run all ${suite.cases.length} cases in fresh scenes; up to ${suite.cases.length*12} primary model requests and ${(suite.cases.length*80000).toLocaleString('en-US')} primary tokens total, plus local preparation and one Luna task review per case in hybrid mode. Existing scene will be replaced.`}>
+        <button type="button" disabled={locked || !profile?.configured || (selectedModel==='hybrid' && !taskSupervisor?.configured)} onClick={()=>void start()} title={`Run all ${suite.cases.length} cases in fresh scenes; up to ${totalRequests} primary model requests and ${totalTokens.toLocaleString('en-US')} primary tokens total, plus local preparation and one Luna task review per case in hybrid mode. Existing scene will be replaced.`}>
           {pending ? <LoaderCircle size={16} className="loading-icon"/> : <Play size={16}/>}Start baseline</button>
         {suite.active && <button type="button" className="danger" aria-label="Stop baseline" disabled={!connected} onClick={()=>void request('stop',{}).catch(failure=>setError(String(failure)))}><CircleStop size={16}/>Stop baseline</button>}
         {suite.sequence_id && <button type="button" className="icon-button" aria-label="Download baseline report" title="Download baseline report" onClick={()=>void download()}><Download size={16}/></button>}
@@ -134,7 +136,7 @@ export function RegressionControl({state, connected, request}: {state:LiveState;
           const Icon=entry.status==='passed' ? CheckCircle2 : ['failed','invalid'].includes(entry.status) ? TriangleAlert : active ? LoaderCircle : Circle;
           return <li key={entry.id} data-status={entry.status} aria-current={suite.active && index===suite.current_index ? 'step' : undefined}>
             <img src={`/scenario-previews/${entry.challenge_id}.webp`} alt="" width={48} height={30}/>
-            <span className="regression-case-title">{index+1}. {entry.title}<small>{entry.budget_s} s{entry.elapsed_s!==undefined ? ` / ${entry.elapsed_s.toFixed(1)} s elapsed` : ''}</small></span>
+            <span className="regression-case-title">{index+1}. {entry.title}<small>{entry.budget_s} s / {entry.max_model_requests??12} requests / {(entry.max_model_tokens??80000).toLocaleString('en-US')} tokens{entry.elapsed_s!==undefined ? ` / ${entry.elapsed_s.toFixed(1)} s elapsed` : ''}</small></span>
             <span className="regression-case-status"><Icon size={15} className={active?'loading-icon':''}/>{entry.status.replaceAll('_',' ')}</span>
             {(entry.error || entry.outcome?.message) && <small className="regression-case-detail">{entry.error || entry.outcome?.message}</small>}
             <RegressionProgress entry={entry}/>

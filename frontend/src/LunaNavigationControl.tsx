@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, Bot, Check, ChevronRight, CircleDot, Copy, Folder, Minus, Plus, Play, Power, Route, Save, Settings2, Timer, Send, MessageSquare, History, Radio, X } from 'lucide-react';
 import { ExchangeFeed } from './ExchangeFeed';
+import { ModelActivity } from './ModelActivity';
 import { MotionDiagnostics } from './MotionDiagnostics';
 import { LocalModelProgress } from './LocalModelProgress';
 import { usePreference, useSavePreferences } from './Preferences';
@@ -32,11 +33,12 @@ function TokenCounter({ agent, connected }: { agent: LiveState['agent']; connect
   </div>;
 }
 
-export function LunaNavigationControl({ state, connected, request, commandHost, settingsHost, spatialTelemetry, telemetryContent }: {
+export function LunaNavigationControl({ state, connected, request, commandHost, settingsHost, spatialTelemetry, telemetryContent, robotAccess }: {
   state: LiveState; connected: boolean; request: (path: string, body?: unknown) => Promise<unknown>; commandHost: HTMLElement | null;
   settingsHost?:HTMLElement | null;
   spatialTelemetry?:SpatialTelemetry | null;
   telemetryContent?:ReactNode;
+  robotAccess?:ReactNode;
 }) {
   const agent = state.agent;
   const kitchenSearch = state.challenge?.id === 'flat_kitchen';
@@ -57,9 +59,10 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
   const goal = agent.active && agent.goal ? agent.goal : goals[goalKey] ?? state.challenge?.goal ?? 'Inspect the scene and navigate safely.';
   const setGoal = (value: string) => setGoals(previous => ({...previous, [goalKey]: value}));
   const [interval, setInterval] = usePreference('interval', .25);
-  const [turns, setTurns] = usePreference('turns', 80);
-  const [maxRequests, setMaxRequests] = usePreference('max_model_requests', 12);
-  const [maxTokens, setMaxTokens] = usePreference('max_model_tokens', 100000);
+  const kitchenBudget = kitchenSearch && unified;
+  const [turns, setTurns] = usePreference(kitchenBudget ? 'kitchen_turns' : 'turns', kitchenBudget ? 60 : 80);
+  const [maxRequests, setMaxRequests] = usePreference(kitchenBudget ? 'kitchen_max_model_requests' : 'max_model_requests', kitchenBudget ? 60 : 12);
+  const [maxTokens, setMaxTokens] = usePreference(kitchenBudget ? 'kitchen_max_model_tokens' : 'max_model_tokens', kitchenBudget ? 400000 : 100000);
   const [preferredReasoning, setReasoning] = usePreference('reasoning', 'high');
   const reasoning = useLocalModel ? 'none' : luna?.reasoning_efforts.includes(preferredReasoning) ? preferredReasoning : luna?.reasoning_efforts[0] ?? 'high';
   const taskSupervisorReasoning = luna?.reasoning_efforts.includes('low') ? 'low' : luna?.reasoning_efforts[0] ?? 'none';
@@ -299,19 +302,19 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     if (next !== 'telemetry') setInspector(next);
   }
   return <section className="agent-section" aria-label="LLM control">
-    {settingsHost && createPortal(<button type="button" className="icon-button" aria-label="Open configuration" title="Robot configuration"
+    {settingsHost && createPortal(<button type="button" aria-label="Robot settings" title="Robot configuration"
       aria-haspopup="dialog" aria-controls="robot-configuration" aria-expanded={configurationOpen} onClick={event => {
         if (configurationOpen) return;
         event.currentTarget.closest('dialog')?.close();
         selectInspector('settings');
-      }}><Settings2 size={19}/></button>, settingsHost)}
+      }}><Settings2 size={17}/>Robot settings</button>, settingsHost)}
     {createPortal(<dialog id="robot-configuration" className="robot-configuration" ref={configurationDialog} aria-labelledby="configuration-title"
       onClose={closeConfiguration}>
       <div className="configuration-heading"><h2 id="configuration-title"><Settings2 size={18}/>Robot configuration</h2>
         <button type="button" className="icon-button" aria-label="Close configuration" title="Close configuration"
           onClick={closeConfiguration}><X size={18}/></button></div>
       <RobotControlSlot active={configurationOpen}/>
-      <div className="configuration-content"><fieldset disabled={configurationSaving}>
+      <div className="configuration-content">{robotAccess}<fieldset disabled={configurationSaving}>
         <div ref={setConfigurationHost} className="configuration-fields"/>
       </fieldset></div>
       <div className="configuration-footer">
@@ -322,23 +325,26 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
           <Save size={16}/>{configurationSaving ? 'Saving configuration' : 'Save configuration'}</button>
       </div>
     </dialog>, document.body)}
-    <div className="panel-header console-heading"><h3><Bot size={17} />{modelName} console</h3>
+    <div className="panel-header console-heading"><h3><Bot size={17} />Robot assistant</h3>
       {recording?.active && <span className="tag" role="status" aria-label="Run recording"><CircleDot size={13}/>{recording.status === 'finalizing' ? 'Saving recording' : 'Recording'}</span>}
-      <button type="button" className="icon-button" aria-label={consoleMinimized ? 'Restore Luna console' : 'Minimize Luna console'}
-        title={consoleMinimized ? 'Restore Luna console' : 'Minimize Luna console'} aria-expanded={!consoleMinimized} aria-controls="luna-console-body"
+      <button type="button" className="icon-button" aria-label={consoleMinimized ? 'Show assistant details' : 'Hide assistant details'}
+        title={consoleMinimized ? 'Show assistant details' : 'Hide assistant details'} aria-expanded={!consoleMinimized} aria-controls="luna-console-body"
         onClick={()=>setConsoleMinimized(value=>!value)}>{consoleMinimized ? <Plus size={16}/> : <Minus size={16}/>}</button>
     </div>
+    <ModelActivity agent={agent} connected={connected} modelName={localOnly ? 'Local exploration' : modelName}
+      onCalls={()=>{selectInspector('trace');requestAnimationFrame(()=>document.getElementById('inspector-trace')?.focus());}}
+      onDetails={()=>{selectInspector('telemetry');requestAnimationFrame(()=>document.getElementById('inspector-telemetry')?.focus());}} />
     <div id="luna-console-body" hidden={consoleMinimized}>
     <div className="inspector-tabs tabs" role="tablist" aria-label="Robot inspector" onKeyDown={event => {
-      const keys = ['conversation', 'trace', 'telemetry', 'settings'] as const;
+      const keys = ['conversation', 'trace', 'telemetry'] as const;
       const index = keys.indexOf(inspector);
       const next = event.key === 'ArrowRight' ? (index + 1) % keys.length : event.key === 'ArrowLeft' ? (index + keys.length - 1) % keys.length : event.key === 'Home' ? 0 : event.key === 'End' ? keys.length - 1 : -1;
       if (next < 0) return;
       event.preventDefault(); selectInspector(keys[next]);
       event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next].focus();
     }}>
-      {([{id:'conversation',label:'Conversation',icon:MessageSquare},{id:'trace',label:'Trace',icon:Radio},
-        {id:'telemetry',label:'Telemetry',icon:Activity},{id:'settings',label:'Settings',icon:Settings2}] as const).map(({id,label,icon:Icon}) =>
+      {([{id:'conversation',label:'Conversation',icon:MessageSquare},{id:'trace',label:'Model calls',icon:Radio},
+        {id:'telemetry',label:'Details',icon:Activity}] as const).map(({id,label,icon:Icon}) =>
         <button type="button" key={id} role="tab" id={`inspector-${id}`} aria-controls={`panel-${id}`} aria-selected={inspector === id}
           tabIndex={inspector === id ? 0 : -1} onClick={() => selectInspector(id)}><Icon size={15} />{label}</button>)}
     </div>
@@ -446,8 +452,8 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
       </div>
     </section>
     </div>
-    <div id="panel-trace" role="tabpanel" aria-labelledby="inspector-trace" hidden={!hasRun || inspector !== 'trace'}>
-    <ExchangeFeed agent={agent} visible={hasRun && inspector === 'trace'} />
+    <div id="panel-trace" role="tabpanel" aria-labelledby="inspector-trace" hidden={inspector !== 'trace'}>
+    <ExchangeFeed agent={agent} visible={inspector === 'trace' && !consoleMinimized} />
     <details className="run-memory" aria-label="Episode movement memory">
       <summary><History size={15} />Movement memory</summary>
       <div className="agent-metrics"><span>Route samples <strong>{agent.run_memory?.visited_positions_m.length ?? 0}</strong></span>
@@ -462,7 +468,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     </div>
     {configurationHost && createPortal(<details className="run-options compact-disclosure" open={runSettingsOpen} onToggle={event => setRunSettingsOpen(event.currentTarget.open)}>
     <summary><ChevronRight className="disclosure-chevron" size={15} /><Settings2 size={15} /><strong>Run settings</strong></summary>
-    <div id="panel-settings" role="tabpanel" aria-labelledby="inspector-settings">
+    <div id="panel-settings">
       <MemoryControls active={configurationOpen} locked={!connected || agent.active || state.busy || pending || configurationSaving}
         runId={state.run_id} epoch={state.episode_epoch} request={request}/>
       <section className="recording-settings" aria-label="Test run recording">

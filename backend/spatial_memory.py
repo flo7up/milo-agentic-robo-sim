@@ -357,6 +357,7 @@ class SpatialMemoryStore:
                 for place in document["places"]:
                     place["requires_revalidation"] = True
                 document["frontier_attempts"] = {}
+                document.pop("passage_memory", None)
                 connection.execute("UPDATE maps SET document=? WHERE map_id=?", (json.dumps(document), scope.map_id))
 
     def checkpoint(self, scope, home, name):

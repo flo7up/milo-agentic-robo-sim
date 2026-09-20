@@ -118,6 +118,8 @@ class HomeMission:
 
     def invalidate(self, reason):
         self.fail(reason, "cancelled")
+        if self.home:
+            self.home.passage_memory.break_tracking()
         self.memory_path, self.memory_origin = [], None
         self.room_verification = None
         self.room_evidence_after = time.monotonic()
@@ -202,6 +204,8 @@ class HomeMission:
         if sensor:
             self.observe_depth(sensor)
         self.localization["status"] = "localized"
+        self.home.passage_memory.bind_frame(self.home.frame_revision)
+        self.home.passage_memory.observe(self.pose, now, self.home.observed_connection)
         self.allowed_cache = None
         if getattr(self.worker, "memory", None):
             from backend.memory_session import track_memory_travel
@@ -481,7 +485,7 @@ class HomeMission:
                         raise ValueError("FRONTIER_SELECTION_CHANGED: supplied identity changed")
                     chosen_frontier = {"frontier_id": selected_frontier.frontier_id, "position_m": list(selected_frontier.position_m)}
                 else:
-                    choices = self.home.frontiers(self.pose, radius, self.obstacles(), request.region_id)
+                    choices = self.home.exploration_frontiers(self.pose, radius, self.obstacles(), request.region_id)
                     chosen_frontier = next((item for item in choices if item["frontier_id"] == request.frontier_id), None)
                 if chosen_frontier is None:
                     raise ValueError("UNKNOWN_FRONTIER: select a currently reachable frontier")
@@ -624,7 +628,7 @@ class HomeMission:
                     if not timing_failure and task["kind"] == "explore" and not task.get("single_frontier") and task["frontier_id"]:
                         task.setdefault("rejected_frontiers", []).append(task["frontier_id"])
                         if not getattr(worker, "memory", None):
-                            self.home.mark_frontier(task["frontier_id"])
+                            self.home.mark_frontier(task["frontier_id"], "blocked")
                         task["target_m"] = None
                 worker.continuous = None
             if task["target_m"] is not None and math.dist(self.pose[:2], task["target_m"]) <= .15:
@@ -678,8 +682,8 @@ class HomeMission:
                     return
             radius = sim.robot_footprint()["radius_m"]
             if task["target_m"] is None:
-                frontiers = self.home.frontiers(self.pose, radius, self.obstacles(), task["region_id"],
-                    excluded=task.get("rejected_frontiers", ()))
+                frontiers = self.home.exploration_frontiers(self.pose, radius, self.obstacles(), task["region_id"],
+                    excluded=task.get("rejected_frontiers", ()), room_search=task.get("room_search", False))
                 if not frontiers:
                     task.update(status="completed", reason="No untried reachable frontiers; closed and unknown areas remain unexplored", completion_verified=True)
                     self.stage = "review"
@@ -701,7 +705,7 @@ class HomeMission:
                     raise
                 task.setdefault("rejected_frontiers", []).append(task["frontier_id"])
                 if not getattr(worker, "memory", None):
-                    self.home.mark_frontier(task["frontier_id"])
+                    self.home.mark_frontier(task["frontier_id"], "blocked")
                 task["target_m"] = None
                 task["retries"] += 1
                 task["reason"] = "Selecting another frontier after map rejection: " + str(error)
@@ -734,6 +738,7 @@ class HomeMission:
             sim.stop()
 
     def record_route_failure(self, phase, reason):
+        self.home.passage_memory.finish(self.task.get("frontier_id"), self.home.known_near, "blocked")
         failures = self.task.setdefault("route_failures", [])
         failures.append({"phase": phase, "reason": reason, "segment": self.task.get("segments", 0),
             "frontier_id": self.task.get("frontier_id"),
@@ -838,7 +843,7 @@ class HomeMission:
             result["room_graph"] = {"map_id": home.identity, "frame": "map", "timestamp_unix_s": time.time(),
                 **home.graph_summary(allowed)}
             result["frontier_selection_available"] = fresh and not self.active
-            result["frontiers"] = home.frontiers(self.pose, radius, self.obstacles())[:8] if result["frontier_selection_available"] else []
+            result["frontiers"] = home.exploration_frontiers(self.pose, radius, self.obstacles())[:8] if result["frontier_selection_available"] else []
             record = self.room_verification
             current = bool(record and self.task and record["task_id"] == self.task["task_id"]
                 and record["run_id"] == self.worker.sim.run_id and record["episode_epoch"] == self.worker.sim.epoch

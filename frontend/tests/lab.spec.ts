@@ -223,7 +223,7 @@ test('movement zones render sampled clearance without changing camera or motion'
   await expect(canvas).toHaveAttribute('data-zone-count','48');
   await expect.poll(async()=>(await spectatorPixels(page)).signature!==before.signature).toBe(true);
   await expect(page.getByLabel('Movement zone legend')).toContainText('geometry only');
-  await page.getByRole('button',{name:'Minimize Luna console',exact:true}).click();
+  await page.getByRole('button',{name:'Hide assistant details',exact:true}).click();
   await expect(canvas).toHaveAttribute('data-zone-count','48');
   await expect.poll(()=>page.evaluate(()=>sessionStorage.getItem('milo-sensors-and-areas'))).toBe('true');
   await page.reload();
@@ -693,7 +693,7 @@ test('textures and live proximity readings render in the operator views', async 
   await expect(front.locator('dd')).not.toHaveText('0.67 m');
   expect((await (await motion).json()).status).toBe('ok');
   await page.getByRole('combobox', { name: 'Predefined challenge', exact: true }).selectOption('apartment');
-  await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+  await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Apartment Search', exact: true })).toBeVisible();
   await expect.poll(() => loadedTextures.size).toBe(6);
   await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(50);
@@ -800,6 +800,60 @@ async function writeScenarioPreview(page: Page, identifier: string) {
   await writeFile(new URL(`${identifier}.webp`, directory), Buffer.from(encoded, 'base64'));
 }
 
+for (const [identifier, title] of [['maze', 'Maze'], ['maze_complex', 'Maze — Complex']] as const) {
+test(`${identifier} loads without a saved map and preserves its goal and selection on reset`, async ({page,request}) => {
+  test.setTimeout(120000);
+  const errors:string[]=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  await page.setViewportSize({width:1440,height:1000});
+  await page.goto('/');
+  const chooser=page.locator('.challenge-menu > button');
+  await chooser.click();
+  const menu=page.locator('dialog.challenge-menu-dialog');
+  await menu.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption(identifier);
+  await expect(menu.getByRole('combobox',{name:'Map source',exact:true})).toHaveValue('none');
+  await expect(menu.locator('.scenario-summary')).toContainText('dead ends');
+  await expect(menu.locator('.scenario-completion')).toContainText('one simulated second');
+  const responsePromise=page.waitForResponse(response=>response.url().endsWith('/api/challenges/load')&&response.request().method()==='POST');
+  await menu.getByRole('button',{name:'Load selected scenario',exact:true}).click();
+  const response=await responsePromise;
+  expect(response.ok()).toBe(true);
+  expect(response.request().postDataJSON()).toEqual({challenge_id:identifier,environment:'standalone',reuse_saved_map:false});
+  const loaded:LiveState=await response.json();
+  expect(loaded.challenge?.status).toBe('in_progress');
+  expect(loaded.regression?.cases.map(entry=>entry.id)).toEqual(initial.regression?.cases.map(entry=>entry.id));
+  await expect(menu).toBeHidden();
+  await expect(page.getByRole('heading',{name:title,exact:true})).toBeVisible();
+  await expect(page.locator('textarea[aria-label="Robot goal"]')).toHaveValue(loaded.challenge!.goal);
+  await expect.poll(async()=>(await spectatorPixels(page)).colors).toBeGreaterThan(30);
+  await writeScenarioPreview(page,identifier);
+  for(const width of [1440,390]) {
+    await page.setViewportSize({width,height:1000});
+    await page.locator('.spectator-shell').screenshot({path:`../.runtime/maze-exploration-v1/${identifier}-scene-${width}.png`});
+    await chooser.click();
+    if(process.env.MILO_CAPTURE_PREVIEWS!=='1') {
+      await expect(menu.getByAltText(`Scene preview: ${title}`)).toHaveJSProperty('naturalWidth',480);
+    }
+    expect(await menu.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+    await menu.getByRole('button',{name:'Close challenge menu',exact:true}).click();
+  }
+  const reset=await request.post('/api/reset',{data:{}});
+  expect(reset.ok()).toBe(true);
+  const resetState:LiveState=await reset.json();
+  expect(resetState.run_id).not.toBe(loaded.run_id);
+  expect(resetState.challenge?.id).toBe(identifier);
+  expect(resetState.challenge?.completed_objectives).toBe(0);
+  expect(resetState.agent.active).toBe(false);
+  expect(resetState.map_setup?.reuse_saved_map).toBe(false);
+  await page.reload();
+  await chooser.click();
+  await expect(menu.getByRole('combobox',{name:'Predefined challenge',exact:true})).toHaveValue(identifier);
+  await expect(menu.getByRole('combobox',{name:'Map source',exact:true})).toHaveValue('none');
+  expect(errors).toEqual([]);
+});
+}
+
 test('farther chair circuit loads, persists and renders without changing the fixed suite', async ({page,request}) => {
   test.setTimeout(90000);
   const errors:string[]=[];
@@ -807,14 +861,14 @@ test('farther chair circuit loads, persists and renders without changing the fix
   const initial:LiveState=await(await request.get('/api/state')).json();
   await page.setViewportSize({width:1440,height:1000});
   await page.goto('/');
-  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
-  const menu=page.getByRole('dialog',{name:'Load challenge',exact:true});
+  await page.getByRole('button',{name:'Load scenario',exact:true}).click();
+  const menu=page.getByRole('dialog',{name:'Load scenario',exact:true});
   await menu.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption('chair_circuit_far');
   await menu.getByRole('combobox',{name:'Map source',exact:true}).selectOption('none');
   await expect(menu.locator('.scenario-summary')).toContainText('3.2 m');
   await expect(menu.getByRole('combobox',{name:'Object to circle',exact:true})).toHaveCount(0);
   const responsePromise=page.waitForResponse(response=>response.url().endsWith('/api/challenges/load')&&response.request().method()==='POST');
-  await menu.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await menu.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   const response=await responsePromise;
   expect(response.ok()).toBe(true);
   expect(response.request().postDataJSON()).toEqual({challenge_id:'chair_circuit_far',environment:'standalone',reuse_saved_map:false});
@@ -833,7 +887,7 @@ test('farther chair circuit loads, persists and renders without changing the fix
     await expect.poll(async()=>(await spectatorPixels(page)).colors).toBeGreaterThan(30);
     expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
     await page.locator('.spectator-shell').screenshot({path:`../.runtime/chair-circuit-far-v1/scene-${width}.png`});
-    await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+    await page.getByRole('button',{name:'Load scenario',exact:true}).click();
     await expect(menu.getByRole('combobox',{name:'Predefined challenge',exact:true})).toHaveValue('chair_circuit_far');
     if(process.env.MILO_CAPTURE_PREVIEWS!=='1') {
       await expect(menu.getByAltText('Scene preview: Circle the Chair: Farther Start')).toHaveJSProperty('naturalWidth',480);
@@ -852,7 +906,7 @@ test('farther chair circuit loads, persists and renders without changing the fix
   expect(resetState.challenge?.orbit).toEqual(loaded.challenge?.orbit);
   expect(resetState.agent.active).toBe(false);
   await page.reload();
-  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+  await page.getByRole('button',{name:'Load scenario',exact:true}).click();
   await expect(menu.getByRole('combobox',{name:'Predefined challenge',exact:true})).toHaveValue('chair_circuit_far');
   expect(errors).toEqual([]);
 });
@@ -874,7 +928,7 @@ test('shared apartment selection preserves the common world and renders across v
   for (const identifier of ['furniture_circuit', 'apartment', 'flat_kitchen', 'recharge']) {
     await selector.selectOption(identifier);
     const response = page.waitForResponse(reply => reply.url().endsWith('/api/challenges/load') && reply.request().method() === 'POST');
-    await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+    await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
     expect((await response).ok()).toBe(true);
     await expect(page.locator('.scenario-selection-state')).toHaveText('Loaded');
     const state: LiveState = await (await request.get('/api/state')).json();
@@ -935,7 +989,7 @@ test('predefined challenges load distinct scenes and goals and reset in place', 
   for (const preset of presets) {
     await selector.selectOption(preset.id);
     await expect(page.locator('.challenge-goal')).toHaveText(preset.goal);
-    await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+    await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
     await expect(page.getByRole('heading', { name: preset.title, exact: true })).toBeVisible();
     await expect(page.getByRole('textbox', { name: 'Robot goal', exact: true })).toHaveValue(preset.goal);
     await expectDefaultTurnLimit(page);
@@ -959,7 +1013,7 @@ test('predefined challenges load distinct scenes and goals and reset in place', 
   }
   expect(signatures.size).toBe(presets.length);
   await selector.selectOption('bench');
-  await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+  await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Practice bench', exact: true })).toBeVisible();
   await expect(page.locator('.challenge-status')).toHaveCount(0);
   await writeScenarioPreview(page, 'bench');
@@ -976,7 +1030,7 @@ for (const width of [1440, 390]) {
       ['inspection', 'Service Gallery Inspection'], ['workshop', 'Cluttered Assembly Workshop'], ['pedestrian_crossing', 'Pedestrian Crossing'],
       ['flat_kitchen', 'Find the Kitchen']]) {
       await selector.selectOption(identifier);
-      await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+      await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
       await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
       await expect(page.locator('.challenge-toolbar')).toContainText('Advanced');
       await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(30);
@@ -1011,7 +1065,7 @@ test('kitchen to bathroom shows recognizable camera views and resettable arrival
   await page.goto('/');
   const selector = page.getByRole('combobox', { name: 'Predefined challenge', exact: true });
   await selector.selectOption('kitchen_bathroom');
-  await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+  await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Kitchen to Bathroom', exact: true })).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'Robot goal', exact: true })).toContainText('identify your current room');
   await expectDefaultTurnLimit(page);
@@ -1056,7 +1110,7 @@ test('apartment search loads on mobile and shows inspected-target completion and
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
   await page.getByRole('combobox', { name: 'Predefined challenge', exact: true }).selectOption('apartment');
-  await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+  await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Apartment Search', exact: true })).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'Robot goal', exact: true })).toContainText('yellow cube');
   await expectDefaultTurnLimit(page);
@@ -1094,7 +1148,7 @@ test('parking challenge shows measured completion and mobile goals fit', async (
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
   await page.getByRole('combobox', { name: 'Predefined challenge', exact: true }).selectOption('park');
-  await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+  await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Park in the Bay', exact: true })).toBeVisible();
   for (const speed of [.3, .3, 0]) {
     const state = await (await request.get('/api/state')).json();
@@ -1112,9 +1166,9 @@ test('parking challenge shows measured completion and mobile goals fit', async (
   await page.getByRole('button', { name: 'Reset episode', exact: true }).click();
   await expect(page.locator('.challenge-status')).toHaveText('0 / 1 goals complete');
   await page.getByRole('combobox', { name: 'Predefined challenge', exact: true }).selectOption('sort');
-  await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+  await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Color Sort', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Load challenge', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Load selected scenario', exact: true })).toBeEnabled();
   await expect(page.locator('.challenge-objectives li')).toHaveCount(2);
   await expect(page.locator('.challenge-status')).toHaveText('0 / 2 goals complete');
   await expect.poll(async () => (await spectatorPixels(page)).colors).toBeGreaterThan(20);
@@ -1126,7 +1180,7 @@ test('remember and recharge exposes battery, wait, and a resettable mission', as
   await page.setViewportSize({ width: 1440, height: 1100 });
   await page.goto('/');
   await page.getByRole('combobox', { name: 'Predefined challenge', exact: true }).selectOption('recharge');
-  await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+  await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Remember and Recharge', exact: true })).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'Robot goal', exact: true })).toContainText('find your way back');
   await expectDefaultTurnLimit(page);
@@ -1135,7 +1189,7 @@ test('remember and recharge exposes battery, wait, and a resettable mission', as
   await expect(battery).toHaveAttribute('value', '100');
   const waitCompleted = page.waitForResponse(response => response.url().endsWith('/api/command')
     && response.request().postDataJSON()?.tool === 'wait', { timeout: 20000 });
-  await page.getByRole('link', {name:'Controls',exact:true}).click();
+  await page.locator('.manual-disclosure > summary').click();
   await page.getByRole('button', { name: 'Wait', exact: true }).click();
   expect((await (await waitCompleted).json()).status).toBe('ok');
   await expect(page.locator('.event-list')).toContainText('wait');
@@ -1289,7 +1343,7 @@ test('token tracker shows exact run totals and retains stale readings until reco
     liveSocket!.send(JSON.stringify(current));
   }
   await page.goto('/');
-  await page.getByRole('tab', { name: 'Telemetry', exact: true }).click();
+  await page.getByRole('tab', { name: 'Details', exact: true }).click();
   const tracker = page.getByRole('group', { name: 'Token usage', exact: true });
   await expect(tracker).toHaveCount(0);
   expect(await page.locator('.activity-summary .token-tracker').count()).toBe(0);
@@ -1506,7 +1560,13 @@ test('manual control, authoritative camera isolation, and immediate stop', async
   await expect.poll(async () => (await spectatorPixels(page)).signature).not.toBe(initialPixels.signature);
   expect(await camera.getAttribute('src')).toBe(initialFrame);
   const beforeDrive = await (await request.get('/api/state')).json();
-  await page.getByRole('link', {name:'Controls',exact:true}).click();
+  if (beforeDrive.stopped) {
+    await page.getByRole('button',{name:'Robot settings',exact:true}).click();
+    await page.getByText('Manual control options',{exact:true}).click();
+    await page.getByRole('button',{name:'Enable manual control',exact:true}).click();
+    await page.getByRole('button',{name:'Close configuration',exact:true}).click();
+  }
+  await page.locator('.manual-disclosure > summary').click();
   await page.getByRole('button', { name: 'Drive forward', exact: true }).click();
   await expect(page.locator('.status')).toHaveText('Robot running');
   await expect(page.locator('.activity-detail')).toHaveText('Executing command / Manual control');
@@ -1518,9 +1578,11 @@ test('manual control, authoritative camera isolation, and immediate stop', async
   await page.getByRole('button', { name: 'Set head', exact: true }).click();
   await expect(page.locator('.event-list')).toContainText('set_head');
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
-  await expect(page.locator('.status')).toHaveText('Robot stopped');
+  await expect(page.locator('.status')).toHaveText(/^(Robot stopped|Stopped)$/);
+  await page.getByRole('button', {name:'Robot settings',exact:true}).click();
   if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button', { name: 'Enable manual control', exact: true }).click();
+  await page.getByRole('button', {name:'Close configuration',exact:true}).click();
   await expect(page.locator('.status')).toHaveText('On / Idle');
   await page.screenshot({ path: 'test-results/desktop.png', fullPage: true });
 });
@@ -1529,7 +1591,7 @@ test('mobile layout has no horizontal overflow and renders nonblank pixels', asy
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
   await expect(page.locator('.spectator canvas')).toBeVisible();
-  await page.getByRole('link', {name:'Controls',exact:true}).click();
+  await page.locator('.manual-disclosure > summary').click();
   await page.getByRole('tab', { name: 'Arms & grippers', exact: true }).click();
   const dimensions = await page.evaluate(() => ({ viewport: innerWidth, page: document.documentElement.scrollWidth }));
   expect(dimensions.page).toBeLessThanOrEqual(dimensions.viewport);

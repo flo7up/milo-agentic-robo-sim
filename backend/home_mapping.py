@@ -12,6 +12,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from backend.spatial_memory import ClosingConnection, SpatialMemoryStore
+from backend.passage_memory import PassageMemory
 
 
 class ObjectMemory(Protocol):
@@ -61,6 +62,7 @@ class HomeMap:
         self.edges = []
         self.objects = []
         self.frontier_attempts = {}
+        self.passage_memory = PassageMemory()
         self.created_at = time.time()
         self.updated_at = self.created_at
         self.revision = 0
@@ -171,6 +173,7 @@ class HomeMap:
         return route[::-1]
 
     def document(self):
+        self.passage_memory.bind_frame(self.frame_revision)
         return {"schema": "milo-home-map-v1", "map_id": self.identity, "environment_id": self.environment_id,
             "name": self.name, "frame": "map", "units": "m_rad", "resolution_m": self.resolution_m,
             "origin_m": self.origin.tolist(), "width": self.size, "height": self.size,
@@ -178,7 +181,8 @@ class HomeMap:
             "source": "simulated_laser_and_wheel_odometry", "scan_count": self.scan_count,
             "evidence": self.evidence.ravel().tolist(), "visits": self.visits.ravel().tolist(),
             "places": self.places, "edges": self.edges, "objects": self.objects,
-            "frontier_attempts": self.frontier_attempts}
+            "frontier_attempts": self.frontier_attempts,
+            **({"passage_memory": self.passage_memory.document()} if self.passage_memory.places else {})}
 
     def add_place(self, name, kind, pose, radius_m, connects=()):
         if not name.strip() or len(name) > 80 or kind not in {"room", "doorway", "destination"}:
@@ -263,10 +267,73 @@ class HomeMap:
                 break
         return sorted(result, key=lambda item: item["distance_m"] + item["attempts"])[:20]
 
-    def mark_frontier(self, identity):
+    def search_frontiers(self, pose, radius_m, obstacles=(), *, excluded=()):
+        allowed = self.allowed(radius_m, obstacles)
+        position = self.indices(pose[:2])
+        components, _ = label(allowed)
+        if not self.inside(position) or not components[position[1], position[0]]:
+            return []
+        connected = components == components[position[1], position[0]]
+        cells = self.cells
+        boundary = binary_dilation(cells == -1, iterations=math.ceil((radius_m+.4)/self.resolution_m))
+        rows, columns = np.where(connected & boundary)
+        points = self.origin + (np.column_stack((columns, rows))+.5)*self.resolution_m
+        distances = np.linalg.norm(points-pose[:2], axis=1)
+        headings = np.arctan2(points[:, 1]-pose[1], points[:, 0]-pose[0])-pose[2]
+        turns = np.abs(np.arctan2(np.sin(headings), np.cos(headings)))
+        offsets = np.linspace(0., 2*np.pi, 48, endpoint=False)
+        rays = np.stack((np.cos(offsets), np.sin(offsets)), axis=-1)[:, None, :] * np.arange(.1, 2.6, .1)[None, :, None]
+        proposals = {}
+        for index in np.argsort(distances + .4*turns):
+            if not .6 <= distances[index] <= 5.:
+                continue
+            point = points[index]
+            identity = ":".join(str(int(math.floor(value/.5))) for value in point)
+            if identity in excluded or identity in proposals:
+                continue
+            sampled = self.indices(point+rays)
+            inside = self.inside(sampled)
+            clipped = np.clip(sampled, 0, self.size-1)
+            values = cells[clipped[..., 1], clipped[..., 0]]
+            visible = np.cumsum((values == 100) | ~inside, axis=1) == 0
+            unknown = sampled[visible & (values == -1)]
+            gain = len(np.unique(unknown, axis=0))*self.resolution_m**2
+            attempts = self.frontier_attempts.get(identity, {}).get("attempts", 0)
+            score = gain/(1.+.35*distances[index]) - .35*turns[index] - 1.5*attempts
+            proposals[identity] = {"frontier_id": identity, "position_m": point.tolist(),
+                "distance_m": float(distances[index]), "attempts": attempts,
+                "expected_unseen_m2": round(gain, 3), "search_score": float(score),
+                "region_scope": "observed_connected_space", "gain_is_estimate": True}
+        return sorted(proposals.values(), key=lambda item: -item["search_score"])[:20]
+
+    def observed_connection(self, start, end):
+        """Association of historical places only; footprint/path guards still authorize motion."""
+        points = np.linspace(start, end, max(2, math.ceil(math.dist(start, end)/.05)+1))
+        indices = self.indices(points)
+        return bool(self.inside(indices).all() and (self.evidence[indices[:, 1], indices[:, 0]] < 0).all())
+
+    def known_near(self, point):
+        column, row = self.indices(point)
+        width = math.ceil(2./self.resolution_m)
+        patch = self.evidence[max(0, row-width):min(self.size, row+width+1),
+            max(0, column-width):min(self.size, column+width+1)]
+        return float(np.count_nonzero(patch)*self.resolution_m**2)
+
+    def exploration_frontiers(self, pose, radius_m, obstacles=(), region_id=None, *, excluded=(), room_search=False):
+        self.passage_memory.bind_frame(self.frame_revision)
+        recovering = self.passage_memory.data.loops > 0 and region_id is None
+        candidates = self.search_frontiers(pose, radius_m, obstacles, excluded=excluded) if room_search or recovering else []
+        if not candidates:
+            candidates = self.frontiers(pose, radius_m, obstacles, region_id, excluded=excluded)
+            recovering = False
+        return self.passage_memory.annotate(candidates, pose, self.observed_connection, self.known_near,
+            recovery=recovering)
+
+    def mark_frontier(self, identity, result="reached"):
         previous = self.frontier_attempts.get(identity, {})
         self.frontier_attempts[identity] = {"attempts": previous.get("attempts", 0) + 1,
             "known_cells": int(np.count_nonzero(self.evidence)), "last_attempt_unix_s": time.time()}
+        self.passage_memory.finish(identity, self.known_near, result)
 
     def match_scan(self, laser, seed=None):
         _, local, hits = laser_points(laser, [0., 0., 0.])
@@ -347,6 +414,7 @@ class HomeMap:
         result.revision, result.scan_count = data["revision"], data["scan_count"]
         result.places, result.edges, result.objects = data["places"], data["edges"], data["objects"]
         result.frontier_attempts = data["frontier_attempts"]
+        result.passage_memory = PassageMemory(data.get("passage_memory"))
         result.saved = True
         return result
 

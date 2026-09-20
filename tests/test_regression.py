@@ -4,11 +4,13 @@ from backend.regression import CASES, SUITE_ID, RegressionStart, grade_progress,
 
 
 def test_observable_baseline_has_fixed_distinct_challenges_and_budgets():
-    assert SUITE_ID == "observable-navigation-v2"
+    assert SUITE_ID == "observable-navigation-v3"
     assert [case["id"] for case in CASES] == ["parking", "parking-left", "parking-right", "parking-far",
         "table-clockwise", "table-counterclockwise", "object-search", "room-arrival"]
     assert sum(case["budget_s"] for case in CASES) == 1200
     assert len({case["challenge_id"] for case in CASES}) == 7
+    assert [(case.get("max_model_requests", 12), case.get("max_model_tokens", 80000))
+        for case in CASES] == [(12, 80000)] * 7 + [(60, 400000)]
     default = RegressionStart(run_id="run", episode_epoch=0)
     assert (default.model_id, default.reasoning, default.task_supervisor_model_id) == ("qwen", "none", "luna")
     assert RegressionStart(run_id="run", episode_epoch=0, model_id="luna").task_supervisor_model_id is None
@@ -197,16 +199,20 @@ def test_regression_path_api_handles_unavailable_recordings_and_recovers(tmp_pat
         assert client.get("/api/state").json()["snapshot"] == initial
 
 
-def test_previous_suite_results_are_retained_without_mixing_with_expanded_suite(tmp_path):
+@pytest.mark.parametrize("previous_suite", ["observable-navigation-v1", "observable-navigation-v2"])
+def test_previous_suite_results_are_retained_without_mixing_with_expanded_suite(tmp_path, previous_suite):
     import json
     from backend.regression import RegressionSequence
 
-    directory = tmp_path / "regression-observable-navigation-v1-20260919T000000Z-legacy"
+    directory = tmp_path / f"regression-{previous_suite}-20260919T000000Z-legacy"
     directory.mkdir()
     report = directory / "sequence.json"
-    original = json.dumps({"suite_id": "observable-navigation-v1", "sequence_id": "legacy",
+    previous_cases = [{key: value for key, value in case.items()
+        if key not in {"max_model_requests", "max_model_tokens"}} for case in CASES
+        if previous_suite == "observable-navigation-v2" or not case["id"].startswith("parking-")]
+    original = json.dumps({"suite_id": previous_suite, "sequence_id": "legacy",
         "phase": "completed", "finished_at": "2026-09-19T00:00:00Z",
-        "cases": [{**case, "status": "failed"} for case in CASES if not case["id"].startswith("parking-")]})
+        "cases": [{**case, "status": "failed"} for case in previous_cases]})
     report.write_text(original, encoding="utf-8")
     sequence = RegressionSequence()
     assert not sequence.restore_latest(tmp_path)
@@ -311,6 +317,10 @@ async def test_sequence_serializes_cases_retains_failures_and_never_restarts_aft
     async def start(settings):
         calls.append(settings)
         assert settings.goal == worker.challenge.goal and settings.mission_budget_s == CASES[len(calls)-1]["budget_s"]
+        expected_requests, expected_tokens = (60, 400000) if worker.challenge.id == "flat_kitchen" else (12, 80000)
+        assert settings.max_turns == settings.max_model_requests == expected_requests
+        assert settings.max_model_tokens == expected_tokens
+        assert settings.max_task_supervisor_requests == 1 and settings.max_task_supervisor_tokens == 100000
         async def finish():
             score = {"complete_recording": ending != "recording_failure", "operator_assisted": False, "dropped_records": 0,
                 "contact_episodes": 0, "final_physics_success": False}
@@ -334,6 +344,8 @@ async def test_sequence_serializes_cases_retains_failures_and_never_restarts_aft
     assert lab.recording_enabled is False and lab.recording_root == tmp_path
     saved = json.loads((sequence.directory / "sequence.json").read_text())
     assert saved["active"] is False and saved["finished_at"]
+    assert saved["settings"]["case_budget_overrides"] == {
+        "room-arrival": {"max_model_requests": 60, "max_model_tokens": 400000}}
     assert "source_hashes" not in sequence.public() and saved["source_hashes"] == {"frozen": "hash"}
     assert saved["cases"][0]["evaluation"]["progress_pct"] == 0.
     assert saved["cases"][0]["evaluation"]["evaluation_only"]

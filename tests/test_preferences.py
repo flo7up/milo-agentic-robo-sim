@@ -22,6 +22,22 @@ def test_preferences_survive_new_store_and_merge_without_scene_commands(tmp_path
     path.unlink()
 
 
+def test_kitchen_budgets_persist_separately_from_other_challenges(tmp_path):
+    path = tmp_path / "preferences.sqlite3"
+    store = PreferenceStore(path)
+    general = {"turns": 20, "max_model_requests": 12, "max_model_tokens": 100000}
+    kitchen = {"kitchen_turns": 60, "kitchen_max_model_requests": 60, "kitchen_max_model_tokens": 400000}
+    store.update(PreferencesPatch(**general))
+    store.update(PreferencesPatch(**kitchen))
+    assert PreferenceStore(path).read()["preferences"] == {**general, **kitchen}
+    for key, maximum in (("kitchen_turns", 80), ("kitchen_max_model_requests", 200),
+            ("kitchen_max_model_tokens", 2000000)):
+        for value in (0, maximum + 1, 1.5, True):
+            with pytest.raises(ValidationError):
+                PreferencesPatch.model_validate({key: value})
+    path.unlink()
+
+
 def test_recording_preferences_retain_previous_folders_and_default_choice(tmp_path):
     store = PreferenceStore(tmp_path / "preferences.sqlite3")
     assert store.recording_directories() == []

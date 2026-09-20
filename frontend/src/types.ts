@@ -55,7 +55,7 @@ export type NavigationState = {
     status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'; evidence: string }[];
 };
 export type ManualPlacement = { run_id: string; episode_epoch: number; observation_seq: number; xy_m: [number, number] };
-export type ChallengeId = 'bench' | 'park' | 'park_left' | 'park_right' | 'park_far' | 'tidy' | 'sort' | 'recharge' | 'apartment' | 'kitchen_bathroom' | 'clinic_delivery' | 'warehouse' | 'inspection' | 'workshop' | 'local_park' | 'pedestrian_crossing' | 'flat_kitchen' | 'furniture_circuit' | 'chair_circuit_far' | 'movement_practice';
+export type ChallengeId = 'bench' | 'park' | 'park_left' | 'park_right' | 'park_far' | 'tidy' | 'sort' | 'recharge' | 'apartment' | 'kitchen_bathroom' | 'clinic_delivery' | 'warehouse' | 'inspection' | 'workshop' | 'local_park' | 'pedestrian_crossing' | 'flat_kitchen' | 'furniture_circuit' | 'chair_circuit_far' | 'movement_practice' | 'maze' | 'maze_complex';
 export type ChallengeEnvironment = 'standalone' | 'shared_apartment_v1';
 export type ChallengePreset = { id: ChallengeId; environment?: ChallengeEnvironment; title: string; skill: string; goal: string; objectives: string[]; suggested_turn_limit: number;
   category?: 'Navigation' | 'Perception' | 'Manipulation'; difficulty?: 'Foundation' | 'Advanced';
@@ -129,6 +129,7 @@ export type AgentState = {
 };
 export type RegressionCase = {
   id: string; challenge_id: ChallengeId; title: string; budget_s: number;
+  max_model_requests?: number; max_model_tokens?: number;
   status: 'pending' | 'loading' | 'running' | 'passed' | 'failed' | 'invalid' | 'cancelled' | 'not_run';
   elapsed_s?: number; error?: string | null; outcome?: {message?: string} | null;
   trajectory_url?: string;

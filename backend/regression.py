@@ -17,7 +17,7 @@ from backend.recording import write_recording_json
 from backend.session_recording import ROOT, recording_root
 
 
-SUITE_ID = "observable-navigation-v2"
+SUITE_ID = "observable-navigation-v3"
 CASES = (
     {"id": "parking", "challenge_id": "park", "title": "Park in the green bay", "budget_s": 120},
     {"id": "parking-left", "challenge_id": "park_left", "title": "Park from 30 cm left offset", "budget_s": 120},
@@ -28,7 +28,8 @@ CASES = (
     {"id": "table-counterclockwise", "challenge_id": "furniture_circuit", "title": "Table circuit counterclockwise", "budget_s": 180,
         "orbit_target": "table", "orbit_direction": "counterclockwise"},
     {"id": "object-search", "challenge_id": "apartment", "title": "Find and approach the yellow cube", "budget_s": 180},
-    {"id": "room-arrival", "challenge_id": "flat_kitchen", "title": "Find and enter the kitchen", "budget_s": 180},
+    {"id": "room-arrival", "challenge_id": "flat_kitchen", "title": "Find and enter the kitchen", "budget_s": 180,
+        "max_model_requests": 60, "max_model_tokens": 400000},
 )
 
 
@@ -261,6 +262,8 @@ class RegressionSequence:
             "task_supervisor_model_id": request.task_supervisor_model_id,
             "evidence": lab.agent.recording_evidence, "current_index": None,
             "settings": {"max_requests_per_case": 12, "max_tokens_per_case": 80000, "images": 2,
+                "case_budget_overrides": {case["id"]: {key: case[key] for key in ("max_model_requests", "max_model_tokens")}
+                    for case in CASES if "max_model_tokens" in case},
                 "history_tokens": 8192, "reuse_saved_map": False, "gap_s": 3},
             "cases": [{**case, "status": "pending"} for case in CASES]}
         self.task = asyncio.create_task(self.run(lab, request, start_agent))
@@ -292,8 +295,9 @@ class RegressionSequence:
                 settings = AgentStart(run_id=worker.latest["run_id"], episode_epoch=worker.epoch,
                     goal=worker.challenge.goal, model_id=request.model_id, reasoning=request.reasoning,
                     execution_mode="luna_continuous", unified_mission=True, images_per_request=2, context_tokens=8192,
-                    map_context=True, mission_budget_s=case["budget_s"], max_turns=12, max_model_requests=12,
-                    max_model_tokens=80000, feedback_interval_s=.25,
+                    map_context=True, mission_budget_s=case["budget_s"], max_turns=case.get("max_model_requests", 12),
+                    max_model_requests=case.get("max_model_requests", 12),
+                    max_model_tokens=case.get("max_model_tokens", 80000), feedback_interval_s=.25,
                     task_supervisor_model_id=request.task_supervisor_model_id,
                     task_supervisor_reasoning="low", max_task_supervisor_requests=1, max_task_supervisor_tokens=100000)
                 case.update(run_id=settings.run_id, settings=settings.model_dump(),

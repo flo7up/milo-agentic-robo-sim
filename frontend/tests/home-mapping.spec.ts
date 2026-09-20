@@ -50,19 +50,19 @@ test('scenario map reuse is optional and survives reset without deleting saved m
   test.setTimeout(90000);
   await request.post('/api/challenges/load',{data:{challenge_id:'park'}});
   await page.goto('/');
-  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
-  const dialog=page.getByRole('dialog',{name:'Load challenge',exact:true});
+  await page.getByRole('button',{name:'Load scenario',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Load scenario',exact:true});
   await dialog.getByRole('combobox',{name:'Map source',exact:true}).selectOption('none');
   const loaded=page.waitForResponse(response=>response.url().endsWith('/api/challenges/load')&&response.request().method()==='POST');
-  await dialog.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await dialog.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   expect((await loaded).request().postDataJSON().reuse_saved_map).toBe(false);
   await expect.poll(async()=>(await(await request.get('/api/state')).json()).map_setup.reuse_saved_map).toBe(false);
   const reset=await request.post('/api/reset');
   expect((await reset.json()).map_setup).toMatchObject({reuse_saved_map:false,map_id:null});
-  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+  await page.getByRole('button',{name:'Load scenario',exact:true}).click();
   await expect(dialog.getByRole('combobox',{name:'Map source',exact:true})).toHaveValue('none');
   await dialog.getByRole('combobox',{name:'Map source',exact:true}).selectOption('saved');
-  await dialog.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await dialog.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   await expect.poll(async()=>(await(await request.get('/api/state')).json()).map_setup.reuse_saved_map).toBe(true);
 });
 

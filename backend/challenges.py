@@ -8,7 +8,7 @@ from backend.movement import MovementStep
 
 
 ChallengeId = Literal["bench", "park", "park_left", "park_right", "park_far", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery",
-                      "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "chair_circuit_far", "movement_practice"]
+                      "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "chair_circuit_far", "movement_practice", "maze", "maze_complex"]
 Vector3 = Annotated[list[float], Field(min_length=3, max_length=3)]
 
 
@@ -99,7 +99,121 @@ class Challenge(StrictModel):
         return objects
 
 
+def maze_challenge():
+    # Fixed, connected 4 x 4 maze. This topology is scene/evaluator data only;
+    # controllers must discover corridors through their ordinary sensors.
+    passages = {frozenset(pair) for pair in (
+        ((0, 0), (1, 0)), ((1, 0), (2, 0)), ((2, 0), (3, 0)),
+        ((2, 0), (2, 1)), ((1, 1), (0, 1)), ((0, 1), (0, 2)),
+        ((0, 2), (0, 3)), ((1, 1), (2, 1)), ((2, 1), (3, 1)),
+        ((2, 1), (2, 2)), ((2, 2), (1, 2)), ((1, 2), (1, 3)),
+        ((2, 2), (2, 3)), ((2, 2), (3, 2)), ((3, 2), (3, 3)),
+    )}
+    cell, edge, thickness, height = 1.8, -3.6, .14, 1.4
+    objects = []
+    for axis in (0, 1):
+        for boundary in range(5):
+            for lane in range(4):
+                before = (boundary - 1, lane) if axis == 0 else (lane, boundary - 1)
+                after = (boundary, lane) if axis == 0 else (lane, boundary)
+                if frozenset((before, after)) in passages or (axis, boundary, lane) == (0, 4, 3):
+                    continue
+                position = [edge + cell * boundary, edge + cell * (lane + .5)]
+                size = [thickness, cell + thickness]
+                if axis == 1:
+                    position.reverse()
+                    size.reverse()
+                objects.append({"name": "back_wall" if (axis, boundary, lane) == (0, 4, 0) else f"maze_wall_{axis}_{boundary}_{lane}",
+                    "size": [*size, height], "position": [*position, height / 2], "color": [.72, .77, .78, 1]})
+    green = [.08, .72, .25, 1]
+    objects.extend([
+        *[{"name": f"maze_exit_post_{side}", "size": [.18, .18, height], "position": [3.6, y, height / 2], "color": green}
+          for side, y in (("south", 1.89), ("north", 3.51))],
+        {"name": "maze_exit_header", "size": [.18, 1.8, .22], "position": [3.6, 2.7, 1.51], "color": green},
+    ])
+    return Challenge(id="maze", title="Maze", skill="Exploration, dead-end recovery and exit finding", difficulty="Advanced",
+        floor_size_m=[12, 10], initial_xy=[-2.7, -2.7], initial_head_pitch=.15, suggested_turn_limit=160,
+        goal="Explore the maze and find the green exit doorway. Discover the route using your camera and sensors, remember junctions and backtrack from dead ends. Drive through the doorway and park with your entire base and both wheels in the green bay outside the maze. Stop and wait for one simulated second. Keep your arms folded and avoid the walls. Seeing the exit alone does not complete the task.",
+        objects=objects, ordered_objectives=True,
+        objectives=[Objective(label="Leave the maze and stop fully in the green exit bay for 1 second", body="robot",
+            center=[4.5, 2.7, 0], size=[1.2, 1.3], color=green, require_lift=False, dwell_s=1)])
+
+
+def complex_maze_challenge():
+    # Fixed 6 x 6 scene: 37 passages, two loops, ten junctions and eight dead ends.
+    # Evaluator-only topology; the controller receives ordinary sensor observations.
+    passages = {frozenset(pair) for pair in (
+        ((3, 3), (3, 4)),
+        ((2, 3), (2, 4)),
+        ((2, 1), (3, 1)),
+        ((4, 3), (4, 4)),
+        ((3, 1), (4, 1)),
+        ((5, 1), (5, 2)),
+        ((3, 0), (4, 0)),
+        ((4, 1), (5, 1)),
+        ((0, 5), (1, 5)),
+        ((2, 2), (2, 3)),
+        ((0, 3), (1, 3)),
+        ((3, 2), (4, 2)),
+        ((1, 2), (1, 3)),
+        ((3, 1), (3, 2)),
+        ((0, 1), (1, 1)),
+        ((1, 3), (1, 4)),
+        ((1, 4), (2, 4)),
+        ((3, 3), (4, 3)),
+        ((5, 0), (5, 1)),
+        ((0, 0), (1, 0)),
+        ((2, 0), (3, 0)),
+        ((4, 0), (4, 1)),
+        ((2, 1), (2, 2)),
+        ((0, 4), (0, 5)),
+        ((0, 2), (1, 2)),
+        ((3, 5), (4, 5)),
+        ((5, 4), (5, 5)),
+        ((0, 1), (0, 2)),
+        ((5, 3), (5, 4)),
+        ((2, 3), (3, 3)),
+        ((4, 5), (5, 5)),
+        ((4, 4), (5, 4)),
+        ((0, 4), (1, 4)),
+        ((1, 0), (1, 1)),
+        ((2, 4), (2, 5)),
+        ((4, 2), (5, 2)),
+        ((0, 2), (0, 3)),
+    )}
+    cell, edge, thickness, height = 1.8, -5.4, .14, 1.4
+    objects = []
+    for axis in (0, 1):
+        for boundary in range(7):
+            for lane in range(6):
+                before = (boundary - 1, lane) if axis == 0 else (lane, boundary - 1)
+                after = (boundary, lane) if axis == 0 else (lane, boundary)
+                if frozenset((before, after)) in passages or (axis, boundary, lane) == (0, 6, 5):
+                    continue
+                position = [edge + cell * boundary, edge + cell * (lane + .5)]
+                size = [thickness, cell + thickness]
+                if axis == 1:
+                    position.reverse()
+                    size.reverse()
+                objects.append({"name": "back_wall" if (axis, boundary, lane) == (0, 6, 0) else f"maze_wall_{axis}_{boundary}_{lane}",
+                    "size": [*size, height], "position": [*position, height / 2], "color": [.72, .77, .78, 1]})
+    green = [.08, .72, .25, 1]
+    objects.extend([
+        *[{"name": f"maze_exit_post_{side}", "size": [.18, .18, height], "position": [5.4, y, height / 2], "color": green}
+          for side, y in (("south", 3.69), ("north", 5.31))],
+        {"name": "maze_exit_header", "size": [.18, 1.8, .22], "position": [5.4, 4.5, 1.51], "color": green},
+    ])
+    return Challenge(id="maze_complex", title="Maze — Complex", skill="Exploration, loop recognition, backtracking and exit finding", difficulty="Advanced",
+        floor_size_m=[16, 14], initial_xy=[-4.5, -4.5], initial_head_pitch=.15, suggested_turn_limit=160,
+        goal="Explore the larger maze and find the green exit doorway. Use your camera, sensors and movement memory to distinguish new passages from loops, remember junctions and backtrack from dead ends. Drive through the doorway and park with your entire base and both wheels in the green bay outside the maze. Stop and wait for one simulated second. Keep your arms folded and avoid the walls. Seeing the exit alone does not complete the task.",
+        objects=objects, ordered_objectives=True,
+        objectives=[Objective(label="Leave the complex maze and stop fully in the green exit bay for 1 second", body="robot",
+            center=[6.3, 4.5, 0], size=[1.2, 1.3], color=green, require_lift=False, dwell_s=1)])
+
+
 PRESETS = {
+    "maze": maze_challenge(),
+    "maze_complex": complex_maze_challenge(),
     "movement_practice": Challenge(id="movement_practice", title="Movement Practice", skill="Measured movement sequences",
         floor_size_m=[8, 8], initial_head_pitch=.45,
         goal="Move 1 meter straight forward, stop, then move 1 meter straight backward without turning around and stop. Finally spin one full turn counterclockwise on the spot and stop. Keep the arms folded and hold still for half a second after each step.",

@@ -17,6 +17,7 @@ type Preferences = {
   position: number[]; joints: number[];
   mission_map_context: boolean;
   max_model_requests: number; max_model_tokens: number;
+  kitchen_turns: number; kitchen_max_model_requests: number; kitchen_max_model_tokens: number;
 };
 type Values = Partial<Preferences>;
 function merge(previous: Values, patch: Values): Values {
@@ -33,11 +34,12 @@ const choices: Record<string, readonly string[]> = {
 };
 const ranges: Record<string, [number, number]> = {interval: [.25, 30], turns: [1, 80], exploration_budget: [1, 300],
   max_model_requests: [1, 200], max_model_tokens: [1, 2000000],
+  kitchen_turns: [1, 80], kitchen_max_model_requests: [1, 200], kitchen_max_model_tokens: [1, 2000000],
   duration: [.1, 2], head_yaw: [-1.5, 1.5], head_pitch: [-.7, 1.15], opening: [0, .11], force: [1, 35]};
 const booleans = new Set(['handoff', 'skill_composer', 'ai_routes', 'adaptive', 'connection_open', 'run_settings_open',
   'challenge_details_open', 'compact_arms', 'axes', 'manual_open', 'mission_map_context']);
 const scenarios = new Set(['bench', 'park', 'park_left', 'park_right', 'park_far', 'tidy', 'sort', 'recharge', 'apartment', 'kitchen_bathroom', 'clinic_delivery',
-  'warehouse', 'inspection', 'workshop', 'local_park', 'pedestrian_crossing', 'flat_kitchen', 'furniture_circuit', 'chair_circuit_far', 'movement_practice']);
+  'warehouse', 'inspection', 'workshop', 'local_park', 'pedestrian_crossing', 'flat_kitchen', 'furniture_circuit', 'chair_circuit_far', 'movement_practice', 'maze', 'maze_complex']);
 
 function valid(key: string, value: unknown): boolean {
   if (key === 'position' || key === 'joints') {
@@ -47,7 +49,8 @@ function valid(key: string, value: unknown): boolean {
   }
   if (choices[key]) return typeof value === 'string' && choices[key].includes(value);
   if (ranges[key]) return typeof value === 'number' && Number.isFinite(value) && value >= ranges[key][0] && value <= ranges[key][1]
-    && (!['turns', 'exploration_budget', 'max_model_requests', 'max_model_tokens'].includes(key) || Number.isInteger(value));
+    && (!['turns', 'exploration_budget', 'max_model_requests', 'max_model_tokens',
+      'kitchen_turns', 'kitchen_max_model_requests', 'kitchen_max_model_tokens'].includes(key) || Number.isInteger(value));
   if (booleans.has(key)) return typeof value === 'boolean';
   if (key === 'luna_deployment') return typeof value === 'string' && value.length <= 128 && /^[\w.-]*$/.test(value);
   if (key === 'local_model_tag') return typeof value === 'string' && value.length <= 120;

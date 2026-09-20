@@ -3,8 +3,8 @@ import { writeFile } from 'node:fs/promises';
 import type { ExchangeFeed, LiveState } from '../src/types';
 
 async function openChallengeMenu(page: Page) {
-  if (!await page.getByRole('dialog', {name:'Load challenge',exact:true}).isVisible()) {
-    await page.getByRole('button', {name:'Choose challenge',exact:true}).click();
+  if (!await page.getByRole('dialog', {name:'Load scenario',exact:true}).isVisible()) {
+    await page.getByRole('button', {name:'Load scenario',exact:true}).click();
   }
 }
 
@@ -159,8 +159,8 @@ test('challenge menu closes after loading and preserves selection when reopened'
   await page.route('**/api/challenges/load', route => rejectLoad
     ? route.fulfill({status:503,json:{detail:'Scene temporarily unavailable'}}) : route.continue());
   await page.goto('/');
-  const launcher=page.getByRole('button',{name:'Choose challenge',exact:true});
-  const menu=page.getByRole('dialog',{name:'Load challenge',exact:true});
+  const launcher=page.getByRole('button',{name:'Load scenario',exact:true});
+  const menu=page.getByRole('dialog',{name:'Load scenario',exact:true});
   await expect(launcher).toBeVisible();
   await expect(menu).toBeHidden();
   await expect(page.getByLabel('Selected scenario preview',{exact:true})).toBeHidden();
@@ -169,7 +169,7 @@ test('challenge menu closes after loading and preserves selection when reopened'
   await expect(menu).toBeVisible();
   await expect(launcher).toHaveAttribute('aria-expanded','true');
   await menu.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption('park');
-  await menu.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await menu.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   await expect(menu).toBeHidden();
   await expect(launcher).toBeFocused();
   await expect(page.locator('.runbar h2')).toHaveText('Park in the Bay');
@@ -194,7 +194,7 @@ test('challenge menu closes after loading and preserves selection when reopened'
   await menu.getByRole('combobox',{name:'Object to circle',exact:true}).selectOption('sofa');
   await menu.getByRole('combobox',{name:'Circuit direction',exact:true}).selectOption('counterclockwise');
   rejectLoad=true;
-  await menu.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await menu.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   await expect(menu.getByRole('alert')).toContainText('Scene temporarily unavailable');
   await expect(menu).toBeVisible();
   expect((await(await request.get('/api/state')).json()).run_id).toBe(loaded.run_id);
@@ -205,7 +205,7 @@ test('challenge menu closes after loading and preserves selection when reopened'
   await expect(menu.getByRole('combobox',{name:'Object to circle',exact:true})).toHaveValue('sofa');
   await expect(menu.getByRole('combobox',{name:'Circuit direction',exact:true})).toHaveValue('counterclockwise');
   rejectLoad=false;
-  await menu.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await menu.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   await expect(menu).toBeHidden();
   await expect(page.locator('.runbar h2')).toHaveText('Circle the Furniture');
 });
@@ -942,7 +942,7 @@ test('scenario previews explain each task without loading or moving the robot', 
   });
   await selector.selectOption('park');
   await expect(overview.getByText('Preview unavailable',{exact:true})).toBeVisible();
-  await expect(page.getByRole('button',{name:'Load challenge',exact:true})).toBeEnabled();
+  await expect(page.getByRole('button',{name:'Load selected scenario',exact:true})).toBeEnabled();
   await overview.getByRole('button',{name:'Retry scene preview',exact:true}).click();
   await expect(overview.locator('.scenario-thumbnail')).toHaveAttribute('data-state','ready');
   await selector.selectOption('furniture_circuit');
@@ -988,7 +988,7 @@ test('furniture circuits expose object commands and retain selection on reset', 
   await page.getByRole('combobox',{name:'Object to circle',exact:true}).selectOption('chair');
   await page.getByRole('combobox',{name:'Circuit direction',exact:true}).selectOption('counterclockwise');
   const loading = page.waitForResponse(response => response.url().endsWith('/api/challenges/load'));
-  await page.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await page.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   const response = await loading;
   expect(response.ok()).toBe(true);
   expect(response.request().postDataJSON()).toMatchObject({challenge_id:'furniture_circuit',orbit_target:'chair',orbit_direction:'counterclockwise'});
@@ -1174,7 +1174,7 @@ test('continuous settings survive kitchen load and scripted preparation is stopp
   await folding.uncheck();
   await openChallengeMenu(page);
   await page.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption('kitchen_bathroom');
-  await page.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await page.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   await expect.poll(async()=>((await (await request.get('/api/state')).json()) as LiveState).challenge?.id).toBe('kitchen_bathroom');
   await page.locator('.spatial-section summary').click();
   await expect(sensing).toBeChecked();
@@ -1182,7 +1182,7 @@ test('continuous settings survive kitchen load and scripted preparation is stopp
   await folding.check();
   await openChallengeMenu(page);
   await page.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption('park');
-  await page.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await page.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   await expect.poll(async()=>((await (await request.get('/api/state')).json()) as LiveState).challenge?.id).toBe('park');
   await page.locator('.spatial-section summary').click();
   await expect(folding).toBeChecked();
@@ -1307,7 +1307,7 @@ test('Luna supervises local motion in the selected scene and Stop retains loaded
   for (const challenge of ['park', 'recharge']) {
     await openChallengeMenu(page);
     await page.getByRole('combobox', { name: 'Predefined challenge', exact: true }).selectOption(challenge);
-    await page.getByRole('button', { name: 'Load challenge', exact: true }).click();
+    await page.getByRole('button', { name: 'Load selected scenario', exact: true }).click();
     await expect.poll(async () => ((await (await request.get('/api/state')).json()) as LiveState).challenge?.id).toBe(challenge);
     const before: LiveState = await (await request.get('/api/state')).json();
     if (!await page.locator('.run-options').evaluate((element: HTMLDetailsElement) => element.open)) {
@@ -1481,7 +1481,7 @@ test('setup comes first and controls follow the run lifecycle', async ({page, re
   await page.goto('/');
   const scenario = page.getByRole('region', {name:'Predefined challenges',exact:true});
   await expect(scenario).toBeHidden();
-  await expect(page.getByRole('button',{name:'Choose challenge',exact:true})).toBeVisible();
+  await expect(page.getByRole('button',{name:'Load scenario',exact:true})).toBeVisible();
   await expect(page.getByRole('textbox',{name:'Foundry endpoint',exact:true})).toBeVisible();
   await expect(page.getByRole('button',{name:'Start LLM control',exact:true})).toBeHidden();
   await expect(page.getByRole('tablist',{name:'Robot inspector',exact:true})).toHaveCount(0);
@@ -1507,22 +1507,22 @@ test('setup comes first and controls follow the run lifecycle', async ({page, re
   });
   await openChallengeMenu(page);
   await page.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption('park');
-  await page.getByRole('button',{name:'Load challenge',exact:true}).click();
+  await page.getByRole('button',{name:'Load selected scenario',exact:true}).click();
   await expect(page.getByRole('button',{name:'Loading...',exact:true})).toBeDisabled();
   await expect(page.getByRole('button',{name:'Start LLM control',exact:true,includeHidden:true})).toBeDisabled();
   releaseLoad!();
   await expect(scenario.getByRole('alert')).toContainText('Scene temporarily unavailable');
-  await expect(page.getByRole('button',{name:'Load challenge',exact:true})).toBeEnabled();
+  await expect(page.getByRole('button',{name:'Load selected scenario',exact:true})).toBeEnabled();
   await page.getByRole('button',{name:'Close challenge menu',exact:true}).click();
   await expect(goal).toHaveValue('Inspect the doorway.');
   for (const width of [1440,390,320]) {
     await page.setViewportSize({width,height:1000});
     await page.evaluate(() => scrollTo(0,0));
     await openChallengeMenu(page);
-    const loadingBounds = (await page.getByRole('dialog',{name:'Load challenge',exact:true}).boundingBox())!;
+    const loadingBounds = (await page.getByRole('dialog',{name:'Load scenario',exact:true}).boundingBox())!;
     expect(loadingBounds.y).toBeGreaterThanOrEqual(0);
     expect(loadingBounds.y + loadingBounds.height).toBeLessThanOrEqual(1000);
-    await expect(page.getByRole('button',{name:'Load challenge',exact:true})).toBeInViewport();
+    await expect(page.getByRole('button',{name:'Load selected scenario',exact:true})).toBeInViewport();
     await page.screenshot({path:`test-results/setup-journey-${width}.png`});
     await page.getByRole('button',{name:'Close challenge menu',exact:true}).click();
     const sceneBounds = (await page.locator('.spectator').boundingBox())!;
@@ -1541,7 +1541,7 @@ test('setup comes first and controls follow the run lifecycle', async ({page, re
   live = {...live,stopped:true,agent:{...live.agent,active:false,phase:'completed'}};
   channel!.send(JSON.stringify(live));
   await expect(page.getByRole('textbox',{name:'New run instruction',exact:true})).toBeHidden();
-  await page.getByRole('link',{name:'Controls',exact:true}).click();
+  await page.locator('.manual-disclosure > summary').click();
   await expect(page.locator('.manual-disclosure')).toHaveAttribute('open','');
   await expect(page.getByRole('button',{name:'Drive forward',exact:true})).toBeDisabled();
   await expect(page.getByRole('button',{name:'Stop',exact:true})).toBeInViewport();
@@ -1549,7 +1549,7 @@ test('setup comes first and controls follow the run lifecycle', async ({page, re
 
 test('manual controls and challenge reset remain usable without Luna', async ({ page, request }) => {
   await page.goto('/');
-  await page.getByRole('link',{name:'Controls',exact:true}).click();
+  await page.locator('.manual-disclosure > summary').click();
   if (await page.locator('.robot-options').getAttribute('open') === null) await page.locator('.robot-options > summary').click();
   await page.getByRole('button', { name: 'Enable manual control', exact: true }).isDisabled();
   const before: LiveState = await (await request.get('/api/state')).json();

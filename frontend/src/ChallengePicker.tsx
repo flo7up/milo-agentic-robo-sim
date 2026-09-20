@@ -6,6 +6,8 @@ import type { ChallengeEnvironment, ChallengeId, ChallengePreset, LiveState } fr
 import { usePreference, type SceneSelection } from './Preferences';
 
 const scenarioNotes: Record<ChallengeId, { summary: string; completion: string }> = {
+  maze_complex: { summary: 'A larger 6 × 6 maze with ten junctions, eight dead ends and two loops. Discover the green exit using the robot\'s camera, sensors and memory.', completion: 'Drive through the exit and stop with the entire base and both wheels in the outside green bay for one simulated second.' },
+  maze: { summary: 'Explore a maze with junctions and dead ends. Find the green exit using the robot\'s camera, sensors and memory.', completion: 'Drive through the exit and stop with the entire base and both wheels in the outside green bay for one simulated second.' },
   bench: { summary: 'An open practice area with a cube for driving, camera movement and arm control.', completion: 'Free practice, without scored objectives.' },
   park: { summary: 'A short parking course with two posts and a green destination bay.', completion: 'Stop with the entire base and both wheels inside the bay.' },
   park_left: { summary: 'The same parking bay and posts, starting 30 cm left of the centreline.', completion: 'Stop with the entire base and both wheels inside the bay.' },
@@ -61,6 +63,7 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
   const [error, setError] = useState('');
   function updateSelection(changes: Partial<SceneSelection>) {
     const next = {...selection, ...changes};
+    if (changes.challenge_id && ['maze', 'maze_complex'].includes(changes.challenge_id) && selected !== changes.challenge_id) next.reuse_saved_map = false;
     if (next.environment === 'shared_apartment_v1') {
       if (!['furniture_circuit', 'apartment', 'flat_kitchen', 'recharge'].includes(next.challenge_id)) next.challenge_id = 'furniture_circuit';
       next.orbit_target = 'table';
@@ -111,12 +114,12 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
   }
 
   return <div className="challenge-menu" id="setup">
-    <button type="button" className="icon-button" aria-label="Choose challenge" title="Choose challenge" aria-haspopup="dialog" aria-controls={menuId} aria-expanded={menuOpen}
-      onClick={() => { dialog.current?.showModal(); setMenuOpen(true); }}><FolderOpen size={16} aria-hidden="true" /></button>
+    <button type="button" aria-label="Load scenario" title="Choose a scenario to load" aria-haspopup="dialog" aria-controls={menuId} aria-expanded={menuOpen}
+      onClick={() => { dialog.current?.showModal(); setMenuOpen(true); }}><FolderOpen size={16} aria-hidden="true" />Load scenario</button>
     {createPortal(<dialog ref={dialog} id={menuId} className="challenge-menu-dialog" aria-labelledby={`${menuId}-title`}
       onClose={() => setMenuOpen(false)} onCancel={event => { if (loading) event.preventDefault(); }}>
       <div className="challenge-menu-heading">
-        <h2 id={`${menuId}-title`}>Load challenge</h2>
+        <h2 id={`${menuId}-title`}>Load scenario</h2>
         <button type="button" className="icon-button" aria-label="Close challenge menu" title="Close challenge menu" disabled={loading}
           onClick={() => dialog.current?.close()}><X size={18} /></button>
       </div>
@@ -145,7 +148,7 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
         </select></label>
       </>}
       {preset?.difficulty === 'Advanced' && <span className="tag">Advanced</span>}
-      <button type="button" disabled={!connected || loading || !presets.length} title="Stop current control and load a fresh episode" onClick={() => void load()}>{loading ? <LoaderCircle size={16} className="loading-icon" /> : <FolderOpen size={16} />} {loading ? 'Loading...' : 'Load challenge'}</button>
+      <button type="button" disabled={!connected || loading || !presets.length} title="Stop current control and load a fresh episode" onClick={() => void load()}>{loading ? <LoaderCircle size={16} className="loading-icon" /> : <FolderOpen size={16} />} {loading ? 'Loading...' : 'Load selected scenario'}</button>
       {loaded && <span className={`challenge-status ${loaded.status === 'completed' ? 'ok' : loaded.status === 'failed' ? 'bad' : ''}`} role="status">{loaded.status === 'completed' ? 'Completed' : loaded.status === 'failed' ? 'Failed' : `${loaded.completed_objectives} / ${loaded.progress.length} goals complete`}</span>}
     </div>
     <div className="scenario-overview" aria-label="Selected scenario preview">

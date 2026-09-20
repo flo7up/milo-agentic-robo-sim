@@ -120,7 +120,7 @@ def test_inspection_shelf_case_is_distinct_from_yellow_target_without_geometry_c
 
 
 def test_presets_have_distinct_goals_and_private_geometry():
-    assert set(PRESETS) == {"park", "park_left", "park_right", "park_far", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "chair_circuit_far", "movement_practice"}
+    assert set(PRESETS) == {"park", "park_left", "park_right", "park_far", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "chair_circuit_far", "movement_practice", "maze", "maze_complex"}
     for preset in PRESETS.values():
         assert preset.goal and preset.objectives
         assert "objects" not in preset.public()
@@ -865,7 +865,7 @@ async def test_challenge_goal_reaches_voice_without_evaluator_state(identifier):
         await worker.close()
 
 
-@pytest.mark.parametrize("identifier", ["tidy", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop"])
+@pytest.mark.parametrize("identifier", ["tidy", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "maze", "maze_complex"])
 async def test_challenge_state_never_leaks_into_text_model_feedback(identifier):
     preset = get_challenge(identifier)
     worker = SimulationWorker(challenge=preset, pace=False)
@@ -879,6 +879,7 @@ async def test_challenge_state_never_leaks_into_text_model_feedback(identifier):
         assert "red_cube" not in payload and "progress" not in payload and "completed_objectives" not in payload
         assert all(value not in payload for value in ("current_room", "initial_xy", "toilet_cistern", "bathroom_floor", "visible_zone"))
         assert all(value not in payload for value in ("floor_size_m", "ordered_objectives", "inspection_target", "stock_0_0_0", "workstation_divider"))
+        assert all(value not in payload for value in ("maze_wall_", "maze_exit_post_", "passages", "zone_0"))
     finally:
         await agent.halt()
         await worker.close()

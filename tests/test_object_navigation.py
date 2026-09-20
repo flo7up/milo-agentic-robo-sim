@@ -50,7 +50,8 @@ def test_object_options_keep_intention_and_reject_blocked_corridor():
     assert not goal.verified
 
 
-def test_circle_candidate_contract_and_resolution_require_fresh_visual_selection():
+@pytest.mark.parametrize("action", ["circle", "select_object", "verify_object"])
+def test_circle_candidate_contract_and_resolution_require_fresh_visual_selection(action):
     from backend.mission import MissionDecision
     from backend.mission_supervisor import local_response_schema
     from backend.object_navigation import circle_candidates, resolve_circle_candidate
@@ -60,9 +61,9 @@ def test_circle_candidate_contract_and_resolution_require_fresh_visual_selection
     candidates = circle_candidates(sensor, now=10.1)
     assert candidates
     identity = candidates[0]["id"]
-    decision = MissionDecision(action="circle", object_candidate_id=identity, object_label="table",
-        evidence_text="Flat top with supporting legs", circle_direction="clockwise")
-    schema = local_response_schema(["circle", "look"], object_candidate_ids=[identity])["anyOf"][0]
+    decision = MissionDecision(action=action, object_candidate_id=identity, object_label="table",
+        object_goal_id="current-goal", evidence_text="Flat top with supporting legs", circle_direction="clockwise")
+    schema = local_response_schema([action, "look"], object_candidate_ids=[identity])["anyOf"][0]
     assert schema["properties"]["object_candidate_id"]["enum"] == [identity]
     assert "object_bounds" not in schema["properties"] and "evidence_text" in schema["required"]
     assert decision.object_bounds is None
@@ -79,7 +80,7 @@ def test_circle_candidate_contract_and_resolution_require_fresh_visual_selection
     with pytest.raises(ValueError, match="STALE"):
         resolve_circle_candidate(sensor, candidates, identity, now=9.)
     with pytest.raises(ValueError, match="evidence"):
-        MissionDecision(action="circle", object_candidate_id=identity, object_label="table")
+        MissionDecision(action=action, object_candidate_id=identity, object_label="table", object_goal_id="current-goal")
     with pytest.raises(ValueError, match="replacement box"):
         MissionDecision(**{**decision.model_dump(), "object_bounds": [0., 0., 0., 0.]})
 

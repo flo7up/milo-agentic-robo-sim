@@ -379,6 +379,104 @@ async def test_local_mission_prepares_fresh_observed_map_and_stops_without_model
         await worker.close()
 
 
+@pytest.mark.parametrize("fault", [None, "stop", "sensors", "unknown", "deadline"])
+async def test_cold_kitchen_exploration_entry_is_observed_bounded_and_cancellable(tmp_path, monkeypatch, record_property, fault):
+    import asyncio
+    import json
+    from backend.agent import AgentController, AgentStart
+    from backend.challenges import get_challenge
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    from scripts.benchmark_household import PhysicsMeasurements
+
+    challenge = get_challenge("flat_kitchen")
+    worker = SimulationWorker(challenge=challenge, rendering="enhanced", pace=True)
+    controller = AgentController(model_factory=lambda config: pytest.fail("Exploration diagnostic must stay model-free"))
+    physical = PhysicsMeasurements(challenge.initial_xy)
+    preparing = False
+    entry_starts = 0
+    entry_travel = []
+    original_entry, original_sample, original_start = worker.prepare_exploration_entry, worker._sample_spatial, worker._start_navigation_path
+
+    async def entry(mission, duration_s=8., travel_m=.5):
+        nonlocal preparing
+        preparing = True
+        before = physical.travel
+        try:
+            return await original_entry(mission, 0. if fault == "deadline" else duration_s, travel_m)
+        finally:
+            entry_travel.append(physical.travel-before)
+            preparing = False
+
+    def sample(*args, **kwargs):
+        result = original_sample(*args, **kwargs)
+        if preparing and fault == "sensors":
+            worker.spatial_error = "Injected unavailable depth"
+        if preparing and fault == "unknown":
+            worker.spatial_map.cells[:] = -1
+        return result
+
+    def start(*args, **kwargs):
+        nonlocal entry_starts
+        if preparing:
+            entry_starts += 1
+        result = original_start(*args, **kwargs)
+        if preparing and fault == "stop":
+            worker.stop()
+        return result
+
+    monkeypatch.setattr(worker, "prepare_exploration_entry", entry)
+    monkeypatch.setattr(worker, "_sample_spatial", sample)
+    monkeypatch.setattr(worker, "_start_navigation_path", start)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "maps.sqlite3"))
+        def attach(sim):
+            previous = sim.on_tick
+            def tick():
+                previous()
+                physical.sample(worker)
+            sim.on_tick = tick
+            physical.sample(worker)
+        await worker.call(attach)
+        controller.start(worker, AgentStart(run_id=worker.sim.run_id, episode_epoch=worker.epoch,
+            goal="Explore the observed environment", execution_mode="luna_continuous", unified_mission=True,
+            mission_local_only=True, mission_budget_s=60., max_turns=12, feedback_interval_s=.25))
+        if fault is None:
+            async with asyncio.timeout(75.):
+                while not controller.task.done():
+                    if physical.travel >= 1.5:
+                        worker.stop()
+                        break
+                    await asyncio.sleep(.05)
+        await asyncio.wait_for(controller.task, 90.)
+        entries = [event["payload"] for event in controller.trace()["events"] if event["title"] == "Observed exploration entry"]
+        record_property("exploration_entry", json.dumps({"fault": fault, "travel_m": physical.travel,
+            "contacts": physical.contacts, "entries": entries, "error": controller.state["error"]}))
+        assert physical.contacts == 0
+        assert controller.state["input_tokens"] == 0 and not controller.active
+        assert worker.sim.cancel.is_set() and not worker.home_mission.active
+        assert worker.latest["challenge"]["status"] != "completed"
+        if fault is None:
+            assert entries and all(0.15 <= item["travel_m"] <= .5 and item["elapsed_s"] <= 8. for item in entries)
+            assert physical.travel >= 1.5
+            assert controller.state["outcome"]["kind"] == "interrupted"
+            assert (await worker.home_state(compact=True))["coverage"]["free_m2"] >= 35.
+        else:
+            assert not entries and sum(entry_travel) < .03
+            if fault != "unknown":
+                assert physical.travel < .03
+            assert entry_starts == (1 if fault == "stop" else 0)
+            assert controller.state["error"] is not None or controller.state["outcome"]["kind"] == "interrupted"
+        ticks = await worker.call(lambda sim: sim.ticks)
+        await asyncio.sleep(.2)
+        assert await worker.call(lambda sim: sim.ticks) == ticks
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
 def test_targeted_exploration_plan_is_rejected_before_it_can_disable_room_supervision():
     from backend.mission import MissionDecision
     with pytest.raises(ValueError, match="kind=room"):
@@ -666,7 +764,8 @@ async def test_room_search_delegates_frontiers_to_local_worker(tmp_path, monkeyp
         deadline = controller.mission.deadline
         if interrupted:
             async with asyncio.timeout(70.):
-                while not worker.home_mission.active or math.hypot(*worker.sim.odometry[:2]) < .15:
+                while (not worker.home_mission.active or not worker.home_mission.task["segments"]
+                        or math.hypot(*worker.sim.odometry[:2]) < .15):
                     assert not controller.task.done(), {"state": controller.state, "task": worker.home_mission.task}
                     await asyncio.sleep(.02)
             worker.stop()
@@ -952,9 +1051,10 @@ async def test_mission_half_turn_stays_in_place_refreshes_view_and_obeys_stop(tm
         await worker.close()
 
 
-@pytest.mark.parametrize("stop_phase,with_memory", [(None, False), ("reply", False), ("return", False),
-    pytest.param("redirect", False, id="task-change-cabinet-to-home"), pytest.param(None, True, id="persistent-memory")])
-async def test_unified_visual_object_approach_and_automatic_return(tmp_path, stop_phase, record_property, with_memory):
+@pytest.mark.parametrize("stop_phase,with_memory,use_candidates", [(None, False, False), ("reply", False, False), ("return", False, False),
+    pytest.param("redirect", False, False, id="task-change-cabinet-to-home"), pytest.param(None, True, False, id="persistent-memory"),
+    pytest.param(None, False, True, id="observed-candidate-ids")])
+async def test_unified_visual_object_approach_and_automatic_return(tmp_path, stop_phase, record_property, with_memory, use_candidates):
     import asyncio
     import base64
     from io import BytesIO
@@ -976,6 +1076,8 @@ async def test_unified_visual_object_approach_and_automatic_return(tmp_path, sto
         *[{"action": "turn", "turn_rad": 1.3} for heading in range(5)], {"action": "look", "pitch_rad": .45}]
 
     class VisualModel:
+        requires_grounded_plan = use_candidates
+
         async def respond(self, profile, reasoning, goal, inputs):
             goals.append(goal)
             if stop_phase == "reply" and not replies:
@@ -1018,6 +1120,14 @@ async def test_unified_visual_object_approach_and_automatic_return(tmp_path, sto
                 decision = {"action": "approach_object", "object_goal_id": selected["goal_id"]}
             else:
                 decision = {"action": "verify_object", "object_goal_id": selected["goal_id"], "object_bounds": bounds}
+            if use_candidates and decision["action"] in {"select_object", "verify_object"}:
+                candidates = payload["observation"]["spatial"]["object_candidates"]
+                candidate = min(candidates, key=lambda item: sum(abs(actual-expected)
+                    for actual, expected in zip(item["bounds"], bounds)))
+                assert candidate["bounds"][0] <= float(columns.mean()/width) <= candidate["bounds"][2]
+                assert candidate["bounds"][1] <= float(rows.mean()/height) <= candidate["bounds"][3]
+                decision.pop("object_bounds")
+                decision.update(object_candidate_id=candidate["id"], evidence_text="Visible red cabinet body")
             replies.append(decision)
             return model_response("guide_mission", json.dumps(decision), call_id=f"mission-{len(replies)}")
 

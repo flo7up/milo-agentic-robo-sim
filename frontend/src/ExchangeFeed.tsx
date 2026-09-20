@@ -185,7 +185,7 @@ export function ExchangeFeed({ agent, visible = true }: { agent: AgentState; vis
       setError('');
       setCopyMessage('');
     }
-    if (!agent.session_id || cursor.current.revision >= agent.trace_revision) return;
+    if (!visible || !agent.session_id || cursor.current.revision >= agent.trace_revision) return;
     const controller = new AbortController();
     const sessionId = agent.session_id;
     const query = new URLSearchParams({ session_id: sessionId, after: String(cursor.current.revision) });
@@ -209,7 +209,7 @@ export function ExchangeFeed({ agent, visible = true }: { agent: AgentState; vis
     }
     void load();
     return () => controller.abort();
-  }, [agent.session_id, agent.trace_revision, retry]);
+  }, [agent.session_id, agent.trace_revision, retry, visible]);
 
   const entries = feed.session_id === agent.session_id ? feed.events : [];
   const shown = entries.filter(entry => filter === 'All' || (filter === 'Inputs' && entry.kind === 'feedback') ||

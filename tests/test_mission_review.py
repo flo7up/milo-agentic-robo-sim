@@ -9,6 +9,92 @@ from backend.mission import Mission, MissionDecision, MissionPlan
 from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
 
 
+def test_target_priority_keeps_the_selected_object_approach_and_verification_stages():
+    from backend.mission_supervisor import instructions_for
+
+    instructions = instructions_for({"mission": {"plan": {"kind": "object", "completion": "arrive"}}})
+    assert "unselected target requires select_object" in instructions
+    assert "keep an already selected goal and use approach_object then verify_object" in instructions
+    assert "Explore follows its existing frontier and CANNOT approach a visible object" in instructions
+
+
+@pytest.mark.parametrize("angles", [{}, {"yaw_rad": .6}, {"pitch_rad": .4}, {"yaw_rad": 0., "pitch_rad": .2},
+    {"yaw_rad": .01, "pitch_rad": .21}])
+def test_production_inspections_reject_missing_or_unchanged_directions(angles):
+    from types import SimpleNamespace
+    from backend.mission_supervisor import accept_initial_action, local_response_schema, tools
+
+    mission = Mission("run", 0, 0, 0, deadline=60., clock=lambda: 0.)
+    mission.configure(MissionPlan(kind="object", target="yellow cube"))
+    observation = SimpleNamespace(head_rad=[0., .2], spatial={})
+    decision = MissionDecision(action="look", **angles)
+    with pytest.raises(ValueError, match="INSPECTION"):
+        accept_initial_action(mission, decision, observation, allowed_actions=["look", "wait", "explore"])
+    assert mission.operation is None and not mission.receipts
+    assert set(tools(["look"])[0]["parameters"]["required"]) == {"action", "yaw_rad", "pitch_rad"}
+    assert set(local_response_schema(["look"])["anyOf"][0]["required"]) == {"action", "yaw_rad", "pitch_rad"}
+
+
+def test_inspection_guard_preserves_changed_view_moving_deferral_and_legacy_refresh():
+    from types import SimpleNamespace
+    from backend.mission_supervisor import accept_initial_action
+
+    mission = Mission("run", 0, 0, 0, deadline=60., clock=lambda: 0.)
+    mission.configure(MissionPlan(kind="room", target="kitchen"))
+    observation = SimpleNamespace(head_rad=[0., .2], spatial={})
+    accept_initial_action(mission, MissionDecision(action="look", yaw_rad=.6, pitch_rad=.2), observation,
+        allowed_actions=["look", "wait"])
+    accept_initial_action(mission, MissionDecision(action="wait"), observation, allowed_actions=["look", "wait"])
+    accept_initial_action(mission, MissionDecision(action="look"), observation)
+    mission.operation = "moving-operation"
+    accept_initial_action(mission, MissionDecision(action="look", yaw_rad=0., pitch_rad=.2), observation,
+        allowed_actions=["look", "wait"])
+    assert mission.operation == "moving-operation" and not mission.receipts
+
+
+@pytest.mark.parametrize("stage", ["unselected", "foreign", "selected", "verified"])
+def test_object_wait_does_not_establish_unmeasured_arrival(stage):
+    from types import SimpleNamespace
+    from backend.mission_supervisor import available_actions, semantic_payload
+
+    mission = Mission("run", 0, 0, 0, deadline=60., clock=lambda: 0.)
+    mission.configure(MissionPlan(kind="object", target="yellow cube on a short pedestal", completion="arrive"))
+    mission.receipts["exploration"] = {"operation_id": "explored"}
+    object_state = None
+    if stage != "unselected":
+        mission.target_id = "current"
+        object_state = {"goal_id": "foreign" if stage == "foreign" else "current", "verified": True}
+    if stage == "verified":
+        mission.receipts["target"] = {"operation_id": "verified"}
+    previous = {"status": "observed", "action": "wait", "reason": "Yellow cube is clearly visible and within 0.9 m"}
+    actions = available_actions(mission, SimpleNamespace(spatial={}), object_state)
+    payload = semantic_payload({"run_id": "run", "episode_epoch": 0, "seq": 12}, mission, object_state, previous, actions)
+    arrival = payload["object_arrival"]
+    assert arrival["target_selected"] == (stage in {"selected", "verified"})
+    assert arrival["arrival_verified"] == (stage == "verified")
+    assert payload["last_execution"]["arrival_verified"] == (stage == "verified")
+    assert arrival["wait_is_arrival_evidence"] is False
+    assert "wait" in actions and "select_object" in actions
+    if stage != "verified":
+        assert "unverified" in payload["last_execution"]["reason"]
+        assert "within 0.9" not in payload["last_execution"]["reason"]
+        assert "target" not in mission.receipts
+    assert "Select the target" in arrival["next_step"] if stage in {"unselected", "foreign"} else "verif" in arrival["next_step"]
+    assert previous["reason"] == "Yellow cube is clearly visible and within 0.9 m"
+    assert mission.operation is None
+
+
+@pytest.mark.parametrize("kind,completion", [("object", "identify"), ("room", "arrive"), ("explore", "arrive")])
+def test_object_arrival_feedback_does_not_change_other_goal_types(kind, completion):
+    from backend.mission_supervisor import semantic_payload
+
+    mission = Mission("run", 0, 0, 0, deadline=60., clock=lambda: 0.)
+    mission.configure(MissionPlan(kind=kind, target="" if kind == "explore" else "target", completion=completion))
+    previous = {"status": "observed", "action": "wait"}
+    payload = semantic_payload({}, mission, None, previous, ["wait"])
+    assert "object_arrival" not in payload and payload["last_execution"] == previous
+
+
 @pytest.mark.parametrize("direction", ["clockwise", "counterclockwise"])
 def test_grounded_circuit_plans_before_exposing_only_compatible_actions(direction):
     from types import SimpleNamespace
@@ -992,6 +1078,26 @@ def test_local_supervisor_uses_frequent_bounded_review_checkpoints():
     objective.travel_m = 2.
     timing = cloud.review_timing(1.)
     assert timing["trigger"] == "travel" and timing["review_interval_s"] == 15. and timing["review_travel_m"] == 2.
+
+
+@pytest.mark.parametrize("kind", ["room", "object"])
+def test_semantic_search_saves_reviews_for_progress_without_extending_authority(kind):
+    from types import SimpleNamespace
+    from backend.mission_supervisor import MappedReviewOperation
+    objective = SimpleNamespace(travel_m=0., expires_at=60.)
+    mission = SimpleNamespace(objective=objective, plan=SimpleNamespace(kind=kind))
+    controller = SimpleNamespace(state={"feedback_interval_s": .25}, mission=mission)
+    mapped = MappedReviewOperation(controller, None, None, SimpleNamespace(provider="ollama"))
+    assert mapped.review_timing(3.)["trigger"] is None
+    assert mapped.review_timing(9.999)["trigger"] is None
+    assert mapped.review_timing(10.)["trigger"] == "periodic"
+    objective.travel_m = .75
+    assert mapped.review_timing(1.)["trigger"] == "travel"
+    objective.travel_m = 0.
+    assert mapped.review_timing(50.)["trigger"] == "objective_deadline"
+    assert objective.expires_at == 60.
+    mission.plan.kind = "place"
+    assert mapped.review_timing(3.)["trigger"] == "periodic"
 
 
 async def test_review_wait_observes_feedback_interval_changes(monkeypatch):

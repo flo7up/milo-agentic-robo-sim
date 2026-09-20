@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
-import { Activity, ArrowDown, ArrowUp, Battery, BatteryCharging, Camera, Check, CircleStop, Crosshair, Eye, Hand, LoaderCircle, Map, MessageSquare, Mic, Minus, Move3D, Pause, Play, Power, Radar, RotateCcw, RotateCw, Route, Settings2, Timer, TriangleAlert, Volume2, Wifi, WifiOff } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, Battery, BatteryCharging, Camera, Check, CircleStop, Crosshair, Eye, Hand, LoaderCircle, Map, Mic, Minus, Move3D, Pause, Play, Power, Radar, RotateCcw, RotateCw, Route, Settings2, Timer, TriangleAlert, Volume2, Wifi, WifiOff } from 'lucide-react';
 import { Spectator } from './Spectator';
 import { HeadCamera } from './HeadCamera';
 import { SpatialSensing } from './SpatialSensing';
@@ -122,7 +122,7 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
   const [sceneLoading, setSceneLoading] = useState(false);
   const [spatialHud, setSpatialHud] = useState<HTMLDivElement | null>(null);
   const [cameraMinimized, setCameraMinimized] = useState(true);
-  const [liveReadoutsOpen, setLiveReadoutsOpen] = useState(true);
+  const [liveReadoutsOpen, setLiveReadoutsOpen] = useState(false);
   const [spatialTelemetry, setSpatialTelemetry] = useState<SpatialTelemetry | null>(null);
   const [showMotionZones,setShowMotionZones]=useState(() => {
     try { return sessionStorage.getItem('milo-sensors-and-areas') === 'true'; }
@@ -215,8 +215,6 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
   const disabled = !connected || !powered || powerPending || pending || sceneLoading || !!state?.busy || !!state?.stopped || !!state?.agent.active || !!state?.regression?.active;
   const jointLimits = [1.8, 2.5, 2.7, 3, 2.5, 3];
   const observation = state?.observation;
-  const inferenceBudget = state?.agent.inference_budget;
-  const reportedTokens = (state?.agent.input_tokens ?? 0) + (state?.agent.output_tokens ?? 0);
   const telemetryContent = <>
     <details className="sensor-panel compact-disclosure">
       <summary><Activity size={16} />Robot sensors</summary>
@@ -238,28 +236,23 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
       <SpatialSensing key={`spatial-${state.run_id}`} runId={state.run_id} epoch={state.episode_epoch}
       connected={connected} busy={sceneLoading || state.busy || state.agent.active} request={api} hudHost={spatialHud} onTelemetry={setSpatialTelemetry} showMotionZones={showMotionZones} /></>}</div>
   </>;
-  const commandBar = <section className="command-bar" aria-label="Robot controls">
-    <RobotActivity state={state} connected={connected} />
-    <div className="run-actions">{state?.power && <div className="robot-power-control">
+  const robotAccess = <section className="robot-access" aria-label="Robot access">
+    {state?.power && <div className="robot-power-control">
       <button className="icon-button" type="button" role="switch" aria-label="Robot power" aria-checked={state.power.on}
         title={state.power.on ? 'Turn robot off' : 'Turn robot on'} disabled={!connected || powerPending || sceneLoading}
-        onClick={() => void togglePower()}><Power size={19} /></button></div>}
+        onClick={() => void togglePower()}><Power size={19} /></button><span>Robot power {state.power.on ? 'on' : 'off'}</span></div>}
+      <details className="robot-options"><summary><Hand size={16} />Manual control options</summary><div>
+        <button disabled={!connected || !powered || (!state?.stopped && !state?.agent.active)} onClick={() => control(state?.agent.active ? 'agent/takeover' : 'resume')}><Hand size={16} />{state?.agent.active ? 'Take manual control' : 'Enable manual control'}</button>
+      </div></details>
+  </section>;
+  const commandBar = <section className="command-bar" aria-label="Robot controls">
+    <RobotActivity state={state} connected={connected} />
+    <div className="run-actions" role="group" aria-label="Run controls">
       <div ref={setCommandHost} className="mission-start" />
       <button className="stop-button" disabled={!connected} onClick={() => control('stop')}><CircleStop size={18} /> Stop</button>
-      <div ref={setSettingsHost} className="mission-settings" />
-      <button className="icon-button" type="button" title="Reset scene" aria-label="Reset episode"
-        disabled={!connected || sceneLoading || powerPending} onClick={() => control('reset')}><RotateCcw size={18} /></button>
-      <details className="robot-options"><summary title="Manual control options" aria-label="Robot options"><Hand size={19} /></summary><div>
-        <button disabled={!connected || !powered || (!state?.stopped && !state?.agent.active)} onClick={() => control(state?.agent.active ? 'agent/takeover' : 'resume')}><Hand size={16} />{state?.agent.active ? 'Take manual control' : 'Enable manual control'}</button>
-      </div></details></div>
-    {inferenceBudget && <div className="command-budget" role="group" aria-label="Luna usage and limits"
-      data-limit-reached={reportedTokens >= inferenceBudget.max_tokens}
-      title="Provider-reported usage. The threshold is checked after each request, so a response may cross it.">
-      <span>{!connected ? 'Last received' : state?.agent.active ? 'Current run' : 'Last run'}</span>
-      <span>Tokens <strong>{reportedTokens.toLocaleString('en-US')} / {inferenceBudget.max_tokens.toLocaleString('en-US')}</strong></span>
-      <span>Requests <strong>{inferenceBudget.requests} / {inferenceBudget.max_requests}</strong></span>
-      {inferenceBudget.usage_unknown && <span>Usage incomplete</span>}
-    </div>}
+      <button type="button" title="Reset the current scenario" aria-label="Reset episode"
+        disabled={!connected || sceneLoading || powerPending} onClick={() => control('reset')}><RotateCcw size={18} /> Reset</button>
+    </div>
   </section>;
   return <RobotControlSurface.Provider value={setControlSurface}>
     <header className="topbar cockpit-header unified-header">
@@ -268,10 +261,10 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
     </header>
     <main className="observatory">
       <section className="runbar">
-        <div className="run-context"><div><h2>{state?.challenge?.title ?? 'Practice bench'}</h2></div>
+        <div className="run-context"><div ref={setSettingsHost} className="mission-settings" /><div><h2>{state?.challenge?.title ?? 'Practice bench'}</h2></div>
           {state?.regression?.active && <span className="tag" role="status">Baseline {(state.regression.current_index ?? 0)+1} / {state.regression.cases.length} · {state.regression.phase.replaceAll('_',' ')}</span>}
-          {state && <ChallengePicker state={state} connected={connected} request={api} onLoadingChange={setSceneLoading} />}</div>
-        <nav className="workspace-nav" aria-label="Workspace"><a href="#observe"><Eye size={15} />World</a><a href="#interact"><MessageSquare size={15} />Luna</a><a href="#controls" onClick={() => setManualOpen(true)}><Hand size={15} />Controls</a></nav>
+        </div>
+        {state && <ChallengePicker state={state} connected={connected} request={api} onLoadingChange={setSceneLoading} />}
       </section>
       {controlSurface ? createPortal(commandBar, controlSurface) : commandBar}
       {error && <div className="error" role="alert">{error}</div>}
@@ -324,7 +317,7 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
       </div>
       <aside className="interaction-column" id="interact" aria-label="Robot interaction">
         {state && <AgentControl key={state.run_id} state={state} connected={connected && !sceneLoading && !powerPending} request={api} commandHost={commandHost}
-          settingsHost={settingsHost} telemetryContent={telemetryContent}
+          settingsHost={settingsHost} telemetryContent={telemetryContent} robotAccess={robotAccess}
           spatialTelemetry={spatialTelemetry?.run_id === state.run_id && spatialTelemetry.episode_epoch === state.episode_epoch ? spatialTelemetry : null} />}
       </aside>
       </div>

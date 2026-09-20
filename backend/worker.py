@@ -1051,6 +1051,108 @@ class SimulationWorker:
                 raise
         return await self.call(operation)
 
+    async def prepare_exploration_entry(self, mission, duration_s=8., travel_m=.5):
+        from backend.home_mapping import transform_pose
+        expected = self._mission_read_authority(mission)
+        operation_id = mission.operation
+        began = time.monotonic()
+        deadline = min(mission.deadline, began + min(8., duration_s))
+        limit = min(.5, travel_m)
+        control = None
+        previous_tick = None
+        guarded_tick = None
+
+        def check(sim):
+            mission.check((sim.run_id, sim.epoch, self.stop_revision, self.task_revision))
+            if (mission.operation != operation_id or sim.cancel.is_set() or not self.powered
+                    or self.inference_owner != expected[-1] or self.home_mission.mission_owner != mission.identity):
+                raise ValueError("CANCELLED: exploration entry authority changed")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Exploration entry deadline expired")
+
+        def start(sim):
+            nonlocal control, previous_tick, guarded_tick
+            self._mission_read_guard(sim, expected)
+            check(sim)
+            if not mission.plan or mission.plan.kind not in {"explore", "room", "object"} or not operation_id:
+                raise ValueError("Exploration entry requires an active search operation")
+            home = self.home_mission
+            home.sample(force=True)
+            home.require_localized()
+            radius = sim.robot_footprint()["radius_m"]
+            allowed = home.home.allowed(radius, home.obstacles())
+            column, row = home.home.indices(home.pose[:2])
+            if not home.home.inside([column, row]):
+                raise ValueError("UNREACHABLE: exploration start outside map")
+            if allowed[row, column]:
+                return False
+            self._sample_spatial(force=True)
+            if not self.spatial_enabled or self.spatial_error or not self.spatial_frames:
+                raise ValueError("SPATIAL_STALE: exploration entry needs fresh depth")
+            sensor = next(reversed(self.spatial_frames.values()))[0]
+            self._mission_read_guard(sim, expected, sensor)
+            if not self._can_reuse_stationary_spatial(sim, sensor):
+                raise ValueError("SPATIAL_STALE: exploration entry frame changed")
+            search = self.spatial_map.route_search(sim.odometry[:2], radius)
+            path = None
+            for distance in (.25, .4):
+                for bearing in (0., -.4, .4):
+                    heading = sim.odometry[2] + bearing
+                    target = sim.odometry[:2] + distance * np.array([np.cos(heading), np.sin(heading)])
+                    mapped = transform_pose([*target, 0.], home.transform)
+                    column, row = home.home.indices(mapped[:2])
+                    if not home.home.inside([column, row]) or not allowed[row, column]:
+                        continue
+                    try:
+                        candidate = search.plan(target)
+                    except ValueError:
+                        continue
+                    length = float(np.linalg.norm(np.diff(candidate, axis=0), axis=1).sum())
+                    if length + .1 <= limit:
+                        path = candidate
+                        break
+                if path is not None:
+                    break
+            if path is None:
+                raise ValueError("UNREACHABLE: no observed local path into mapped free space")
+            check(sim)
+            previous_tick = sim.on_tick
+            def guard():
+                try:
+                    check(sim)
+                except (ValueError, TimeoutError):
+                    sim.stop()
+                previous_tick()
+            guarded_tick = guard
+            sim.on_tick = guard
+            self._start_navigation_path(np.asarray(path), recover_clearance=True)
+            control = self.continuous
+            self.navigation.skill_deadline = min(self.navigation.skill_deadline, deadline)
+            self.navigation.authorized_travel_m = limit
+            return True
+
+        try:
+            if not await self.call(start):
+                return None
+            while control.active:
+                await self.call(check)
+                await asyncio.sleep(.05)
+            await self.call(check)
+            if control.status != "arrived":
+                raise ValueError("Exploration entry blocked: " + control.reason)
+            return {"status": "observed_entry_reached", "travel_m": self.navigation.travel,
+                "elapsed_s": time.monotonic()-began, "source": "head_depth_and_wheel_odometry",
+                "arrival_verified": False}
+        finally:
+            def release(sim):
+                if guarded_tick is not None and sim.on_tick is guarded_tick:
+                    sim.on_tick = previous_tick
+                if control is not None and self.continuous is control:
+                    if control.active:
+                        control.finish(sim, self.navigation, "cancelled", "Exploration entry ended")
+                    self.continuous = None
+            await self.call(release)
+
     async def mission_objective(self, mission, identity, *, decision=None, renew=False, end_reason=None, selection=None):
         from backend.home_mission import HomeRequest
         expected = self._mission_read_authority(mission)
@@ -1089,6 +1191,7 @@ class SimulationWorker:
                     home.command(HomeRequest(run_id=sim.run_id, episode_epoch=sim.epoch,
                         action="explore_frontier" if selection else "explore", frontier_id=selection.frontier_id if selection else None,
                         time_budget=max(1., remaining)), *expected[2:4], **({"selected_frontier": selection} if selection else {}))
+                    home.task["room_search"] = mission.plan.kind == "room"
                     self._mission_read_guard(sim, expected)
                     if selection is not None:
                         selection.check(mission.identity, sim.run_id, sim.epoch, home.home.identity, sim.odometry, time.monotonic())
@@ -1165,17 +1268,24 @@ class SimulationWorker:
             observation = observation.model_copy(update={"odometry_m_rad": list(sensor.odometry_m_rad),
                 "head_rad": list(sensor.head_rad), "simulated_time_s": sensor.simulated_time_s})
             home = self.home_mission
+            if home and home.home and observation.spatial:
+                home.home.passage_memory.bind_frame(home.home.frame_revision)
+                observation = observation.model_copy(update={"spatial": {**observation.spatial,
+                    "passage_memory": home.home.passage_memory.summary(home.home.identity)}})
             if mission and home and home.home and observation.spatial and not moving:
                 from backend.home_mapping import transform_pose
                 home.require_localized()
                 pose = transform_pose(sensor.odometry_m_rad, home.transform)
-                candidates = home.home.frontiers(pose, sim.robot_footprint()["radius_m"], home.obstacles(),
-                    excluded=home.task.get("rejected_frontiers", ()) if home.task and home.task.get("mission_id") == mission.identity else ())
+                rejected = home.task.get("rejected_frontiers", ()) if home.task and home.task.get("mission_id") == mission.identity else ()
+                room_search = mission.plan and mission.plan.kind == "room"
+                candidates = home.home.exploration_frontiers(pose, sim.robot_footprint()["radius_m"], home.obstacles(),
+                    excluded=rejected, room_search=room_search)
                 for candidate in candidates:
                     delta = np.asarray(candidate["position_m"]) - pose[:2]
                     bearing = math.atan2(delta[1], delta[0]) - pose[2]
                     candidate["bearing_rad"] = math.atan2(math.sin(bearing), math.cos(bearing))
-                candidates.sort(key=lambda item: item["distance_m"] + .8 * abs(item["bearing_rad"]) + item["attempts"])
+                if not room_search and not home.home.passage_memory.data.loops:
+                    candidates.sort(key=lambda item: item["distance_m"] + .8 * abs(item["bearing_rad"]) + item["attempts"])
                 observation = observation.model_copy(update={"spatial": {**observation.spatial, "frontiers": candidates[:4]}})
             return sensor, image, observation
         return await self.call(operation)
