@@ -6,6 +6,7 @@ export type SceneSelection = {challenge_id: ChallengeId; environment: ChallengeE
   orbit_target?: 'table' | 'sofa' | 'chair' | 'floor lamp'; orbit_direction?: 'clockwise' | 'counterclockwise'};
 type Preferences = {
   interval: number; turns: number; reasoning: Reasoning; luna_endpoint: string; luna_deployment: string;
+  mission_controller: 'luna' | 'qwen' | 'hybrid' | 'policy'; local_model_endpoint: string; local_model_tag: string;
   control_mode: 'task' | 'exploration'; exploration_budget: number; handoff: boolean; skill_composer: boolean;
   navigation_backend: 'builtin' | 'nav2'; ai_routes: boolean; adaptive: boolean;
   navigation_mode: 'luna_continuous' | 'luna_navigation'; inspector: 'conversation' | 'trace' | 'settings';
@@ -25,6 +26,7 @@ const cacheKey = 'milo-workspace-preferences-v1';
 const pendingKey = 'milo-workspace-preferences-pending-v1';
 const choices: Record<string, readonly string[]> = {
   reasoning: ['none', 'low', 'medium', 'high'], control_mode: ['task', 'exploration'],
+  mission_controller: ['luna', 'qwen', 'hybrid', 'policy'],
   navigation_backend: ['builtin', 'nav2'], navigation_mode: ['luna_continuous', 'luna_navigation'],
   inspector: ['conversation', 'trace', 'settings'], graphics: ['standard', 'enhanced'],
   manual_tab: ['drive', 'head', 'arms'], manual_arm: ['left', 'right'],
@@ -34,7 +36,7 @@ const ranges: Record<string, [number, number]> = {interval: [.25, 30], turns: [1
   duration: [.1, 2], head_yaw: [-1.5, 1.5], head_pitch: [-.7, 1.15], opening: [0, .11], force: [1, 35]};
 const booleans = new Set(['handoff', 'skill_composer', 'ai_routes', 'adaptive', 'connection_open', 'run_settings_open',
   'challenge_details_open', 'compact_arms', 'axes', 'manual_open', 'mission_map_context']);
-const scenarios = new Set(['bench', 'park', 'tidy', 'sort', 'recharge', 'apartment', 'kitchen_bathroom', 'clinic_delivery',
+const scenarios = new Set(['bench', 'park', 'park_left', 'park_right', 'park_far', 'tidy', 'sort', 'recharge', 'apartment', 'kitchen_bathroom', 'clinic_delivery',
   'warehouse', 'inspection', 'workshop', 'local_park', 'pedestrian_crossing', 'flat_kitchen', 'furniture_circuit', 'movement_practice']);
 
 function valid(key: string, value: unknown): boolean {
@@ -48,6 +50,14 @@ function valid(key: string, value: unknown): boolean {
     && (!['turns', 'exploration_budget', 'max_model_requests', 'max_model_tokens'].includes(key) || Number.isInteger(value));
   if (booleans.has(key)) return typeof value === 'boolean';
   if (key === 'luna_deployment') return typeof value === 'string' && value.length <= 128 && /^[\w.-]*$/.test(value);
+  if (key === 'local_model_tag') return typeof value === 'string' && value.length <= 120;
+  if (key === 'local_model_endpoint') {
+    if (value === '') return true;
+    if (typeof value !== 'string' || value.length > 2048) return false;
+    try { const parsed = new URL(value); return parsed.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)
+      && !parsed.username && !parsed.password && !parsed.search && !parsed.hash && (parsed.pathname === '/' || parsed.pathname === '') && parsed.port !== '0'; }
+    catch { return false; }
+  }
   if (key === 'luna_endpoint') {
     if (value === '') return true;
     if (typeof value !== 'string' || value.length > 2048) return false;

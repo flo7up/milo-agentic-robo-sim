@@ -8,6 +8,9 @@ import { usePreference, type SceneSelection } from './Preferences';
 const scenarioNotes: Record<ChallengeId, { summary: string; completion: string }> = {
   bench: { summary: 'An open practice area with a cube for driving, camera movement and arm control.', completion: 'Free practice, without scored objectives.' },
   park: { summary: 'A short parking course with two posts and a green destination bay.', completion: 'Stop with the entire base and both wheels inside the bay.' },
+  park_left: { summary: 'The same parking bay and posts, starting 30 cm left of the centreline.', completion: 'Stop with the entire base and both wheels inside the bay.' },
+  park_right: { summary: 'The same parking bay and posts, starting 30 cm right of the centreline.', completion: 'Stop with the entire base and both wheels inside the bay.' },
+  park_far: { summary: 'The same parking bay and posts, starting 65 cm farther back.', completion: 'Stop with the entire base and both wheels inside the bay.' },
   local_park: { summary: 'A simple green-bay course with wide posts, used for local-model parking experiments.', completion: 'Park fully in the green bay, grounded and at rest.' },
   tidy: { summary: 'A single red cube beside a blue drop zone. A focused pick-and-place task.', completion: 'Lift the cube, then release it fully inside the blue zone and let it settle.' },
   sort: { summary: 'Two colored cubes and matching drop zones for a two-object manipulation task.', completion: 'Lift and place each cube in its matching zone, released and settled.' },

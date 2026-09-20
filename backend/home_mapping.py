@@ -141,8 +141,13 @@ class HomeMap:
     def route(self, start, goal, radius_m, obstacles=()):
         allowed = self.allowed(radius_m, obstacles)
         indices = self.indices([start, goal])
-        if not self.inside(indices).all() or not allowed[indices[:, 1], indices[:, 0]].all():
-            raise ValueError("UNREACHABLE: destination or current footprint is not in mapped free space")
+        if not self.inside(indices).all():
+            raise ValueError("UNREACHABLE: destination or current footprint is outside the mapped area")
+        start_allowed, goal_allowed = allowed[indices[:, 1], indices[:, 0]]
+        if not start_allowed:
+            raise ValueError("UNREACHABLE: current footprint is not in mapped free space")
+        if not goal_allowed:
+            raise ValueError("UNREACHABLE: destination is not in mapped free space")
         nodes = np.arange(self.size ** 2).reshape(allowed.shape)
         sources, targets = [], []
         for row_delta, column_delta in ((1, 0), (0, 1)):
@@ -225,9 +230,6 @@ class HomeMap:
         connected = components == components[position[1], position[0]]
         nearby_unknown = binary_dilation(self.cells == -1, iterations=math.ceil((radius_m + .4) / self.resolution_m))
         groups, count = label(connected & nearby_unknown)
-        visited_count = int(np.count_nonzero(self.visits))
-        distance_from_visited = (distance_transform_edt(self.visits == 0) * self.resolution_m
-            if visited_count >= 5 else np.zeros_like(self.visits, dtype=float))
         region = None
         if region_id:
             region = next((place for place in self.places if place["place_id"] == region_id and place["kind"] == "room"), None)
@@ -243,8 +245,7 @@ class HomeMap:
             distances = np.linalg.norm(points - pose[:2], axis=1)
             headings = np.arctan2(points[:, 1] - pose[1], points[:, 0] - pose[0]) - pose[2]
             turns = np.abs(np.arctan2(np.sin(headings), np.cos(headings)))
-            novelty = np.minimum(distance_from_visited[rows, columns], 1.5)
-            scores = np.abs(distances - 1.) + .4 * turns + self.visits[rows, columns] * .2 - .35 * novelty
+            scores = np.abs(distances - 1.) + .4 * turns + self.visits[rows, columns] * .2
             for selected in np.argsort(scores):
                 if distances[selected] <= .15 + self.resolution_m:
                     continue
@@ -258,31 +259,25 @@ class HomeMap:
                 if previous.get("attempts", 0) >= 2 and known - previous.get("known_cells", known) < 25:
                     continue
                 result.append({"frontier_id": key, "position_m": point, "distance_m": float(distances[selected]),
-                    "attempts": previous.get("attempts", 0), "distance_from_visited_m": float(novelty[selected]),
-                    "priority": float(scores[selected] + previous.get("attempts", 0)),
-                    "region_scope": "within_3m_of_room_annotation" if region else "all_connected"})
+                    "attempts": previous.get("attempts", 0), "region_scope": "within_3m_of_room_annotation" if region else "all_connected"})
                 break
-        return sorted(result, key=lambda item: item["priority"])[:20]
+        return sorted(result, key=lambda item: item["distance_m"] + item["attempts"])[:20]
 
     def mark_frontier(self, identity):
         previous = self.frontier_attempts.get(identity, {})
         self.frontier_attempts[identity] = {"attempts": previous.get("attempts", 0) + 1,
             "known_cells": int(np.count_nonzero(self.evidence)), "last_attempt_unix_s": time.time()}
 
-    def match_scan(self, laser, seed=None, radius_m=.25):
+    def match_scan(self, laser, seed=None):
         _, local, hits = laser_points(laser, [0., 0., 0.])
         local = local[hits][::4]
         if len(local) < 20 or np.count_nonzero(self.cells == 100) < 20:
             raise ValueError("LOCALIZATION_UNRELIABLE: insufficient measured wall returns")
         field = distance_transform_edt(self.cells != 100) * self.resolution_m
-        allowed = self.allowed(radius_m)
 
         def score(poses):
             results = []
             for pose in poses:
-                position = self.indices(pose[:2])
-                if not self.inside(position) or not allowed[position[1], position[0]]:
-                    continue
                 cosine, sine = math.cos(pose[2]), math.sin(pose[2])
                 points = local @ np.array([[cosine, sine], [-sine, cosine]]) + pose[:2]
                 indices = self.indices(points)
@@ -293,7 +288,7 @@ class HomeMap:
             return sorted(results, key=lambda item: item[0])
 
         if seed is None:
-            rows, columns = np.where(allowed)
+            rows, columns = np.where(self.allowed(.25))
             positions = np.unique(np.floor((self.origin + np.column_stack((columns, rows)) * self.resolution_m) / .4) * .4, axis=0)
             if len(positions) > 6000:
                 raise ValueError("LOCALIZATION_SEED_REQUIRED: select an approximate saved place")

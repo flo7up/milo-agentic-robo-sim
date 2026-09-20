@@ -23,6 +23,9 @@ class PreferencesPatch(BaseModel):
     reasoning: Literal["none", "low", "medium", "high"] | None = None
     luna_endpoint: str | None = Field(default=None, max_length=2048)
     luna_deployment: str | None = Field(default=None, max_length=128, pattern=r"^[\w.-]*$")
+    mission_controller: Literal["luna", "qwen", "hybrid", "policy"] | None = None
+    local_model_endpoint: str | None = Field(default=None, max_length=2048)
+    local_model_tag: str | None = Field(default=None, max_length=120)
     control_mode: Literal["task", "exploration"] | None = None
     exploration_budget: int | None = Field(default=None, ge=1, le=300)
     handoff: bool | None = None
@@ -70,6 +73,14 @@ class PreferencesPatch(BaseModel):
         path = Path(value).expanduser()
         if path.drive and not path.is_absolute():
             raise ValueError("Use an absolute drive path or a workspace-relative folder")
+        return value
+
+    @field_validator("local_model_endpoint")
+    @classmethod
+    def local_endpoint(cls, value):
+        if value is not None:
+            from backend.agent import FoundryConfig
+            return FoundryConfig.local_endpoint(value)
         return value
 
     @field_validator("luna_endpoint")

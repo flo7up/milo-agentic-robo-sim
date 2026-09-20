@@ -41,6 +41,17 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
   const agent = state.agent;
   const kitchenSearch = state.challenge?.id === 'flat_kitchen';
   const luna = agent.configuration.models.find(model => model.id === 'luna' && model.provider === 'foundry');
+  const qwen = agent.configuration.models.find(model => model.id === 'qwen' && model.provider === 'ollama');
+  const [preferredController, setPreferredController] = usePreference('mission_controller', 'luna');
+  const [diagnostic, setDiagnostic] = useState<'unified' | 'local' | 'legacy'>(() =>
+    new URLSearchParams(location.search).get('diagnostics') === 'legacy' ? 'legacy' : 'unified');
+  const unified = diagnostic !== 'legacy';
+  const localOnly = diagnostic === 'local' || (unified && preferredController === 'policy');
+  const hybrid = unified && preferredController === 'hybrid';
+  const useLocalModel = unified && !localOnly && ['qwen','hybrid'].includes(preferredController);
+  const selectedModel = useLocalModel ? qwen : luna;
+  const modelId = useLocalModel ? 'qwen' : 'luna';
+  const modelName = hybrid ? 'Qwen + Luna' : useLocalModel ? 'Qwen' : 'Luna';
   const goalKey = `${state.challenge?.environment ?? 'standalone'}:${state.challenge?.id ?? 'bench'}:${state.challenge?.orbit?.target ?? ''}:${state.challenge?.orbit?.direction ?? ''}`;
   const [goals, setGoals] = usePreference('goals', {});
   const goal = agent.active && agent.goal ? agent.goal : goals[goalKey] ?? state.challenge?.goal ?? 'Inspect the scene and navigate safely.';
@@ -50,10 +61,16 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
   const [maxRequests, setMaxRequests] = usePreference('max_model_requests', 12);
   const [maxTokens, setMaxTokens] = usePreference('max_model_tokens', 100000);
   const [preferredReasoning, setReasoning] = usePreference('reasoning', 'high');
-  const reasoning = luna?.reasoning_efforts.includes(preferredReasoning) ? preferredReasoning : luna?.reasoning_efforts[0] ?? 'high';
+  const reasoning = useLocalModel ? 'none' : luna?.reasoning_efforts.includes(preferredReasoning) ? preferredReasoning : luna?.reasoning_efforts[0] ?? 'high';
+  const taskSupervisorReasoning = luna?.reasoning_efforts.includes('low') ? 'low' : luna?.reasoning_efforts[0] ?? 'none';
   const [endpoint, setEndpoint] = usePreference('luna_endpoint', agent.configuration.endpoint);
   const [deployment, setDeployment] = usePreference('luna_deployment', luna?.deployment ?? '');
-  const connectionChanged = normalizedEndpoint(endpoint) !== normalizedEndpoint(agent.configuration.endpoint) || deployment !== (luna?.deployment ?? '');
+  const [localEndpoint, setLocalEndpoint] = usePreference('local_model_endpoint', agent.configuration.ollama_endpoint);
+  const [localTag, setLocalTag] = usePreference('local_model_tag', qwen?.deployment ?? 'qwen3-vl:4b-instruct-q4_K_M');
+  const cloudConnectionChanged = normalizedEndpoint(endpoint) !== normalizedEndpoint(agent.configuration.endpoint) || deployment !== (luna?.deployment ?? '');
+  const localConnectionChanged = normalizedEndpoint(localEndpoint) !== normalizedEndpoint(agent.configuration.ollama_endpoint) || localTag !== (qwen?.deployment ?? '');
+  const selectedConnectionChanged = hybrid ? localConnectionChanged || cloudConnectionChanged : useLocalModel ? localConnectionChanged : cloudConnectionChanged;
+  const connectionChanged = cloudConnectionChanged || ((useLocalModel || !!qwen) && localConnectionChanged);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
   const [configurationOpen, setConfigurationOpen] = useState(false);
@@ -99,19 +116,35 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     catch {setRecordingError('Could not copy the recording path');}
   }
   const [explorationBudget, setExplorationBudget] = usePreference('exploration_budget', 180);
-  const [diagnostic, setDiagnostic] = useState<'unified' | 'local' | 'legacy'>(() =>
-    new URLSearchParams(location.search).get('diagnostics') === 'legacy' ? 'legacy' : 'unified');
   const [mapContext, setMapContext] = usePreference('mission_map_context', true);
-  const unified = diagnostic !== 'legacy';
-  const localOnly = diagnostic === 'local';
-  const [capabilities, setCapabilities] = useState<{ready: boolean; architecture?: {name:string;version:string;revision:string}}>({ready:false});
+  const [capabilities, setCapabilities] = useState<{ready: boolean; localSupervisor?:boolean; architecture?: {name:string;version:string;revision:string}}>({ready:false});
   useEffect(() => {
     const controller = new AbortController();
     void fetch('/api/mission/capabilities', {signal:controller.signal}).then(response => response.ok ? response.json() : null)
-      .then(value => {if (!controller.signal.aborted) setCapabilities({ready:value?.version===1 && value?.unified_mission===true, architecture:value?.architecture});})
+      .then(value => {if (!controller.signal.aborted) setCapabilities({ready:value?.version===1 && value?.unified_mission===true,
+        localSupervisor:value?.local_supervisor?.transport==='mission_json_v1', architecture:value?.architecture});})
       .catch(() => {});
     return () => controller.abort();
   }, [state.run_id]);
+  const [localCheckRevision, setLocalCheckRevision] = useState(0);
+  const [localReadiness, setLocalReadiness] = useState<{ready:boolean;message:string;key:string} | null>(null);
+  const localReadinessKey = JSON.stringify([state.run_id, agent.configuration.ollama_endpoint, qwen?.deployment, localCheckRevision]);
+  useEffect(() => {
+    if (!useLocalModel || !connected || !capabilities.localSupervisor || localConnectionChanged || agent.active) return;
+    const controller = new AbortController();
+    let active = true;
+    const timeout = window.setTimeout(()=>controller.abort(), 7000);
+    setLocalReadiness(null);
+    void fetch('/api/agent/local-readiness?model_id=qwen', {signal:controller.signal}).then(async response => {
+      if (!response.ok) throw new Error('Local model readiness unavailable');
+      return response.json();
+    }).then(value=>{
+      if (!controller.signal.aborted) setLocalReadiness({ready:value.ready===true,message:value.message,key:localReadinessKey});
+    }).catch(()=>{if (active) setLocalReadiness({ready:false,message:'Local model readiness unavailable',key:localReadinessKey});})
+      .finally(()=>window.clearTimeout(timeout));
+    return ()=>{active=false;controller.abort();window.clearTimeout(timeout);};
+  }, [useLocalModel, connected, capabilities.localSupervisor, localConnectionChanged, agent.active, localReadinessKey]);
+  const localModelReady = !!capabilities.localSupervisor && localReadiness?.key === localReadinessKey && localReadiness.ready;
   const [instruction, setInstruction] = useState('');
   const [sending, setSending] = useState(false);
   const [instructionError, setInstructionError] = useState('');
@@ -140,12 +173,12 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
   const [supportsSkillComposer, setSupportsSkillComposer] = useState(false);
   useEffect(() => {
     const controller = new AbortController();
-    void fetch(`/api/test-variant?execution_mode=${navigationMode}&model_id=luna&reasoning=${reasoning}&skill_composer=${navigationMode === 'luna_continuous' && backend === 'builtin' && skillComposer}&navigation_backend=${backend}`, {signal:controller.signal})
+    void fetch(`/api/test-variant?execution_mode=${navigationMode}&model_id=${modelId}&reasoning=${reasoning}&skill_composer=${navigationMode === 'luna_continuous' && backend === 'builtin' && skillComposer}&navigation_backend=${backend}${hybrid ? '&task_supervisor_model_id=luna' : ''}`, {signal:controller.signal})
       .then(async response => response.ok ? response.json() : null)
       .then(data => { if (!controller.signal.aborted) { setVariant(data?.architecture ?? null); setSupportsAiRoutes(data?.supports_ai_generated_routes === true); setSupportsSkillComposer(data?.supports_skill_composer === true); setSupportsNavigationBackend(data?.supports_navigation_backend === true); if (data?.nav2) setNav2(data.nav2); } })
       .catch(() => {});
     return () => controller.abort();
-  }, [navigationMode, reasoning, luna?.deployment, skillComposer, backend]);
+  }, [navigationMode, modelId, reasoning, selectedModel?.deployment, skillComposer, backend, hybrid]);
   useEffect(() => {
     if (!supportsNavigationBackend) return;
     const controller = new AbortController();
@@ -156,23 +189,28 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     return () => { window.clearInterval(timer); controller.abort(); };
   }, [supportsNavigationBackend]);
   const resident = state.local_navigation_model;
-  const startUnavailable = agent.active || !connected || pending || sending || recordingSaving || configurationSaving || state.power?.on === false || state.busy
-    || (!localOnly && (!luna?.configured || connectionChanged))
+  const startUnavailable = agent.active || state.regression?.active || !connected || pending || sending || recordingSaving || configurationSaving || state.power?.on === false || state.busy
+    || (!localOnly && (!selectedModel?.configured || selectedConnectionChanged || (useLocalModel && !localModelReady)))
+    || (hybrid && !luna?.configured)
     || !Number.isInteger(maxRequests) || maxRequests < 1 || maxRequests > 200 || !Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 2000000
     || (unified && (!capabilities.ready || !Number.isFinite(explorationBudget) || explorationBudget < 5 || explorationBudget > 300))
     || (!unified && ((continuous && backend === 'builtin' && aiRoutes && !supportsAiRoutes) || (backend === 'nav2' && !nav2.ready)))
     || !Number.isInteger(turns) || turns < 1 || turns > 80 || !Number.isFinite(interval) || interval < .25 || interval > 30;
   const stopInstruction = ['stop','pause','halt','cancel'].includes(instruction.trim().toLowerCase().replace(/[.!]+$/, ''));
   const instructionUnavailable = !connected ? 'Disconnected' : state.power?.on === false ? 'Robot is off'
-    : pending || sending || recordingSaving || configurationSaving ? 'Sending request' : stopInstruction ? '' : localOnly ? 'Custom instructions require the Luna mission profile'
+    : state.regression?.active && !stopInstruction ? 'Stop the regression baseline before sending an instruction'
+    : pending || sending || recordingSaving || configurationSaving ? 'Sending request' : stopInstruction ? '' : localOnly ? 'Custom instructions require a model supervisor'
     : agent.active ? (!agent.session_id ? 'Waiting for the active session' : '')
-    : state.busy ? 'Robot is busy' : !luna?.configured ? 'Luna connection required'
-    : connectionChanged ? 'Connection changes not applied' : startUnavailable ? 'Check mission settings and controller readiness' : '';
+    : state.busy ? 'Robot is busy' : !selectedModel?.configured ? `${modelName} connection required`
+    : selectedConnectionChanged ? 'Connection changes not applied' : useLocalModel && !localModelReady ? 'Local model not ready'
+    : startUnavailable ? 'Check mission settings and controller readiness' : '';
   function startRequest(target: string) {
     if (unified) return request('mission/start', {run_id:state.run_id, episode_epoch:state.episode_epoch, execution_mode:'luna_continuous',
       unified_mission:true, mission_local_only:localOnly, map_context:mapContext, mission_budget_s:explorationBudget,
       images_per_request:2, context_tokens:8192, navigation_backend:'builtin', compact_arms:compactArms,
-      model_id:'luna', reasoning, goal:localOnly ? 'Explore the observed environment within the mission budget.' : target,
+      model_id:modelId, reasoning, goal:localOnly ? 'Explore the observed environment within the mission budget.' : target,
+      ...(hybrid ? {task_supervisor_model_id:'luna',task_supervisor_reasoning:taskSupervisorReasoning,
+        max_task_supervisor_requests:4,max_task_supervisor_tokens:100000} : {}),
       max_turns:turns, feedback_interval_s:interval, max_model_requests:maxRequests, max_model_tokens:maxTokens});
     return request('agent/start', {run_id:state.run_id, episode_epoch:state.episode_epoch,
       execution_mode:navigationMode, compact_arms:compactArms,
@@ -215,9 +253,12 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
   }
   function connectionValues() {
     const models = agent.configuration.models.map(({configured: _, ...model}) => model.id === 'luna'
-      ? {...model, provider: 'foundry', deployment} : model);
+      ? {...model, provider: 'foundry', deployment} : model.id === 'qwen'
+      ? {...model, provider:'ollama', deployment:localTag, reasoning_efforts:['none'] as Reasoning[], context_window:16384} : model);
     if (!models.some(model => model.id === 'luna')) models.push({id:'luna',label:'Luna',deployment,provider:'foundry',reasoning_efforts:['low','medium','high']});
-    return {endpoint, ollama_endpoint:agent.configuration.ollama_endpoint, models};
+    if (useLocalModel && !models.some(model => model.id === 'qwen')) models.push({id:'qwen',label:'Qwen3-VL 4B (local)',deployment:localTag,
+      provider:'ollama',reasoning_efforts:['none'],context_window:16384});
+    return {endpoint, ollama_endpoint:(useLocalModel || !!qwen) ? localEndpoint : agent.configuration.ollama_endpoint, models};
   }
   const configurationLocked = !connected || agent.active || state.busy || pending || sending || recordingSaving || configurationSaving || !!recording?.active;
   async function saveConfiguration() {
@@ -281,7 +322,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
           <Save size={16}/>{configurationSaving ? 'Saving configuration' : 'Save configuration'}</button>
       </div>
     </dialog>, document.body)}
-    <div className="panel-header console-heading"><h3><Bot size={17} />Luna console</h3>
+    <div className="panel-header console-heading"><h3><Bot size={17} />{modelName} console</h3>
       {recording?.active && <span className="tag" role="status" aria-label="Run recording"><CircleDot size={13}/>{recording.status === 'finalizing' ? 'Saving recording' : 'Recording'}</span>}
       <button type="button" className="icon-button" aria-label={consoleMinimized ? 'Restore Luna console' : 'Minimize Luna console'}
         title={consoleMinimized ? 'Restore Luna console' : 'Minimize Luna console'} aria-expanded={!consoleMinimized} aria-controls="luna-console-body"
@@ -302,16 +343,36 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
           tabIndex={inspector === id ? 0 : -1} onClick={() => selectInspector(id)}><Icon size={15} />{label}</button>)}
     </div>
     {unified && !capabilities.ready && <p role="alert">Mission controller unavailable on this server. Restart with the current backend.</p>}
-    {configurationHost && createPortal(<details className="agent-connection setup-connection" hidden={agent.active} open={connectionOpen}
-      onToggle={event => setConnectionOpen(event.currentTarget.open)}><summary><Settings2 size={15} /> Luna connection</summary>
+    {configurationHost && createPortal(<div className="mission-controller-choice">
+      <label>Mission controller<select aria-label="Mission controller" value={unified ? preferredController : 'luna'} disabled={configurationLocked || !unified}
+        onChange={event=>{setPreferredController(event.target.value as typeof preferredController);setConnectionOpen(true);}}>
+        <option value="luna">Luna + existing policies</option><option value="qwen">Local Qwen + existing policies</option>
+        <option value="hybrid">Qwen + Luna task supervision</option>
+        <option value="policy">Policy-only exploration (backup)</option></select></label>
+    </div>, configurationHost)}
+    {configurationHost && createPortal(<details className={`agent-connection setup-connection${useLocalModel ? ' local-supervisor-connection' : ''}`} hidden={agent.active} open={connectionOpen}
+      onToggle={event => setConnectionOpen(event.currentTarget.open)}><summary><Settings2 size={15} /> {useLocalModel ? 'Local model connection' : 'Luna connection'}</summary>
       <form onSubmit={event => {
         event.preventDefault();
         void perform('agent/config', connectionValues());
       }}><fieldset disabled={!connected || agent.active || pending}>
-        <label>Foundry endpoint<input aria-label="Foundry endpoint" type="url" value={endpoint} onChange={event => setEndpoint(event.target.value)} /></label>
-        <label>Luna deployment<input aria-label="Luna deployment" value={deployment} onChange={event => setDeployment(event.target.value)} /></label>
-        <button type="submit"><Check size={16} /> Apply Luna connection</button>
+        {useLocalModel ? <>
+          <label>Ollama endpoint<input aria-label="Ollama endpoint" type="url" value={localEndpoint} onChange={event=>setLocalEndpoint(event.target.value)}/></label>
+          <label>Local model tag<input aria-label="Local model tag" value={localTag} maxLength={120} onChange={event=>setLocalTag(event.target.value)}/></label>
+        </> : <>
+          <label>Foundry endpoint<input aria-label="Foundry endpoint" type="url" value={endpoint} onChange={event => setEndpoint(event.target.value)} /></label>
+          <label>Luna deployment<input aria-label="Luna deployment" value={deployment} onChange={event => setDeployment(event.target.value)} /></label>
+        </>}
+        <button type="submit"><Check size={16} />{useLocalModel ? 'Apply local connection' : 'Apply Luna connection'}</button>
       </fieldset></form>
+      {useLocalModel && <>
+        <p role="status" aria-label="Local supervisor readiness">{!capabilities.localSupervisor ? 'Backend update required' : localConnectionChanged ? 'Apply local connection first'
+          : localReadiness?.key === localReadinessKey ? localReadiness.message : 'Checking local model'}</p>
+        <button type="button" disabled={configurationLocked || localConnectionChanged || !capabilities.localSupervisor}
+          onClick={()=>setLocalCheckRevision(value=>value+1)}><Check size={16}/>Check local model</button>
+        {hybrid && <p role="status" aria-label="Luna task supervision readiness">{luna?.configured
+          ? 'Luna sets the immutable task plan only; Qwen owns current-observation decisions' : 'Configure Luna before hybrid task supervision'}</p>}
+      </>}
     </details>, configurationHost)}
     {!continuous && agent.local_model && <LocalModelProgress live={agent.local_model} connected={connected} resident={resident} />}
     <form id="mission-form" className="agent-form" onSubmit={event => {
@@ -358,12 +419,17 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     </details>
     {hasRun && <TokenCounter agent={agent} connected={connected} />}
     {agent.inference_budget && <div className="agent-metrics" aria-label="Luna task budget">
-      <span>Luna requests <strong>{agent.inference_budget.requests} / {agent.inference_budget.max_requests}</strong></span>
+      <span>{agent.model_id === 'qwen' ? 'Qwen' : 'Luna'} requests <strong>{agent.inference_budget.requests} / {agent.inference_budget.max_requests}</strong></span>
       <span>Token threshold <strong>{agent.inference_budget.max_tokens.toLocaleString()}</strong></span>
+    </div>}
+    {agent.task_supervision && <div className="agent-metrics" aria-label="Luna task supervision budget">
+      <span>Luna task reviews <strong>{agent.task_supervision.requests} / {agent.task_supervision.max_requests}</strong></span>
+      <span>Tokens <strong>{agent.task_supervision.tokens.toLocaleString()} / {agent.task_supervision.max_tokens.toLocaleString()}</strong></span>
+      <span>Motion authority <strong>None</strong></span>
     </div>}
     {hasRun && <div className="agent-metrics"><span>Supervisor turns <strong>{agent.turns} / {agent.max_turns}</strong></span>
       <span>{continuous ? 'Route updates' : 'Local commands'} <strong>{continuous ? state.continuous_navigation?.updates ?? 0 : agent.local_model?.requests_completed ?? 0}</strong></span>
-      <span>{continuous ? 'Luna inference' : 'Local inference'} <strong>{agent.inference_latency_s?.toFixed(2) ?? '-'} s</strong></span>
+      <span>{continuous ? `${agent.model_id === 'qwen' ? 'Qwen' : 'Luna'} inference` : 'Local inference'} <strong>{agent.inference_latency_s?.toFixed(2) ?? '-'} s</strong></span>
       <span>{agent.local_model?.instruction ?? ''}</span></div>}
     {telemetryContent}
     </div>
@@ -373,7 +439,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
       <div className="chat-transcript" role="log" aria-label="Run conversation" tabIndex={0}>
         {!hasRun && !agent.run_messages?.length && <p className="empty">No messages yet.</p>}
         {(agent.run_messages ?? []).map(message => <article key={message.id} className={`chat-message chat-${message.role}`}>
-          <strong>{message.role === 'user' ? 'You' : message.source === 'model' ? 'Luna' : 'Controller'} / {message.status}</strong>
+          <strong>{message.role === 'user' ? 'You' : message.source === 'model' ? agent.configuration.models.find(model=>model.id===agent.model_id)?.label ?? modelName : 'Controller'} / {message.status}</strong>
           <p>{message.text}</p></article>)}
         {hasRun && agent.goal && !agent.run_messages?.some(message=>message.role==='user' && message.text===agent.goal) &&
           <article className="chat-message chat-user"><strong>You / mission instruction</strong><p>{agent.goal}</p></article>}
@@ -431,7 +497,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
           <option value="nav2" disabled={!nav2.enabled}>Nav2 (primary)</option><option value="builtin">Built-in (backup)</option></select></label>}
         <label>Supervisor reasoning<select aria-label="Supervisor reasoning" value={reasoning} disabled={agent.active || pending}
           onChange={event => setReasoning(event.target.value as Reasoning)}>
-          {(luna?.reasoning_efforts ?? ['low', 'medium', 'high']).map(effort => <option value={effort} key={effort}>{effort}</option>)}</select></label>
+          {(useLocalModel ? ['none'] : luna?.reasoning_efforts ?? ['low', 'medium', 'high']).map(effort => <option value={effort} key={effort}>{effort}</option>)}</select></label>
         <label>Supervisor turn limit<input aria-label="Supervisor turn limit" type="number" min={1} max={80} value={turns}
           disabled={agent.active || pending} onChange={event => setTurns(Number(event.target.value))} /></label>
         <label>Luna request limit<input aria-label="Luna request limit" type="number" min={1} max={200} value={maxRequests}

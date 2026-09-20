@@ -1,3 +1,42 @@
+ .regression-panel { border-block: 1px solid var(--cp-border); padding: 10px 0; margin-bottom: 14px; }
+ .regression-panel > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; flex-wrap: wrap; }
+ .regression-panel > summary > span { color: var(--cp-text-muted); font-size: 12px; }
+ .regression-toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; padding: 12px 0; }
+ .regression-toolbar label { display: grid; gap: 4px; font-size: 12px; min-width: 130px; flex: 0 1 180px; }
+ .regression-toolbar select { min-height: 36px; width: 100%; }
+ .regression-cases { list-style: none; padding: 0; margin: 0; }
+ .regression-cases li { display: grid; grid-template-columns: 48px minmax(0,1fr) minmax(88px,auto); gap: 6px 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--cp-border); }
+ .regression-cases li[aria-current="step"] { background: var(--cp-accent-soft); }
+ .regression-cases img { width: 48px; height: 30px; object-fit: contain; }
+ .regression-case-title { font-size: 13px; overflow-wrap: anywhere; }
+ .regression-case-title small { display: block; color: var(--cp-text-muted); }
+ .regression-case-status { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+ .regression-cases [data-status="passed"] .regression-case-status { color: var(--cp-success); }
+ .regression-cases [data-status="failed"] .regression-case-status, .regression-cases [data-status="invalid"] .regression-case-status { color: var(--cp-danger); }
+ .regression-case-detail { grid-column: 2 / -1; color: var(--cp-text-muted); overflow-wrap: anywhere; }
+.regression-path { grid-column: 1 / -1; min-width: 0; }
+.regression-path > summary { display: flex; align-items: center; gap: 6px; min-height: 30px; color: var(--cp-text-muted); font-size: 12px; }
+.regression-path > summary small { margin-left: auto; font-variant-numeric: tabular-nums; }
+.regression-path svg { display: block; width: 100%; max-width: 520px; aspect-ratio: 360 / 164; background: var(--cp-surface-soft); border: 1px solid var(--cp-border); }
+.regression-path-axis { fill: none; stroke: var(--cp-border); stroke-width: 1; stroke-dasharray: 3 4; }
+.regression-path-line { fill: none; stroke: var(--cp-accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.regression-path-start { fill: var(--cp-surface); stroke: var(--cp-success); stroke-width: 3; }
+.regression-path-end { fill: var(--cp-accent); stroke: var(--cp-surface); stroke-width: 1.5; }
+.regression-path-contact { fill: var(--cp-danger); stroke: var(--cp-surface); stroke-width: 1.5; }
+.regression-path-empty { min-height: 48px; display: grid; place-items: center; color: var(--cp-text-muted); background: var(--cp-surface-soft); }
+.regression-progress { grid-column: 1 / -1; min-width: 0; display: grid; gap: 5px; font-size: 12px; }
+.regression-progress-heading, .regression-progress-values, .regression-path-legend { display: flex; flex-wrap: wrap; gap: 5px 12px; align-items: center; }
+.regression-progress-heading strong { font-variant-numeric: tabular-nums; }
+.regression-progress-heading small { margin-left: auto; }
+.regression-progress progress { width: 100%; height: 7px; accent-color: var(--cp-accent); }
+.regression-progress-values, .regression-progress > small, .regression-path-legend { color: var(--cp-text-muted); }
+.regression-checks { list-style: none; margin: 0; padding: 0; display: flex; gap: 5px 12px; flex-wrap: wrap; }
+.regression-checks li { display: flex; gap: 4px; border: 0; padding: 0; color: var(--cp-text-muted); font-size: 11px; }
+.regression-checks li[data-complete="true"] { color: var(--cp-success); }
+.regression-checks svg { flex-shrink: 0; }
+.regression-path-target { fill: none; stroke: var(--cp-success); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.regression-path-legend { font-size: 11px; margin-top: 4px; }
+ .regression-directory { display: block; font-size: 11px; color: var(--cp-text-muted); overflow-wrap: anywhere; padding-top: 8px; }
 :root {
   color-scheme: light;
   --cp-bg: #f7f4ef;
@@ -815,6 +854,8 @@ footer { padding: 22px 0; font-size: 11px; color: var(--cp-text-soft); border-to
 .configuration-content { flex: 1; min-height: 0; overflow-y: auto; padding: 0 16px 16px; }
 .configuration-content > fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 .configuration-fields { padding-block: 8px 20px; }
+.mission-controller-choice { width: 100%; margin-bottom: 16px; }
+.robot-configuration .local-supervisor-connection fieldset { grid-template-columns: minmax(0, 1fr); }
 .robot-configuration .configuration-fields label { font-size: 13px; }
 .robot-configuration #panel-settings .agent-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .robot-configuration .token-budget-control { grid-template-columns: minmax(0, 1fr); }

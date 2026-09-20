@@ -540,7 +540,8 @@ async def rotate(controller, worker, settings, stop_revision, angle, panoramic=F
             {"kind": "drive", "linear_mps": 0., "angular_radps": max(-.5, min(.5, 2 * remaining)), "duration_s": 1.}]}))
         await asyncio.sleep(.1)
     await worker.call(lambda sim: worker.navigation.cancel(sim, "Viewpoint rotation finished"))
-    final = await settle(worker, settings)
+    await wait_stationary(controller, worker, settings, .5)
+    final, _ = await worker.feedback()
     if panoramic:
         final, image = await worker.feedback()
         frames.append((final, image))
@@ -687,7 +688,7 @@ async def circle_observed_object(controller, worker, settings, sensor, guide, st
             return {"status": "blocked", "reason": f"{error.code}: {error}", "object": guide.object_label}
         controller._trace("policy", "Observed furniture circuit", progress)
         if progress["complete"]:
-            await wait_stationary(controller, worker, settings, .5)
+            await wait_stationary(controller, worker, settings, 1.25)
             return {"status": "arrived", **progress, "completion_source": "measured_orbit_not_semantic_proof"}
         while worker.continuous.active:
             controller._check_live(worker, settings)

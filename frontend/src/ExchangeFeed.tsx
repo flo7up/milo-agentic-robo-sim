@@ -27,9 +27,9 @@ function Payload({ title, value }: { title: string; value: unknown }) {
 }
 
 function entryPreview(entry: ExchangeEntry): string {
-  if (entry.kind === 'feedback') return `Frame ${entry.payload.observation.seq} / ${entry.payload.images_in_request} image(s) / ${entry.payload.observation.simulated_time_s.toFixed(2)} s simulated`;
-  if (entry.kind === 'response') return [entry.payload.status, `${entry.payload.latency_s.toFixed(2)} s`,
-    entry.payload.refusals.join(' ') || entry.payload.text || entry.payload.calls.map(call => {
+  if (entry.kind === 'feedback') return `Frame ${entry.payload.observation.seq} / ${entry.payload.images_in_request} image(s) / ${typeof entry.payload.observation.simulated_time_s === 'number' ? entry.payload.observation.simulated_time_s.toFixed(2) : '-'} s simulated`;
+  if (entry.kind === 'response') return [entry.payload.status, typeof entry.payload.latency_s === 'number' ? `${entry.payload.latency_s.toFixed(2)} s` : null,
+    (entry.payload.refusals ?? []).join(' ') || entry.payload.text || (entry.payload.calls ?? []).map(call => {
       const decision = reportedDecision(call.arguments);
       return decision ? `${decision.action?.replaceAll('_', ' ') ?? call.name}: ${decision.reason}` : call.name;
     }).join('; ')].filter(Boolean).join(' / ');

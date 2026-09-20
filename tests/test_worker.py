@@ -13,6 +13,40 @@ from backend.simulation import MotionError
 from backend.worker import CameraActivity, SimulationWorker
 
 
+@pytest.mark.parametrize("fault", [None, "expired", "future", "run", "epoch", "sequence", "missing", "moved", "turned", "head", "disabled", "sensor_error"])
+def test_preparation_reuse_requires_fresh_matching_stationary_sensor(monkeypatch, fault):
+    from types import SimpleNamespace
+    import numpy as np
+    sensor = SimpleNamespace(run_id="run", episode_epoch=1, sequence=4, captured_at=9.9,
+        odometry_m_rad=[0., 0., 0.], head_rad=[0., .45])
+    sim = SimpleNamespace(run_id="run", epoch=1, odometry=np.zeros(3), robot=1, client=0,
+        joints={"head_yaw": 0, "head_pitch": 1})
+    worker = SimulationWorker.__new__(SimulationWorker)
+    worker.spatial_enabled, worker.spatial_error = True, None
+    worker.spatial_map = SimpleNamespace(sequence=4, max_frame_age_s=1.)
+    worker.spatial_frames = {4: (sensor, b"paired", b"depth")}
+    if fault in {"expired", "future"}:
+        sensor.captured_at = 8.999 if fault == "expired" else 10.001
+    elif fault == "run":
+        sensor.run_id = "other"
+    elif fault == "epoch":
+        sensor.episode_epoch = 2
+    elif fault == "sequence":
+        worker.spatial_map.sequence = 5
+    elif fault == "missing":
+        worker.spatial_frames = {}
+    elif fault in {"moved", "turned"}:
+        sim.odometry[0 if fault == "moved" else 2] = .011
+    elif fault == "disabled":
+        worker.spatial_enabled = False
+    elif fault == "sensor_error":
+        worker.spatial_error = "Missing depth"
+    monkeypatch.setattr("backend.worker.time", SimpleNamespace(monotonic=lambda: 10.))
+    monkeypatch.setattr(bullet, "getJointState", lambda robot, joint, **kwargs: ([.03 if fault == "head" else 0., .45][joint],))
+    assert worker._can_reuse_stationary_spatial(sim, sensor) is (fault is None)
+    assert not worker._can_reuse_stationary_spatial(sim, None)
+
+
 def test_worker_timing_separates_nested_wall_time_and_preserves_exception():
     from backend.worker_timing import WorkerTiming
     now = [0.]

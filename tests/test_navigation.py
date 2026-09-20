@@ -1454,8 +1454,9 @@ async def test_continuous_crossing_pause_returns_to_supervisor_for_stationary_yi
         await worker.close()
 
 
-async def test_continuous_floor_target_generates_bounded_camera_derived_approaches():
+async def test_continuous_floor_target_generates_bounded_camera_derived_approaches(monkeypatch):
     import numpy as np
+    import scipy.sparse.csgraph
     from backend.challenges import get_challenge
     from backend.continuous_navigation import ContinuousScan
     from backend.spatial import FloorRegionTracker
@@ -1467,7 +1468,32 @@ async def test_continuous_floor_target_generates_bounded_camera_derived_approach
         tracker = FloorRegionTracker(worker.sim.run_id, worker.epoch)
         regions = tracker.update(sensor, image)
         target = next(region for region in regions if region["color"] == "green")
-        _, _, candidates, observation = await worker.continuous_candidates(floor_target=target)
+        searches = []
+        original = scipy.sparse.csgraph.dijkstra
+        def counted(*args, **kwargs):
+            searches.append(1)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(scipy.sparse.csgraph, "dijkstra", counted)
+        paired, paired_image, candidates, observation = await worker.continuous_candidates(floor_target=target)
+        assert len(searches) == 1
+        assert observation.odometry_m_rad == paired.odometry_m_rad
+        assert observation.head_rad == paired.head_rad
+        assert observation.simulated_time_s == paired.simulated_time_s
+        assert paired_image == worker.spatial_frames[paired.sequence][1]
+        captures = []
+        original_sample = worker._sample_spatial
+        def sample(*args, **kwargs):
+            if kwargs.get("force"):
+                captures.append(1)
+            return original_sample(*args, **kwargs)
+        monkeypatch.setattr(worker, "_sample_spatial", sample)
+        reused, reused_image, repeated_candidates, repeated = await worker.continuous_candidates(
+            floor_target=target, prepared_sensor=paired)
+        assert not captures and reused is paired and reused_image == paired_image
+        assert repeated_candidates == candidates and repeated.odometry_m_rad == observation.odometry_m_rad
+        assert not (await worker.parking_clearance(target, prepared_sensor=reused,
+            stationary_request=ContinuousScan(run_id=worker.sim.run_id, episode_epoch=worker.epoch)))["inside_floor_region"]
+        assert not captures
         forward = [candidate for candidate in candidates if candidate.get("floor_target_id") == target["id"]]
         assert forward and all(candidate["path_length_m"] <= 1.8 for candidate in forward)
         assert min(candidate["goal_distance_m"] for candidate in forward) < .1
@@ -3601,6 +3627,40 @@ def continuous_policy():
         path_valid=Mock(return_value=True))
 
 
+def test_observed_route_search_reuses_graph_and_preserves_single_goal_routes(monkeypatch):
+    import numpy as np
+    import scipy.sparse.csgraph
+    from backend.spatial import ObservedMap
+    observed = ObservedMap("planning", 0)
+    observed.cells[60:105, 65:115] = 0
+    observed.cells[78:83, 91:94] = 100
+    start, radius = [0., 0.], .12
+    goals = [[.4, .2], [.6, -.4], [1.3, .1]]
+    expected = [observed.plan(start, goal, radius) for goal in goals]
+    calls = []
+    original = scipy.sparse.csgraph.dijkstra
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(scipy.sparse.csgraph, "dijkstra", counted)
+    search = observed.route_search(start, radius)
+    assert calls == []
+    for goal, path in zip(goals, expected):
+        assert search.plan(goal) == path
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match="clearance"):
+        search.plan([3., 3.])
+    with pytest.raises(ValueError, match="clearance"):
+        search.plan([.58, 0.])
+    observed.cells[:] = 100
+    observed.origin += 1
+    assert search.plan(goals[0]) == expected[0]
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match="clearance"):
+        observed.plan(start, goals[0], radius)
+    assert all(np.isfinite(path).all() for path in expected)
+
+
 @pytest.mark.parametrize("direction,status,distance,expected", [
     ("front", "clear", None, .5), ("front", "occluded", None, .5),
     ("front", "hit", 1., .5), ("front", "hit", .999, .2),
@@ -3654,6 +3714,20 @@ def test_continuous_policy_slows_for_arrival_without_stopping_early(continuous_p
     assert segment.linear_mps == pytest.approx(min(.5, .7 * distance))
     assert policy.controller.active
     policy.runtime.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("heading,expected_speed", [(0., .15), (.079, .15), (.081, 0.), (-.081, 0.)])
+def test_continuous_parking_precision_requires_alignment_and_still_checks_clearance(continuous_policy, heading, expected_speed):
+    import math
+    policy = continuous_policy
+    policy.controller.precision_following = True
+    policy.sim.odometry[2] = heading
+    policy.controller.update(policy.sim, policy.runtime, policy.observed, policy.path_valid)
+    expected = expected_speed * math.cos(heading)
+    assert policy.runtime.apply.call_args.args[2].segments[0].linear_mps == pytest.approx(expected)
+    assert policy.path_valid.call_args.args[1] == pytest.approx(expected)
+    assert policy.controller.state()["precision_following"]
+    assert policy.controller.state()["speed_limit_mps"] == .15
 
 
 @pytest.mark.parametrize("allowed,expected", [([True], .5), ([False, True], .25), ([False, False, True], 0.), ([False, False, False], None)])

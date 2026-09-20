@@ -237,10 +237,18 @@ class ObservedOrbit:
         self.sign = -1 if direction == "clockwise" else 1
         self.angle = None
         self.swept = 0.
+        self.start_position = None
         self.travel_m = 0.
         self.started = time.monotonic()
 
     def path(self, pose):
+        if self.swept >= 2 * math.pi:
+            displacement = self.start_position - pose[:2]
+            distance = float(np.linalg.norm(displacement))
+            if distance <= .02:
+                return [], True
+            target = np.asarray(pose[:2]) + displacement * min(1., 1.4 / distance)
+            return [list(pose[:2]), target.tolist()], False
         delta = np.asarray(pose[:2]) - self.center
         distance = float(np.linalg.norm(delta))
         angle = math.atan2(delta[1], delta[0])
@@ -253,9 +261,11 @@ class ObservedOrbit:
         if self.angle is not None:
             difference = math.atan2(math.sin(angle - self.angle), math.cos(angle - self.angle))
             self.swept = max(0., self.swept + self.sign * difference)
+        else:
+            self.start_position = np.asarray(pose[:2], dtype=float).copy()
         self.angle = angle
         if self.swept >= 2 * math.pi:
-            return [], True
+            return self.path(pose)
         step = min(.65, 2 * math.pi + .08 - self.swept)
         angles = angle + self.sign * np.linspace(step / 12, step, 12)
         points = self.center + self.radius * np.column_stack((np.cos(angles), np.sin(angles)))
@@ -341,6 +351,7 @@ class ContinuousNavigation:
         self.replans = 0
         self.refill_after_replan = False
         self.circuit_following = False
+        self.precision_following = False
         self.skill_components = []
         self.skill_timing = None
         self.exploration = None
@@ -377,7 +388,8 @@ class ContinuousNavigation:
             "exploration_reviews": self.exploration.revision if self.exploration else 0,
             "exploration_review_remaining_s": max(0., self.exploration.expires_at - self.clock()) if self.exploration else None,
             "elapsed_s": round(self.clock() - self.started, 3), "controller": "continuous_local",
-            "speed_limit_mps": CONTINUOUS_SPEED_MPS,
+            "speed_limit_mps": .15 if self.precision_following else CONTINUOUS_SPEED_MPS,
+            "precision_following": self.precision_following,
             "minimum_cruise_speed_mps": self.minimum_cruise_speed,
             "maximum_update_gap_s": self.maximum_update_gap_s}
 
@@ -440,6 +452,8 @@ class ContinuousNavigation:
             outgoing = self.path[self.index + 1] - self.path[self.index]
             cosine = float(np.dot(incoming, outgoing) / max(1e-9, np.linalg.norm(incoming) * np.linalg.norm(outgoing)))
             threshold = .35 if self.ai_route or self.circuit_following or (self.exploration is not None and self.handoffs) else .2 if cosine > .96 else .05
+            if self.precision_following:
+                threshold = .02
             if np.linalg.norm(self.path[self.index] - pose[:2]) >= threshold:
                 break
             self.index += 1
@@ -450,7 +464,9 @@ class ContinuousNavigation:
         bearing = math.atan2(math.sin(bearing), math.cos(bearing))
         angular = float(np.clip(2 * bearing, -CONTINUOUS_ANGULAR_SPEED_RADPS, CONTINUOUS_ANGULAR_SPEED_RADPS))
         approach = self.distance_m if self.ai_route or self.circuit_following or (self.exploration is not None and self.handoffs) or (self.index < len(self.path) - 1 and cosine > .96) else float(np.linalg.norm(delta))
-        linear = min(CONTINUOUS_SPEED_MPS, CONTINUOUS_APPROACH_GAIN * approach) * max(0., math.cos(bearing)) if abs(bearing) < .7 else 0.
+        speed_limit = .15 if self.precision_following else CONTINUOUS_SPEED_MPS
+        alignment_limit = .08 if self.precision_following else .7
+        linear = min(speed_limit, CONTINUOUS_APPROACH_GAIN * approach) * max(0., math.cos(bearing)) if abs(bearing) < alignment_limit else 0.
         if self.skill_components and self.index < len(self.path) - 2:
             ahead = self.path[max(0, self.index - 1):min(len(self.path), self.index + 20)]
             lengths = np.linalg.norm(np.diff(ahead, axis=0), axis=1)

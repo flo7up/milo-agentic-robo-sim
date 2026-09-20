@@ -237,6 +237,16 @@ def test_floor_regions_use_paired_depth_keep_targets_and_reject_partial_completi
         from io import BytesIO
         from PIL import Image, ImageDraw
         altered = Image.open(BytesIO(image)).convert("RGB")
+        pale_hsv = np.asarray(altered.convert("HSV")).copy()
+        pale_hsv[..., 1] = np.minimum(pale_hsv[..., 1], 43)
+        pale = BytesIO()
+        Image.fromarray(pale_hsv, mode="HSV").convert("RGB").save(pale, format="PNG")
+        pale_regions = FloorRegionTracker(sim.run_id, sim.epoch).update(sensor, pale.getvalue(), now=sensor.captured_at)
+        assert len(pale_regions) == 1 and pale_regions[0]["complete_view"]
+        assert pale_regions[0]["center_m"] == pytest.approx(region["center_m"])
+        neutral = BytesIO()
+        altered.convert("L").convert("RGB").save(neutral, format="PNG")
+        assert FloorRegionTracker(sim.run_id, sim.epoch).update(sensor, neutral.getvalue(), now=sensor.captured_at) == []
         polygon = np.asarray(region["image_polygon"])
         midpoint = (polygon.min(axis=0) + polygon.max(axis=0)) / 2
         ImageDraw.Draw(altered).rectangle((int(midpoint[0] * altered.width), int(polygon[:, 1].min() * altered.height),

@@ -9,6 +9,126 @@ from backend.mission import Mission, MissionDecision, MissionPlan
 from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
 
 
+@pytest.mark.parametrize("direction", ["clockwise", "counterclockwise"])
+def test_grounded_circuit_plans_before_exposing_only_compatible_actions(direction):
+    from types import SimpleNamespace
+    from backend.mission_supervisor import accept_initial_action, available_actions, local_response_schema, tools
+    mission = Mission("run", 0, 0, 0, deadline=60., clock=lambda: 0.)
+    observation = SimpleNamespace(spatial={})
+    plan = MissionPlan(kind="circuit", target="the table", circle_direction=direction)
+    initial = available_actions(mission, observation, None, plan_first=True)
+    assert initial == ["plan"]
+    assert tools(initial)[0]["parameters"]["properties"]["action"]["enum"] == ["plan"]
+    assert local_response_schema(initial)["anyOf"][0]["properties"]["action"]["const"] == "plan"
+    for action in ("identify_target", "select_object"):
+        decision = MissionDecision(action=action, plan=plan, object_label="table" if action == "select_object" else "",
+            object_bounds=[.37, 0., .675, .36], evidence_text="Visible table" if action == "identify_target" else "")
+        with pytest.raises(ValueError, match="choose from: plan"):
+            accept_initial_action(mission, decision, observation, allowed_actions=initial)
+        assert mission.plan is None and mission.operation is None
+    accept_initial_action(mission, MissionDecision(action="plan", plan=plan), observation, allowed_actions=initial)
+    mission.configure(plan)
+    actions = available_actions(mission, observation, None, plan_first=True)
+    assert "circle" in actions and not {"plan", "select_object", "identify_target"}.intersection(actions)
+    circle = MissionDecision(action="circle", object_label="table", object_bounds=[.37, 0., .675, .36], circle_direction=direction)
+    accept_initial_action(mission, circle, observation, allowed_actions=actions)
+    for action in ("identify_target", "select_object"):
+        decision = MissionDecision(action=action, object_label="table" if action == "select_object" else "",
+            object_bounds=[.37, 0., .675, .36], evidence_text="Visible table" if action == "identify_target" else "")
+        with pytest.raises(ValueError, match="Action unavailable"):
+            accept_initial_action(mission, decision, observation, allowed_actions=actions)
+    assert mission.plan == plan and mission.operation is None and not mission.receipts
+
+
+@pytest.mark.parametrize("action", ["circle", "select_object", "verify_object", "identify_target"])
+def test_mission_tools_advertise_normalized_image_coordinates(action):
+    from backend.mission_supervisor import tools
+    schema = tools([action])[0]["parameters"]["properties"]["object_bounds"]
+    if "anyOf" in schema:
+        schema = schema["anyOf"][0]
+    assert schema == {"type": "array", "minItems": 4, "maxItems": 4,
+        "items": {"type": "number", "minimum": 0, "maximum": 1}}
+    with pytest.raises(ValueError, match="normalized image box"):
+        MissionDecision(action="identify_target", object_bounds=[60, 0, 106, 47], evidence_text="Visible table")
+
+
+@pytest.mark.parametrize("direction", ["clockwise", "counterclockwise"])
+async def test_grounded_circuit_replay_recovers_into_correct_capability(tmp_path, monkeypatch, direction):
+    from backend.challenges import get_challenge
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    plan = {"kind": "circuit", "target": "the table", "circle_direction": direction, "completion": "arrive"}
+    replies = [
+        {"action": "identify_target", "plan": plan, "object_bounds": [60, 0, 106, 47], "evidence_text": "Visible table"},
+        {"action": "identify_target", "plan": plan, "object_bounds": [.37, 0., .675, .36], "evidence_text": "Visible table"},
+        {"action": "plan", "plan": plan},
+        {"action": "select_object", "object_label": "table", "object_bounds": [.37, 0., .675, .36]},
+        {"action": "circle", "object_label": "table", "object_bounds": [.37, 0., .675, .36], "circle_direction": direction}]
+    model = ScriptedModel([model_response("guide_mission", json.dumps(reply), call_id=f"replay-{index}")
+        for index, reply in enumerate(replies)])
+    model.requires_grounded_plan = True
+    worker = SimulationWorker(challenge=get_challenge("furniture_circuit"), rendering="tiny", pace=True)
+    controller = controller_for(model)
+    dispatched = []
+    async def capture_circle(controller, worker, settings, sensor, decision, stop_revision):
+        assert controller.mission.plan.circle_direction == decision.circle_direction == direction
+        assert math.hypot(*worker.sim.odometry[:2]) < .005
+        assert worker.home_mission.task is None and sensor.run_id == worker.sim.run_id
+        assert worker.stop_revision == stop_revision and not controller.mission.receipts
+        dispatched.append(decision.action)
+        return {"status": "blocked", "reason": "Scripted dispatch check: no physical circuit executed"}
+    monkeypatch.setattr("backend.mission_supervisor.circle_observed_object", capture_circle)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "circuit-replay.sqlite3"))
+        controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
+            map_context=False, mission_budget_s=60., max_turns=5, max_model_requests=5).model_copy(
+                update={"goal": f"Identify the table, then circle the table {direction}."}))
+        deadline = controller.mission.deadline
+        await asyncio.wait_for(controller.task, 70.)
+        payloads = [json.loads(inputs[-1]["content"][0]["text"]) for inputs in model.inputs]
+        assert len(payloads) == 5 and dispatched == ["circle"]
+        assert all(payload["available_actions"] == ["plan"] for payload in payloads[:3])
+        assert all("circle" in payload["available_actions"] and not {"plan", "identify_target", "select_object"}.intersection(
+            payload["available_actions"]) for payload in payloads[3:])
+        assert "normalized image box" in payloads[1]["last_execution"]["reason"]
+        assert "choose from: plan" in payloads[2]["last_execution"]["reason"]
+        assert "Action unavailable" in payloads[4]["last_execution"]["reason"]
+        assert controller.mission.plan == MissionPlan(**plan) and controller.mission.deadline == deadline
+        assert not controller.mission.receipts and not controller.active and worker.latest["stopped"]
+        assert not worker.sim.proximity_sensors().collisions and math.hypot(*worker.sim.odometry[:2]) < .005
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
+def test_perception_timing_separates_sensor_age_inference_and_net_motion():
+    from types import SimpleNamespace
+    from backend.mission_supervisor import perception_timing
+    sensor = SimpleNamespace(sequence=7, captured_at=100., odometry_m_rad=[1., 2., math.pi-.1],
+        head_rad=[.2, .3], simulated_time_s=10.)
+    observation = SimpleNamespace(seq=8, frame_ref="current.png")
+    current = SimpleNamespace(odometry_m_rad=[1.3, 2.4, -math.pi+.1], head_rad=[.4, .3], simulated_time_s=11.)
+    timing = perception_timing(sensor, observation, current, requested_at=100.4, responded_at=102.9, measured_at=103.2)
+    assert timing["capture_to_request_s"] == pytest.approx(.4)
+    assert timing["inference_s"] == pytest.approx(2.5)
+    assert timing["observation_age_at_response_s"] == pytest.approx(2.9)
+    assert timing["observation_age_at_measurement_s"] == pytest.approx(3.2)
+    assert timing["response_to_measurement_s"] == pytest.approx(.3)
+    assert timing["net_translation_since_capture_m"] == pytest.approx(.5)
+    assert timing["heading_change_since_capture_rad"] == pytest.approx(.2)
+    assert timing["simulated_elapsed_since_capture_s"] == 1.
+    assert timing["source_spatial_sequence"] == 7 and timing["source_observation_seq"] == 8
+    assert timing["source_frame_ref"] == "current.png" and timing["frame"] == "wheel_odometry"
+    assert timing["clock"] == "monotonic" and not timing["motion_authorized"]
+    current.odometry_m_rad = list(sensor.odometry_m_rad)
+    current.head_rad = list(sensor.head_rad)
+    stopped = perception_timing(sensor, observation, current, requested_at=100.4, responded_at=102.9, measured_at=103.2)
+    assert stopped["net_translation_since_capture_m"] == stopped["heading_change_since_capture_rad"] == 0.
+    assert stopped["inference_s"] == pytest.approx(2.5)
+
+
 @pytest.mark.parametrize("field,value", [("objective_duration_s", 0), ("objective_duration_s", 61),
     ("objective_duration_s", float("nan")), ("objective_travel_m", 0),
     ("objective_travel_m", 6.1), ("objective_travel_m", float("inf"))])
@@ -181,6 +301,111 @@ async def test_room_report_is_persisted_as_tentative_paired_evidence(tmp_path, f
         await worker.close()
 
 
+@pytest.mark.parametrize("fault", [None, "stale", "stop", "stop_during_head", "takeover", "reset", "deadline"])
+async def test_mapped_drive_preparation_centers_head_with_fresh_stopped_evidence(tmp_path, monkeypatch, fault):
+    from uuid import uuid4
+    from backend.challenges import get_challenge
+    from backend.contracts import Command
+    from backend.continuous_navigation import ContinuousScan
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    worker = SimulationWorker(challenge=get_challenge("park"), rendering="tiny", pace=False)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "driving-view.sqlite3"))
+        worker.inference_owner = "test-supervisor"
+        await worker.scan_continuous(ContinuousScan(run_id=worker.sim.run_id, episode_epoch=0, compact_arms=True))
+        mission = Mission(worker.sim.run_id, 0, worker.stop_revision, worker.task_revision, time.monotonic()+60.)
+        mission.configure(MissionPlan(kind="object", target="yellow cube"))
+        await worker.prepare_mission(mission.identity, *mission.authority[2:])
+        sensor, _, observation = await worker.mission_feedback(mission)
+        result = await worker.execute(Command(run_id=worker.sim.run_id, episode_epoch=0,
+            observation_seq=observation.seq, action_id=str(uuid4()), tool="set_head",
+            arguments={"yaw_rad": -.8, "pitch_rad": .6, "duration_s": 1.}), assisted=False)
+        assert result.status == "ok"
+        before = worker.sim.odometry.copy()
+        deadline = mission.deadline
+        original_sample = worker._sample_spatial
+        def interrupt_capture(force=False):
+            if fault != "stale":
+                original_sample(force=force)
+            if force:
+                if fault == "stop":
+                    worker.stop()
+                elif fault == "takeover":
+                    worker.task_revision += 1
+                elif fault == "reset":
+                    worker.sim.epoch += 1
+                elif fault == "deadline":
+                    mission.deadline = time.monotonic()-1.
+        if fault:
+            monkeypatch.setattr(worker, "_sample_spatial", interrupt_capture)
+            if fault == "stop_during_head":
+                original_ticks = worker.sim._ticks
+                def stop_during_ticks(count, *args, **kwargs):
+                    original_ticks(count, *args, **kwargs)
+                    worker.stop()
+                monkeypatch.setattr(worker.sim, "_ticks", stop_during_ticks)
+            with pytest.raises((ValueError, TimeoutError)):
+                await worker.prepare_mapped_drive(mission)
+            assert not worker.home_mission.active and mission.operation is None and not mission.receipts
+            assert math.dist(before[:2], worker.sim.odometry[:2]) < .005
+            return
+        prepared = await worker.prepare_mapped_drive(mission)
+        fresh, image, current = await worker.mission_feedback(mission)
+        assert prepared["changed"] and prepared["motion_authorized"] is False
+        assert prepared["head_before_rad"] == pytest.approx([-.8, .6], abs=.03)
+        assert prepared["head_after_rad"] == pytest.approx([0., .2], abs=.03)
+        assert fresh.sequence >= prepared["spatial_sequence"] > sensor.sequence
+        assert fresh.captured_at >= prepared["settled_at_s"] and image
+        assert current.head_rad == pytest.approx([0., .2], abs=.03)
+        assert math.dist(before[:2], worker.sim.odometry[:2]) < .005
+        assert mission.deadline == deadline and mission.operation is None and not mission.receipts
+        assert not worker.home_mission.active and not worker.sim.proximity_sensors().collisions
+    finally:
+        worker.stop()
+        await worker.close()
+
+
+async def test_mapped_route_start_prepares_view_after_inspection(tmp_path, monkeypatch):
+    from backend.challenges import get_challenge
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    replies = [{"action": "plan", "plan": {"kind": "explore"}},
+        {"action": "look", "yaw_rad": -.8, "pitch_rad": .6},
+        {"action": "explore", "objective_duration_s": 10., "objective_travel_m": .5}]
+    model = ScriptedModel([model_response("guide_mission", json.dumps(reply), call_id=f"view-{index}")
+        for index, reply in enumerate(replies)])
+    model.requires_grounded_plan = True
+    worker = SimulationWorker(challenge=get_challenge("park"), rendering="tiny", pace=False)
+    controller = controller_for(model)
+    starts = []
+    original_objective = worker.mission_objective
+    async def checked_objective(mission, identity, **kwargs):
+        if kwargs.get("decision") is not None and not kwargs.get("renew"):
+            sensor = next(reversed(worker.spatial_frames.values()))[0]
+            assert sensor.head_rad == pytest.approx([0., .2], abs=.03)
+            starts.append(sensor.sequence)
+        return await original_objective(mission, identity, **kwargs)
+    monkeypatch.setattr(worker, "mission_objective", checked_objective)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "view-start.sqlite3"))
+        controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
+            map_context=False, mission_budget_s=60., max_turns=3, max_model_requests=3))
+        await asyncio.wait_for(controller.task, 70.)
+        payload = json.loads(model.inputs[2][-1]["content"][0]["text"])
+        assert payload["observation"]["head_rad"] == pytest.approx([-.8, .6], abs=.03)
+        assert starts and starts[0] > payload["sensing"]["source_sequence"]
+        assert not controller.active and worker.latest["stopped"]
+        assert not worker.sim.proximity_sensors().collisions
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
 async def test_find_during_motion_stops_then_identifies_from_fresh_view(tmp_path, monkeypatch):
     from backend.challenges import get_challenge
     from backend.home_mapping import MapStore
@@ -231,6 +456,15 @@ async def test_find_during_motion_stops_then_identifies_from_fresh_view(tmp_path
         assert receipt["evidence_text"] == replies[3]["evidence_text"] and not receipt["arrival_verified"]
         deferred = [event for event in controller.trace()["events"] if event["title"] == "Moving mission decision deferred"]
         assert len(deferred) == 1 and deferred[0]["payload"]["discarded_action"] == "identify_target"
+        timing = [event["payload"] for event in controller.trace()["events"] if event["title"] == "Mission perception timing"]
+        assert len(timing) == 4 and timing[2]["active_route_at_capture"] and not timing[3]["active_route_at_capture"]
+        assert timing[2]["source_spatial_sequence"] == moving["sensing"]["source_sequence"]
+        assert timing[3]["source_spatial_sequence"] == stopped["sensing"]["source_sequence"]
+        assert all(item["observation_age_at_measurement_s"] >= item["observation_age_at_response_s"] >= item["inference_s"] >= 0.
+            and item["net_translation_since_capture_m"] >= 0. and not item["motion_authorized"] for item in timing)
+        confirmation = deferred[0]["payload"]["perception_timing"]
+        assert confirmation["stage"] == "stopped_reobservation" and not confirmation["motion_authorized"]
+        assert confirmation["observation_age_at_measurement_s"] >= timing[2]["observation_age_at_measurement_s"]
         assert not contacts and worker.latest["stopped"] and not controller.active
         frozen = await worker.call(lambda sim: (sim.ticks, sim.odometry.tolist()))
         await asyncio.sleep(.2)
@@ -735,6 +969,31 @@ def test_review_latency_history_is_bounded_and_has_startup_reserve():
     assert mapped.review_timing(0.)["review_reserve_s"] == 10.
 
 
+def test_local_supervisor_uses_frequent_bounded_review_checkpoints():
+    from types import SimpleNamespace
+    from backend.mission_supervisor import MappedReviewOperation
+    objective = SimpleNamespace(travel_m=0., expires_at=100.)
+    controller = SimpleNamespace(state={"feedback_interval_s": .25}, mission=SimpleNamespace(objective=objective))
+    local = MappedReviewOperation(controller, None, None, SimpleNamespace(provider="ollama"))
+    cloud = MappedReviewOperation(controller, None, None, SimpleNamespace(provider="foundry"))
+    assert local.review_timing(2.999)["trigger"] is None
+    timing = local.review_timing(3.)
+    assert timing["trigger"] == "periodic" and timing["review_interval_s"] == 3.
+    local.input_durations.append(.4)
+    local.response_durations.append(3.2)
+    assert local.review_timing(3.)["trigger"] is None
+    assert local.review_timing(4.75)["trigger"] == "periodic"
+    assert local.review_timing(4.75)["review_interval_s"] == 4.75
+    objective.travel_m = .75
+    timing = local.review_timing(1.)
+    assert timing["trigger"] == "travel" and timing["review_travel_m"] == .75
+    objective.travel_m = 1.99
+    assert cloud.review_timing(14.999)["trigger"] is None
+    objective.travel_m = 2.
+    timing = cloud.review_timing(1.)
+    assert timing["trigger"] == "travel" and timing["review_interval_s"] == 15. and timing["review_travel_m"] == 2.
+
+
 async def test_review_wait_observes_feedback_interval_changes(monkeypatch):
     from types import SimpleNamespace
     import backend.mission_supervisor as supervisor
@@ -827,8 +1086,13 @@ async def test_cancelled_supervisor_start_drains_bound_local_operation(objective
     async def home_state(**kwargs):
         return worker.home_mission.state()
 
+    async def prepare_view(selected_mission):
+        assert selected_mission is mission and not worker.home_mission.active
+        return {"changed": False, "motion_authorized": False}
+
     monkeypatch.setattr(worker, "mission_objective", interrupted)
     monkeypatch.setattr(worker, "home_state", home_state)
+    monkeypatch.setattr(worker, "prepare_mapped_drive", prepare_view)
     pending = asyncio.create_task(mapped.start(MissionDecision(action="explore")))
     try:
         await asyncio.wait_for(entered.wait(), .5)
@@ -838,7 +1102,8 @@ async def test_cancelled_supervisor_start_drains_bound_local_operation(objective
             await asyncio.wait_for(pending, .5)
         assert mapped.identity is None and mission.operation is None
         assert not worker.home_mission.active and worker._mission_objective_binding is None
-        assert mission.objective.status == "ended" and len(events) == 1
+        assert mission.objective.status == "ended" and len(events) == 2
+        assert events[0][1] == "Driving view prepared"
     finally:
         pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)

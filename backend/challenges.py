@@ -7,7 +7,7 @@ from backend.contracts import BatterySensor, StrictModel
 from backend.movement import MovementStep
 
 
-ChallengeId = Literal["bench", "park", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery",
+ChallengeId = Literal["bench", "park", "park_left", "park_right", "park_far", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery",
                       "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "movement_practice"]
 Vector3 = Annotated[list[float], Field(min_length=3, max_length=3)]
 
@@ -68,7 +68,7 @@ class Challenge(StrictModel):
     search_target: str | None = None
     ordered_objectives: bool = False
     orbit: OrbitTask | None = None
-    movement_program: list[MovementStep] = Field(default_factory=list, exclude_if=lambda steps: not steps)
+    movement_program: list[MovementStep] = Field(default_factory=list)
     floor_size_m: Annotated[list[Annotated[float, Field(ge=4, le=20)]], Field(min_length=2, max_length=2)] = Field(default_factory=lambda: [6, 6])
 
     def public(self):
@@ -595,6 +595,15 @@ PRESETS["pedestrian_crossing"] = Challenge(
                           color=[.15, .65, .31, 1], require_lift=False, visible_zone=False),
                 Objective(label="Park beyond the crossing", body="robot", center=[4.5, 0, 0],
                                   size=[.90, 1.05], color=[.15, .65, .31, 1], require_lift=False)])
+
+
+for identifier, title, initial_xy in (
+    ("park_left", "Park in the Bay - Left Offset", [0., .30]),
+    ("park_right", "Park in the Bay - Right Offset", [0., -.30]),
+    ("park_far", "Park in the Bay - Longer Approach", [-.65, 0.]),
+):
+    PRESETS[identifier] = Challenge.model_validate({**PRESETS["park"].model_dump(),
+        "id": identifier, "title": title, "initial_xy": initial_xy})
 
 
 def shared_apartment(identifier, direction="clockwise"):

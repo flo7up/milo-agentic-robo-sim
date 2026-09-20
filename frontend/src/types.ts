@@ -55,7 +55,7 @@ export type NavigationState = {
     status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'; evidence: string }[];
 };
 export type ManualPlacement = { run_id: string; episode_epoch: number; observation_seq: number; xy_m: [number, number] };
-export type ChallengeId = 'bench' | 'park' | 'tidy' | 'sort' | 'recharge' | 'apartment' | 'kitchen_bathroom' | 'clinic_delivery' | 'warehouse' | 'inspection' | 'workshop' | 'local_park' | 'pedestrian_crossing' | 'flat_kitchen' | 'furniture_circuit' | 'movement_practice';
+export type ChallengeId = 'bench' | 'park' | 'park_left' | 'park_right' | 'park_far' | 'tidy' | 'sort' | 'recharge' | 'apartment' | 'kitchen_bathroom' | 'clinic_delivery' | 'warehouse' | 'inspection' | 'workshop' | 'local_park' | 'pedestrian_crossing' | 'flat_kitchen' | 'furniture_circuit' | 'movement_practice';
 export type ChallengeEnvironment = 'standalone' | 'shared_apartment_v1';
 export type ChallengePreset = { id: ChallengeId; environment?: ChallengeEnvironment; title: string; skill: string; goal: string; objectives: string[]; suggested_turn_limit: number;
   category?: 'Navigation' | 'Perception' | 'Manipulation'; difficulty?: 'Foundation' | 'Advanced';
@@ -78,7 +78,7 @@ export type Observation = {
 };
 export type Result = { action_id: string; status: string; error: string | null; message: string; actual_duration_s: number; observation: Observation };
 export type Reasoning = 'none' | 'low' | 'medium' | 'high';
-export type ModelProfile = { id: string; label: string; deployment: string; provider: 'foundry' | 'ollama'; reasoning_efforts: Reasoning[]; configured: boolean };
+export type ModelProfile = { id: string; label: string; deployment: string; provider: 'foundry' | 'ollama'; context_window?: number; reasoning_efforts: Reasoning[]; configured: boolean };
 export type AgentAction = { turn: number; tool: string; arguments: unknown; status: string; error: string | null; message: string; actual_duration_s: number; observation_seq: number; odometry_delta_m_rad?: number[] | null };
 export type CollisionFeedback = { source: 'current' | 'during_action'; contacts: { direction: string; force_n?: number }[]; guidance: string };
 export type ExchangeEntry = {
@@ -94,6 +94,8 @@ export type ExchangeEntry = {
 export type ExchangeFeed = { session_id: string | null; revision: number; first_id: number; capacity: number; events: ExchangeEntry[] };
 export type AgentState = {
   inference_budget?: {requests: number; tokens: number; max_requests: number; max_tokens: number; usage_unknown: boolean};
+  task_supervision?: {model_id:string;requests:number;tokens:number;input_tokens:number;output_tokens:number;
+    max_requests:number;max_tokens:number;usage_unknown:boolean;status:string;guidance:string;operational_authority?:false;motion_authorized?:false} | null;
   unified_mission?: boolean;
   mission?: {mission_id: string; phase: string; remaining_s: number; reason: string;
     objective?: {action:string;status:string;remaining_s:number;remaining_travel_m:number;reason?:string;authorization?:ObjectiveAuthorization} | null;
@@ -125,7 +127,32 @@ export type AgentState = {
   events: AgentAction[];
   configuration: { provider: string; endpoint: string; ollama_endpoint: string; default_model_id: string; models: ModelProfile[] };
 };
+export type RegressionCase = {
+  id: string; challenge_id: ChallengeId; title: string; budget_s: number;
+  status: 'pending' | 'loading' | 'running' | 'passed' | 'failed' | 'invalid' | 'cancelled' | 'not_run';
+  elapsed_s?: number; error?: string | null; outcome?: {message?: string} | null;
+  trajectory_url?: string;
+  evaluation?: {
+    schema_version: number; evaluation_only: boolean; kind: 'arrival' | 'search' | 'circuit';
+    metric: string; progress_pct: number; physics_complete: boolean;
+    completed_objectives: number; total_objectives: number; detail: string;
+    initial_gap_m?: number; remaining_m?: number; remaining_pct?: number | null; center_distance_m?: number;
+    valid_degrees?: number; remaining_degrees?: number; return_error_m?: number | null;
+    dwell_s?: number; required_dwell_s?: number;
+    target_xy_m: number[]; target_bounds_m?: number[]; target_radius_m?: number;
+    checks: {label: string; complete: boolean}[];
+  } | null;
+};
+export type RegressionState = {
+  suite_id: string; sequence_id?: string; active: boolean;
+  phase: 'idle' | 'starting' | 'loading' | 'preparing' | 'running' | 'between_cases' | 'completed' | 'stopping' | 'cancelled' | 'error';
+  cases: RegressionCase[]; current_index?: number | null;
+  model?: (Pick<ModelProfile, 'id'> & Partial<ModelProfile>) | null; reasoning?: Reasoning;
+  task_supervisor_model_id?: 'luna' | null;
+  reason?: string | null; directory?: string; evidence?: string;
+};
 export type LiveState = {
+  regression?: RegressionState;
   recording?: {enabled:boolean;directory:string;active:boolean;status:'off'|'ready'|'recording'|'finalizing';
     run_directory:string | null;samples:number | null;error:string | null};
   power?: {on: boolean; mode: 'off' | 'idle' | 'working'; revision: number; idle_sensor_interval_s: number};

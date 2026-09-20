@@ -31,6 +31,7 @@ class ModelProfile(StrictModel):
     label: str = Field(min_length=1, max_length=120)
     deployment: str = Field(default="", max_length=120)
     provider: Literal["foundry", "ollama"] = "foundry"
+    context_window: int | None = Field(default=None, ge=8192, le=49152, exclude_if=lambda value: value is None)
     reasoning_efforts: list[Literal["none", "low", "medium", "high"]] = Field(
         default_factory=lambda: ["low", "medium", "high"], min_length=1)
 
@@ -49,7 +50,9 @@ class FoundryConfig(StrictModel):
                      reasoning_efforts=["low", "none", "medium", "high"]),
         ModelProfile(id="nano", label="GPT-5.4 Nano", deployment="gpt-5.4-nano"),
         ModelProfile(id="gemma", label="Gemma 4 E2B (Ollama)", deployment="gemma4:e2b-it-qat",
-                     provider="ollama")], min_length=1, max_length=20)
+                     provider="ollama"),
+        ModelProfile(id="qwen", label="Qwen3-VL 4B (local)", deployment="qwen3-vl:4b-instruct-q4_K_M",
+                     provider="ollama", context_window=16384)], min_length=1, max_length=20)
 
     @field_validator("ollama_endpoint")
     @classmethod
@@ -240,7 +243,17 @@ def controller_instructions(execution_mode, skill_composer=False):
     return INSTRUCTIONS + (NAVIGATION_INSTRUCTIONS if execution_mode == "navigation_plan" else "")
 
 
+def mission_model_contract(goal, inputs, *, structured=False):
+    from backend.mission_supervisor import instructions_for, tools
+    brief = json.loads(inputs[-1]["content"][0]["text"])
+    frontiers = ((brief.get("observation") or {}).get("spatial") or {}).get("frontiers", [])
+    return instructions_for(brief, structured=structured) + "\nUser goal: " + goal, tools(
+        brief.get("available_actions"), [item["frontier_id"] for item in frontiers])
+
+
 class FoundryModel:
+    requires_grounded_plan = True
+
     def __init__(self, config: FoundryConfig):
         self.credential = None
         project_endpoint = "/api/projects/" in urlsplit(config.endpoint).path
@@ -257,12 +270,9 @@ class FoundryModel:
         mode = getattr(self, "execution_mode", "single_step")
         composer = getattr(self, "skill_composer", False)
         if getattr(self, "unified_mission", False):
-            from backend.mission_supervisor import instructions_for, tools as mission_tools
-            brief = json.loads(inputs[-1]["content"][0]["text"])
-            actions = brief.get("available_actions")
-            frontiers = ((brief.get("observation") or {}).get("spatial") or {}).get("frontiers", [])
-            return await self.client.responses.create(model=profile.deployment, instructions=instructions_for(brief) + "\nUser goal: " + goal,
-                input=inputs, tools=mission_tools(actions, [item["frontier_id"] for item in frontiers]), parallel_tool_calls=False,
+            instructions, tools = mission_model_contract(goal, inputs)
+            return await self.client.responses.create(model=profile.deployment, instructions=instructions,
+                input=inputs, tools=tools, parallel_tool_calls=False,
                 tool_choice={"type": "function", "name": "guide_mission"}, reasoning={"effort": reasoning},
                 max_output_tokens=2048, store=False)
         return await self.client.responses.create(
@@ -272,6 +282,23 @@ class FoundryModel:
                     if mode in {"luna_navigation", "luna_continuous"} else {}),
             reasoning={"effort": reasoning}, include=["reasoning.encrypted_content"],
             max_output_tokens=4096, store=False)
+
+    async def supervise_task(self, profile, reasoning, goal, inputs):
+        from backend.mission import TaskSupervision
+        return await self.client.responses.create(model=profile.deployment,
+            instructions=("Review only the original robot task request. "
+                "Return one review_task call. Do not choose an available action, destination, coordinate, route, motor command, or completion. "
+                "Preserve explicit task semantics: circle/circuit/orbit means a circuit with the stated direction; approach means object arrival; enter means room arrival. "
+                "plan.target must be a short noun phrase from the goal, such as 'table' or 'yellow cube', never a copied sentence or the whole instruction. "
+                "Preserve distinguishing attributes within 160 characters. If validation feedback is supplied, correct only the invalid contract without changing the requested task. "
+                "Never add return_home unless the user explicitly requests returning Home or to the start. "
+                "The local Qwen controller and guarded worker own all operational decisions and motion. Keep guidance concise and applicable only to Qwen's next fresh observation.\n"
+                "Original user goal: " + goal),
+            input=inputs, tools=[{"type": "function", "name": "review_task",
+                "description": "Confirm the immutable task plan and provide non-actuating consistency guidance.",
+                "parameters": TaskSupervision.model_json_schema(), "strict": False}],
+            parallel_tool_calls=False, tool_choice={"type": "function", "name": "review_task"},
+            reasoning={"effort": reasoning}, max_output_tokens=1024, store=False)
 
     async def close(self):
         await self.client.close()
@@ -312,22 +339,54 @@ def ollama_messages(inputs):
 
 
 class OllamaModel:
+    requires_grounded_plan = True
+
     def __init__(self, config: FoundryConfig):
         self.client = httpx.AsyncClient(base_url=config.ollama_endpoint, timeout=45,
                                        trust_env=False, follow_redirects=False)
+
+    async def readiness(self, profile):
+        try:
+            response = await self.client.post("/api/show", json={"model": profile.deployment}, timeout=5)
+            if response.status_code == 404:
+                return {"ready": False, "status": "missing", "message": "Local model is not installed in Ollama."}
+            response.raise_for_status()
+            data = response.json()
+            if data.get("remote_host") or data.get("remote_model") or profile.deployment.endswith("-cloud"):
+                return {"ready": False, "status": "incompatible", "message": "Choose locally installed weights, not an Ollama cloud-backed model."}
+            capabilities = data.get("capabilities", [])
+            if not isinstance(capabilities, list) or not {"vision", "completion"}.issubset(capabilities):
+                return {"ready": False, "status": "incompatible", "message": "Local model must support vision and completion; update Ollama if capabilities are unavailable."}
+            details = data.get("details") or {}
+            return {"ready": True, "status": "installed", "model": profile.deployment,
+                "context_window": profile.context_window or 16384,
+                "quantization": str(details.get("quantization_level", "unknown"))[:32],
+                "message": "Local vision model installed; runtime memory and mission quality are not verified."}
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+            return {"ready": False, "status": "unavailable", "message": "Cannot verify the local Ollama model. Existing controllers remain available."}
 
     async def respond(self, profile, reasoning, goal, inputs):
         if reasoning != "none":
             raise ValueError("Ollama robot control requires None reasoning (thinking disabled).")
         mode = getattr(self, "execution_mode", "single_step")
-        tools = [{"type": "function", "function": {
-            key: tool[key] for key in ("name", "description", "parameters")}} for tool in robot_tools(mode)]
+        unified = getattr(self, "unified_mission", False)
+        if unified:
+            from backend.mission_supervisor import local_response_schema
+            instructions, tools = mission_model_contract(goal, inputs, structured=True)
+            properties = tools[0]["parameters"]["properties"]
+            output_contract = {"format": local_response_schema(properties["action"]["enum"], properties.get("frontier_id", {}).get("enum", []))}
+        else:
+            composer = getattr(self, "skill_composer", False)
+            instructions = controller_instructions(mode, composer) + "\nUser goal: " + goal
+            output_contract = {"tools": [{"type": "function", "function": {
+                key: tool[key] for key in ("name", "description", "parameters")}} for tool in robot_tools(mode, composer)]}
+        request_started = time.monotonic()
         try:
             response = await self.client.post("/api/chat", json={
                 "model": profile.deployment, "think": False, "stream": False, "keep_alive": "5m",
-                "options": {"temperature": 0, "num_predict": 1024, "num_ctx": max(16384,
+                "options": {"temperature": 0, "num_predict": 1024, "num_ctx": getattr(profile, "context_window", None) or max(16384,
                     ((getattr(self, "context_tokens", 4096) + 8192 + getattr(self, "images_per_request", 1) * 1024 + 8191) // 8192) * 8192)},
-                "tools": tools, "messages": [{"role": "system", "content": controller_instructions(mode) + "\nUser goal: " + goal},
+                **output_contract, "messages": [{"role": "system", "content": instructions},
                                              *ollama_messages(inputs)]})
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
@@ -339,11 +398,22 @@ class OllamaModel:
         except httpx.RequestError:
             raise ValueError("Cannot reach Ollama. Start Ollama and check its loopback endpoint.") from None
         data = response.json()
+        response_received = time.monotonic()
         if data.get("error"):
             raise ValueError("Ollama could not generate a response. Check the local model and available memory.")
         message = data.get("message")
         if not isinstance(message, dict) or message.get("role") != "assistant":
             raise ValueError("Ollama returned an invalid assistant response; no motion executed.")
+        if unified:
+            if message.get("tool_calls"):
+                raise ValueError("Ollama returned tool calls instead of a mission JSON decision; no motion executed.")
+            try:
+                decision = json.loads(message.get("content", ""))
+            except (TypeError, ValueError):
+                raise ValueError("Ollama returned invalid mission JSON; no motion executed.") from None
+            if not isinstance(decision, dict):
+                raise ValueError("Ollama mission decision must be an object; no motion executed.")
+            message = {"role": "assistant", "tool_calls": [{"function": {"name": "guide_mission", "arguments": decision}}]}
         outputs = []
         if message.get("content"):
             outputs.append({"id": str(uuid4()), "type": "message", "role": "assistant", "status": "completed",
@@ -364,16 +434,69 @@ class OllamaModel:
             usage = {"input_tokens": data["prompt_eval_count"], "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                      "output_tokens": data["eval_count"], "output_tokens_details": {"reasoning_tokens": 0},
                      "total_tokens": data["prompt_eval_count"] + data["eval_count"]}
+        local_timing = {"clock": "duration_seconds", "request_s": max(0., response_received-request_started)}
+        for source, destination in (("total_duration", "server_total_s"), ("load_duration", "model_load_s"),
+                ("prompt_eval_duration", "prompt_processing_s"), ("eval_duration", "generation_s")):
+            value = data.get(source)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < float("inf"):
+                local_timing[destination] = value / 1_000_000_000
+        for count_key, duration_key, rate_key in (("prompt_eval_count", "prompt_processing_s", "prompt_tokens_per_s"),
+                ("eval_count", "generation_s", "generated_tokens_per_s")):
+            count, duration = data.get(count_key), local_timing.get(duration_key, 0.)
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0 and duration > 0:
+                local_timing[rate_key] = count / duration
         return Response.model_validate({"id": str(uuid4()), "created_at": time.time(), "object": "response",
             "model": data.get("model", profile.deployment), "output": outputs, "tools": [], "tool_choice": "auto",
             "parallel_tool_calls": False, "usage": usage,
+            "local_timing": local_timing,
             "status": "completed" if data.get("done") is True and data.get("done_reason") == "stop" else "incomplete"})
 
     async def close(self):
         await self.client.aclose()
 
 
+async def prepare_local_supervisor(config, model_id, image):
+    profile = next((entry for entry in config.models if entry.id == model_id and entry.provider == "ollama"), None)
+    if not profile or not config.configured(profile):
+        raise ValueError("Configure a local model before preparing it")
+    began = time.monotonic()
+    async with httpx.AsyncClient(base_url=config.ollama_endpoint, timeout=180., trust_env=False, follow_redirects=False) as client:
+        try:
+            response = await client.post("/api/chat", json={"model": profile.deployment, "stream": False,
+                "think": False, "keep_alive": "5m",
+                "options": {"num_ctx": profile.context_window or 16384, "num_predict": 32, "temperature": 0},
+                "format": {"type": "object", "properties": {"ready": {"type": "boolean", "const": True}},
+                    "required": ["ready"], "additionalProperties": False},
+                "messages": [{"role": "system", "content": 'Vision runtime preparation only. Return {"ready":true}. Do not issue any robot commands.'},
+                    {"role": "user", "content": "Prepare the supplied current head-camera image.",
+                        "images": [base64.b64encode(image).decode("ascii")]}]})
+            response.raise_for_status()
+            data = response.json()
+            message = data.get("message") or {}
+            if (data.get("done") is not True or data.get("done_reason") != "stop" or message.get("tool_calls") or
+                    json.loads(message.get("content", "")) != {"ready": True}):
+                raise ValueError("Local model preparation did not complete; no mission started")
+        except (httpx.HTTPError, TypeError, AttributeError, json.JSONDecodeError):
+            raise ValueError("Local model preparation failed; no mission started. Check Ollama and GPU availability.") from None
+    return {"model": profile.deployment, "duration_s": time.monotonic()-began,
+        "input_tokens": data.get("prompt_eval_count"), "output_tokens": data.get("eval_count"),
+        "scope": "stationary_preparation_before_mission", "motion_authorized": False}
+
+
+async def check_local_supervisor(config, model_id):
+    profile = next((entry for entry in config.models if entry.id == model_id and entry.provider == "ollama"), None)
+    if not profile or not config.configured(profile):
+        return {"ready": False, "status": "unconfigured", "message": "Configure a local Ollama model profile first."}
+    adapter = OllamaModel(config)
+    try:
+        return await adapter.readiness(profile)
+    finally:
+        await adapter.close()
+
+
 class ConfiguredModel:
+    requires_grounded_plan = True
+
     def __init__(self, config: FoundryConfig):
         self.config = config
         self.adapter = None
@@ -387,6 +510,13 @@ class ConfiguredModel:
             self.adapter.skill_composer = getattr(self, "skill_composer", False)
             self.adapter.unified_mission = getattr(self, "unified_mission", False)
         return await self.adapter.respond(profile, reasoning, goal, inputs)
+
+    async def supervise_task(self, profile, reasoning, goal, inputs):
+        if profile.provider != "foundry":
+            raise ValueError("Task supervision requires a Foundry model profile")
+        if self.adapter is None:
+            self.adapter = FoundryModel(self.config)
+        return await self.adapter.supervise_task(profile, reasoning, goal, inputs)
 
     async def close(self):
         if self.adapter:
@@ -442,6 +572,37 @@ class BudgetedModel:
         await self.model.close()
 
 
+class BudgetedTaskSupervisor:
+    def __init__(self, model, controller, worker, settings):
+        self.model, self.controller, self.worker, self.settings = model, controller, worker, settings
+        self.session_id = controller.state["session_id"]
+
+    async def respond(self, profile, reasoning, goal, inputs):
+        self.controller._check_live(self.worker, self.settings)
+        state = self.controller.state["task_supervision"]
+        if state["requests"] >= state["max_requests"] or state["tokens"] >= state["max_tokens"]:
+            return None
+        state["requests"] += 1
+        try:
+            response = await self.model.supervise_task(profile, self.settings.task_supervisor_reasoning, goal, inputs)
+        except BaseException:
+            state["usage_unknown"] = True
+            raise
+        self.controller._check_live(self.worker, self.settings)
+        if self.controller.state["session_id"] != self.session_id:
+            raise asyncio.CancelledError
+        if response.usage is None:
+            state["usage_unknown"] = True
+            raise ValueError("Luna task-supervision usage unavailable; Qwen mission stopped before using unaccounted guidance")
+        state["input_tokens"] += response.usage.input_tokens
+        state["output_tokens"] += response.usage.output_tokens
+        state["tokens"] += response.usage.input_tokens + response.usage.output_tokens
+        return response
+
+    async def close(self):
+        await self.model.close()
+
+
 class FeedbackRate(StrictModel):
     feedback_interval_s: float = Field(default=2, ge=.25, le=30)
 
@@ -459,6 +620,10 @@ class AgentStart(FeedbackRate):
     adaptive_navigation: bool = True
     unified_mission: bool = False
     mission_local_only: bool = False
+    task_supervisor_model_id: str | None = Field(default=None, min_length=1, max_length=80)
+    task_supervisor_reasoning: Literal["none", "low", "medium", "high"] = "low"
+    max_task_supervisor_requests: int = Field(default=4, ge=1, le=12)
+    max_task_supervisor_tokens: int = Field(default=100000, ge=1, le=500000)
     map_context: bool = True
     mission_budget_s: float = Field(default=180., ge=5, le=300)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
@@ -477,6 +642,10 @@ class AgentStart(FeedbackRate):
             raise ValueError("Map-aware missions require two image slots: current camera and observed map")
         if self.mission_local_only and not self.unified_mission:
             raise ValueError("Local-only diagnostics require the unified mission executive")
+        if self.task_supervisor_model_id and (not self.unified_mission or self.mission_local_only):
+            raise ValueError("Task supervision requires a model-driven unified mission")
+        if self.task_supervisor_model_id and self.task_supervisor_model_id == self.model_id:
+            raise ValueError("Task supervision requires a separate model profile")
         if self.navigation_backend == "nav2" and (self.execution_mode != "luna_continuous" or self.skill_composer or self.continuous_handoff):
             raise ValueError("Nav2 requires continuous goal control without built-in composer or moving handoff")
         return self
@@ -646,6 +815,9 @@ class AgentController:
     def budgeted_model(self, worker, settings):
         return BudgetedModel(self.model_factory(self.config), self, worker, settings)
 
+    def budgeted_task_supervisor(self, worker, settings):
+        return BudgetedTaskSupervisor(self.model_factory(self.config), self, worker, settings)
+
     def start(self, worker, settings: AgentStart):
         worker.require_power()
         if settings.unified_mission and settings.mission_local_only:
@@ -686,7 +858,15 @@ class AgentController:
             raise ValueError("Configure the selected provider endpoint and model before starting")
         if settings.reasoning not in profile.reasoning_efforts:
             raise ValueError("This model profile does not support the selected reasoning effort")
-        if settings.execution_mode == "luna_continuous" and (profile.id != "luna" or profile.provider != "foundry" or isinstance(settings, ChatStart)):
+        if settings.task_supervisor_model_id:
+            task_profile = next((entry for entry in self.config.models if entry.id == settings.task_supervisor_model_id), None)
+            if profile.provider != "ollama" or not task_profile or task_profile.provider != "foundry" or not self.config.configured(task_profile):
+                raise ValueError("Qwen + Luna task supervision requires configured local Qwen and Foundry Luna profiles")
+            if settings.task_supervisor_reasoning not in task_profile.reasoning_efforts:
+                raise ValueError("Luna does not support the selected task-supervision reasoning effort")
+        local_mission = settings.unified_mission and profile.provider == "ollama"
+        if settings.execution_mode == "luna_continuous" and (isinstance(settings, ChatStart) or
+            (not local_mission and (profile.id != "luna" or profile.provider != "foundry"))):
             raise ValueError("Continuous goal control requires the configured Luna profile and a Robot goal")
         if settings.execution_mode == "supervised_policy" and profile.provider != "foundry":
             raise ValueError("Select a cloud supervisor profile for SmolVLA mode")
@@ -749,6 +929,11 @@ class AgentController:
                       "input_tokens": 0, "output_tokens": 0, "message": "", "error": None, "events": [], "chat_messages": [],
                       "inference_budget": {"requests": 0, "tokens": 0, "max_requests": settings.max_model_requests,
                           "max_tokens": settings.max_model_tokens, "usage_unknown": False},
+                      "task_supervision": ({"model_id": settings.task_supervisor_model_id, "requests": 0,
+                          "tokens": 0, "input_tokens": 0, "output_tokens": 0,
+                          "max_requests": settings.max_task_supervisor_requests, "max_tokens": settings.max_task_supervisor_tokens,
+                          "usage_unknown": False, "status": "pending", "guidance": ""}
+                          if settings.task_supervisor_model_id else None),
                       "auto_wake": False, "idle_reason": None, "idle_since": None, "camera_unchanged_s": 0, "wake_reason": None, "outcome": None}
         self.trace_records.clear()
         self.trace_images.clear()
@@ -1104,6 +1289,7 @@ class AgentController:
 
     async def _run_controller(self, worker, settings, profile, stop_revision):
         model = None
+        task_supervisor = None
         policy_runner = None
         navigation_supervisor = None
         session_timeout = None
@@ -1118,8 +1304,16 @@ class AgentController:
                 if model is not None:
                     model.unified_mission = True
                     model.execution_mode = settings.execution_mode
+                task_profile = None
+                if settings.task_supervisor_model_id:
+                    task_profile = next(entry for entry in self.config.models if entry.id == settings.task_supervisor_model_id)
+                    task_supervisor = self.budgeted_task_supervisor(worker, settings)
                 async with asyncio.timeout(max(0., self.session_deadline-time.monotonic())) as session_timeout:
-                    await run_mission(self, worker, settings, model, profile, stop_revision)
+                    if task_supervisor:
+                        await run_mission(self, worker, settings, model, profile, stop_revision,
+                            task_supervisor=task_supervisor, task_profile=task_profile)
+                    else:
+                        await run_mission(self, worker, settings, model, profile, stop_revision)
                 return
             if settings.execution_mode in {"local_navigation", "luna_navigation"}:
                 model = self.local_navigation_factory()
@@ -1444,6 +1638,8 @@ class AgentController:
                         await model.close()
                     if navigation_supervisor:
                         await navigation_supervisor.close()
+                    if task_supervisor:
+                        await task_supervisor.close()
                 finally:
                     self.active = False
                     if worker.inference_owner is self:

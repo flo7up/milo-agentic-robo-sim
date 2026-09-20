@@ -8,6 +8,7 @@ import { SpatialSensing } from './SpatialSensing';
 import { HomeMapping } from './HomeMapping';
 import { LunaNavigationControl as AgentControl } from './LunaNavigationControl';
 import { ChallengePicker } from './ChallengePicker';
+import { RegressionControl } from './RegressionControl';
 import { robotOutcome } from './OutcomeFeedback';
 import { RobotControlSurface } from './RobotControlSurface';
 import { ViewNavigation, type TestView } from './ViewNavigation';
@@ -19,7 +20,12 @@ export async function api(path: string, body?: unknown) {
   const response = await fetch(`/api/${path}`, body === undefined ? undefined : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(typeof data.detail === 'string' ? data.detail : `Request failed (${response.status})`);
+    const validation = Array.isArray(data.detail) ? data.detail.map((entry: {loc?:unknown;msg?:unknown}) => {
+      const location = Array.isArray(entry.loc) ? entry.loc.filter(part => part !== 'body').join('.') : '';
+      const message = typeof entry.msg === 'string' ? entry.msg : 'Invalid value';
+      return location ? `${location}: ${message}` : message;
+    }).join('; ') : null;
+    throw new Error(typeof data.detail === 'string' ? data.detail : validation || `Request failed (${response.status})`);
   }
   return response.json();
 }
@@ -206,7 +212,7 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
     finally { setPowerPending(false); }
   }
   const powered = state?.power?.on !== false;
-  const disabled = !connected || !powered || powerPending || pending || sceneLoading || !!state?.busy || !!state?.stopped || !!state?.agent.active;
+  const disabled = !connected || !powered || powerPending || pending || sceneLoading || !!state?.busy || !!state?.stopped || !!state?.agent.active || !!state?.regression?.active;
   const jointLimits = [1.8, 2.5, 2.7, 3, 2.5, 3];
   const observation = state?.observation;
   const inferenceBudget = state?.agent.inference_budget;
@@ -263,6 +269,7 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
     <main className="observatory">
       <section className="runbar">
         <div className="run-context"><div><h2>{state?.challenge?.title ?? 'Practice bench'}</h2></div>
+          {state?.regression?.active && <span className="tag" role="status">Baseline {(state.regression.current_index ?? 0)+1} / {state.regression.cases.length} · {state.regression.phase.replaceAll('_',' ')}</span>}
           {state && <ChallengePicker state={state} connected={connected} request={api} onLoadingChange={setSceneLoading} />}</div>
         <nav className="workspace-nav" aria-label="Workspace"><a href="#observe"><Eye size={15} />World</a><a href="#interact"><MessageSquare size={15} />Luna</a><a href="#controls" onClick={() => setManualOpen(true)}><Hand size={15} />Controls</a></nav>
       </section>
@@ -304,6 +311,7 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
           <div className="viewport-footer"><span>{state?.manual_placements ? `Manual placements: ${state.manual_placements}` : 'MILO-01'}</span><span>Epoch {state?.episode_epoch ?? '-'}</span></div>
         </div>
       </section>
+      {state && <RegressionControl state={state} connected={connected && !sceneLoading && !powerPending} request={api}/>}
       <details className="live-telemetry" open={liveReadoutsOpen} onToggle={event=>setLiveReadoutsOpen(event.currentTarget.open)}>
         <summary><Activity size={15} />Live telemetry <span>{!connected ? 'Disconnected / last received' : 'Latest received'}</span></summary>
         <dl aria-label="Live telemetry summary">

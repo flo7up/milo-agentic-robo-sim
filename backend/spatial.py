@@ -181,7 +181,7 @@ class FloorRegionTracker:
         cloud = np.full((*valid.shape, 3), np.nan)
         cloud[valid] = points
         for color, lower, upper in (("green", 65, 110), ("orange", 12, 35), ("cyan", 112, 140)):
-            colored = (hsv[..., 0] >= lower) & (hsv[..., 0] <= upper) & (hsv[..., 1] > 100) & (hsv[..., 2] > 65)
+            colored = (hsv[..., 0] >= lower) & (hsv[..., 0] <= upper) & (hsv[..., 1] > 32) & (hsv[..., 2] > 65)
             components, count = label(colored)
             sizes = np.bincount(components.ravel(), minlength=count + 1)
             for component in np.argsort(-sizes[1:])[:2] + 1:
@@ -248,6 +248,65 @@ def floor_coverage(corners, size):
     for polygon in polygons.reshape(-1, 8).tolist():
         draw.polygon(polygon, fill=1)
     return np.asarray(coverage, dtype=bool)
+
+
+class ObservedRouteSearch:
+    def __init__(self, observed, start, radius_m):
+        self.start = np.asarray(start, dtype=float).copy()
+        self.origin = observed.origin.copy()
+        self.resolution_m = observed.resolution_m
+        self.size = observed.size
+        self.allowed = observed.traversable(self.start, radius_m)
+        self.distances = None
+        self.predecessors = None
+
+    def contains(self, points):
+        indices = np.floor(np.asarray(points) / self.resolution_m).astype(int) - self.origin
+        return bool(np.all((indices >= 0) & (indices < self.size))
+            and np.all(self.allowed[indices[:, 1], indices[:, 0]]))
+
+    def plan(self, goal):
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import dijkstra
+        if not self.contains([self.start, goal]):
+            raise ValueError("Destination or approach is unknown or lacks whole-robot clearance; inspect more floor")
+        indices = np.floor(np.asarray([self.start, goal]) / self.resolution_m).astype(int) - self.origin
+        start_index, goal_index = indices[:, 1] * self.size + indices[:, 0]
+        if self.distances is None:
+            nodes = np.arange(self.size ** 2).reshape(self.allowed.shape)
+            sources, targets = [], []
+            for delta_row, delta_column in ((1, 0), (0, 1)):
+                source = nodes[:self.size - delta_row, :self.size - delta_column]
+                target = nodes[delta_row:, delta_column:]
+                valid = self.allowed[:self.size - delta_row, :self.size - delta_column] & self.allowed[delta_row:, delta_column:]
+                sources.extend(source[valid].tolist())
+                targets.extend(target[valid].tolist())
+            graph = coo_matrix((np.ones(len(sources)), (sources, targets)), shape=(self.size ** 2, self.size ** 2)).tocsr()
+            self.distances, self.predecessors = dijkstra(graph, directed=False, indices=start_index, return_predecessors=True)
+        if not np.isfinite(self.distances[goal_index]):
+            raise ValueError("No connected observed route; inspect another direction")
+        route = [np.asarray(goal, dtype=float)]
+        current = int(goal_index)
+        while current != start_index:
+            current = int(self.predecessors[current])
+            row, column = divmod(current, self.size)
+            route.append((np.array([column, row]) + self.origin + .5) * self.resolution_m)
+        route[-1] = self.start.copy()
+        route.reverse()
+        simplified = [route[0]]
+        anchor = 0
+        while anchor < len(route) - 1:
+            following = anchor + 1
+            for candidate in range(anchor + 2, len(route)):
+                samples = np.linspace(route[anchor], route[candidate], max(2, math.ceil(np.linalg.norm(route[candidate] - route[anchor]) / .02)))
+                if not self.contains(samples):
+                    break
+                following = candidate
+            simplified.append(route[following])
+            anchor = following
+        if sum(np.linalg.norm(end - begin) for begin, end in zip(simplified, simplified[1:])) > 1.8:
+            raise ValueError("Observed route exceeds the 1.8 m local-goal horizon; select a nearer point")
+        return np.array(simplified).tolist()
 
 
 class ObservedMap:
@@ -387,46 +446,10 @@ class ObservedMap:
         return bool(np.all(traversable[indices[:, 1], indices[:, 0]]))
 
     def plan(self, start, goal, radius_m):
-        from scipy.sparse import coo_matrix
-        from scipy.sparse.csgraph import dijkstra
-        allowed = self.traversable(start, radius_m)
-        if not self.contains_path(allowed, [start, goal]):
-            raise ValueError("Destination or approach is unknown or lacks whole-robot clearance; inspect more floor")
-        nodes = np.arange(self.size ** 2).reshape(self.cells.shape)
-        sources, targets = [], []
-        for delta_row, delta_column in ((1, 0), (0, 1)):
-            source = nodes[:self.size - delta_row, :self.size - delta_column]
-            target = nodes[delta_row:, delta_column:]
-            valid = allowed[:self.size - delta_row, :self.size - delta_column] & allowed[delta_row:, delta_column:]
-            sources.extend(source[valid].tolist())
-            targets.extend(target[valid].tolist())
-        graph = coo_matrix((np.ones(len(sources)), (sources, targets)), shape=(self.size ** 2, self.size ** 2)).tocsr()
-        start_index, goal_index = [np.ravel_multi_index(self.cell_index(point), self.cells.shape) for point in (start, goal)]
-        distances, predecessors = dijkstra(graph, directed=False, indices=start_index, return_predecessors=True)
-        if not np.isfinite(distances[goal_index]):
-            raise ValueError("No connected observed route; inspect another direction")
-        route = [np.asarray(goal, dtype=float)]
-        current = int(goal_index)
-        while current != start_index:
-            current = int(predecessors[current])
-            row, column = np.unravel_index(current, self.cells.shape)
-            route.append((np.array([column, row]) + self.origin + .5) * self.resolution_m)
-        route[-1] = np.asarray(start, dtype=float)
-        route.reverse()
-        simplified = [route[0]]
-        anchor = 0
-        while anchor < len(route) - 1:
-            following = anchor + 1
-            for candidate in range(anchor + 2, len(route)):
-                samples = np.linspace(route[anchor], route[candidate], max(2, math.ceil(np.linalg.norm(route[candidate] - route[anchor]) / .02)))
-                if not self.contains_path(allowed, samples):
-                    break
-                following = candidate
-            simplified.append(route[following])
-            anchor = following
-        if sum(np.linalg.norm(end - begin) for begin, end in zip(simplified, simplified[1:])) > 1.8:
-            raise ValueError("Observed route exceeds the 1.8 m local-goal horizon; select a nearer point")
-        return np.array(simplified).tolist()
+        return self.route_search(start, radius_m).plan(goal)
+
+    def route_search(self, start, radius_m):
+        return ObservedRouteSearch(self, start, radius_m)
 
     def public(self, now=None):
         now = time.monotonic() if now is None else now

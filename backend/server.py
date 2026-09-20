@@ -42,6 +42,7 @@ class ServerActivity:
 def lab_is_busy(lab):
     worker = lab.worker
     return bool(lab.connections or lab.lock.locked() or lab.agent.active or lab.agent.recording_active
+    or (getattr(lab, "regression", None) and lab.regression.active)
         or (lab.home_recording is not None and not getattr(lab.home_recording, "finished", False))
         or (worker and (worker.latest.get("busy") or worker.power_transition
             or (worker.home_mission and worker.home_mission.active)

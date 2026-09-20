@@ -23,7 +23,8 @@ def test_sensor_rays_preserve_occlusion_and_unknown():
     assert cell([-3., 0.]) == 0
 
 
-def test_flat_laser_cell_dedup_preserves_exact_ray_evidence():
+@pytest.mark.parametrize("mode", ["mixed", "clear", "occluded", "grid_boundaries"])
+def test_flat_laser_cell_dedup_preserves_exact_ray_evidence(mode):
     from backend.home_mapping import laser_points
     home = HomeMap("laser-equivalence")
     home.evidence[195:205, 195:205] = -20
@@ -32,19 +33,61 @@ def test_flat_laser_cell_dedup_preserves_exact_ray_evidence():
     laser = {"origin_m": [.15, 0., .3], "angle_min": -math.pi, "angle_increment": 2 * math.pi / 720,
         "range_min": .03, "range_max": 8., "ranges_m": generator.uniform(.2, 9., 720).tolist()}
     laser["ranges_m"][7] = None
+    if mode == "clear":
+        laser["ranges_m"] = [8.01] * 720
+    elif mode == "occluded":
+        laser["ranges_m"] = [None] * 720
+    elif mode == "grid_boundaries":
+        laser["ranges_m"] = [.04 * (index % 199 + 1) for index in range(720)]
     pose = [18., -.1, .2]
     expected = home.evidence.copy()
     origin, endpoints, hits = laser_points(laser, pose)
     samples = [home.indices(np.linspace(origin, endpoint, max(2, math.ceil(np.linalg.norm(endpoint - origin) / .04) + 1))[:-1])
         for endpoint in endpoints]
-    free = np.unique(np.concatenate(samples), axis=0)
-    free = free[home.inside(free)]
-    expected[free[:, 1], free[:, 0]] = np.maximum(-20, expected[free[:, 1], free[:, 0]] - 1)
+    if samples:
+        free = np.unique(np.concatenate(samples), axis=0)
+        free = free[home.inside(free)]
+        expected[free[:, 1], free[:, 0]] = np.maximum(-20, expected[free[:, 1], free[:, 0]] - 1)
     occupied = np.unique(home.indices(endpoints[hits]), axis=0)
     occupied = occupied[home.inside(occupied)]
     expected[occupied[:, 1], occupied[:, 0]] = np.minimum(20, expected[occupied[:, 1], occupied[:, 0]] + 4)
     home.observe(laser, pose, 100.)
     np.testing.assert_array_equal(home.evidence, expected)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_live_scan_clearing_preserves_exact_ray_membership_and_expiry(monkeypatch, empty):
+    import threading
+    from types import SimpleNamespace
+    from backend.home_mapping import laser_points
+    from backend.home_mission import HomeMission
+    import backend.ros_navigation
+    sim = SimpleNamespace(odometry=np.array([.2, -.1, .3]), cancel=threading.Event())
+    worker = SimpleNamespace(challenge=None, powered=True, stop_revision=0, task_revision=0, sim=sim,
+        power_state=lambda: {"mode": "working"}, spatial_map=None)
+    mission = HomeMission(worker, store=SimpleNamespace())
+    mission.home = HomeMap("live-equivalence")
+    mission.transform = [0., 0., 0.]
+    generator = np.random.default_rng(714)
+    laser = {"origin_m": [.19, 0., .305], "angle_min": -math.pi, "angle_increment": 2*math.pi/720,
+        "range_min": .03, "range_max": 8., "ranges_m": generator.uniform(.2, 9., 720).tolist()}
+    laser["ranges_m"][0] = None
+    now = 10.
+    mission.live = {} if empty else {(column, row): now-(index % 4)
+        for index, (column, row) in enumerate(generator.integers(120, 280, (500, 2)))}
+    origin, endpoints, hits = laser_points(laser, sim.odometry)
+    samples = origin+(endpoints[:, None, :]-origin)*np.linspace(0., .99, 160)[None, :, None]
+    cleared = mission.home.indices(samples.reshape(-1, 2))
+    codes = set((cleared[:, 1]*mission.home.size+cleared[:, 0]).tolist())
+    expected = {cell: timestamp for cell, timestamp in mission.live.items()
+        if now-timestamp <= 2. and cell[1]*mission.home.size+cell[0] not in codes}
+    for column, row in mission.home.indices(endpoints[hits]):
+        expected[(int(column), int(row))] = now
+    monkeypatch.setattr(backend.ros_navigation, "capture_laser", lambda _: laser)
+    monkeypatch.setattr("backend.home_mission.time", SimpleNamespace(monotonic=lambda: now))
+    mission.sample(force=True)
+    assert mission.error is None and mission.live == expected
+    assert not np.any(mission.home.evidence)
 
 
 def test_save_once_reload_for_scenarios_and_revision_conflict(tmp_path):

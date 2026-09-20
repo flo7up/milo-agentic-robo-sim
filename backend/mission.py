@@ -1,10 +1,11 @@
 import math
+import re
 import time
 from collections import deque
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, model_validator
 
 from backend.contracts import StrictModel
 from backend.movement import MovementStep
@@ -13,7 +14,7 @@ from backend.movement import MovementStep
 class MissionPlan(StrictModel):
     kind: Literal["explore", "object", "room", "place", "circuit", "movement"]
     target: str = Field(default="", max_length=160,
-        description="Short target label, at most 160 characters, e.g. Bathroom with toilet and sink. Do not copy the full task or its stages; the original user goal remains available.")
+        description="Short target label copied exactly from the original user goal, preserving distinguishing attributes; at most 160 characters. Do not substitute a target from instructions, examples or scene descriptions.")
     return_home: bool = False
     circle_direction: Literal["clockwise", "counterclockwise"] = "clockwise"
     movements: list[MovementStep] = Field(default_factory=list, max_length=8,
@@ -35,8 +36,42 @@ class MissionPlan(StrictModel):
         return self
 
 
+def requested_circuit_direction(goal):
+    clauses = re.split(r"[.!?;]|\b(?:but|instead|then)\b", goal)
+    affirmative = [re.sub(r"\b(?:do not|don't|never|not|avoid)\b[^,]*", "", clause) for clause in clauses]
+    directives = [clause for clause in affirmative if re.search(r"\b(circle|circuit|orbit|lap)\b", clause)]
+    directions = {"counterclockwise" if direction != "clockwise" else direction
+        for clause in directives for direction in re.findall(r"\b(counterclockwise|anti-clockwise|anticlockwise|clockwise)\b", clause)}
+    if not directions:
+        directions = {"counterclockwise" if direction != "clockwise" else direction
+            for clause in affirmative for direction in re.findall(r"\b(counterclockwise|anti-clockwise|anticlockwise|clockwise)\b", clause)}
+    if len(directions) > 1:
+        raise ValueError("Circuit direction is ambiguous; request one direction per circuit")
+    return next(iter(directions), None)
+
+
+def validate_plan_against_goal(plan, goal):
+    normalized = " ".join(goal.casefold().split())
+    if re.search(r"\b(circle|circuit|orbit|lap)\b", normalized):
+        if plan.kind != "circuit":
+            raise ValueError("Explicit circuit goals require a circuit plan")
+        requested = requested_circuit_direction(normalized)
+        if requested and plan.circle_direction != requested:
+            raise ValueError("Circuit direction must match the original goal")
+    if re.search(r"\b(approach|get close|come close)\b", normalized) and plan.kind != "object":
+        raise ValueError("Explicit object-approach goals require an object plan")
+    if re.search(r"\b(enter|inside)\b", normalized) and re.search(r"\b(room|kitchen|bathroom|bedroom)\b", normalized) and plan.kind != "room":
+        raise ValueError("Explicit room-entry goals require a room plan")
+    if (re.search(r"\b(park|drive|move|navigate|go)\b", normalized)
+            and re.search(r"\b(parking bay|green bay)\b", normalized) and plan.kind != "place"):
+        raise ValueError("Explicit parking goals require a place plan")
+    explicit_return = bool(re.search(r"\b(return|go back|come back)\b.*\b(home|start|origin)\b", normalized))
+    if plan.return_home and not explicit_return:
+        raise ValueError("Return Home must be explicitly requested")
+
+
 class MissionDecision(StrictModel):
-    action: Literal["plan", "execute_movement", "explore", "navigate_frontier", "circle", "select_object", "approach_object", "verify_object", "identify_target", "navigate_place", "observe_room", "report_observation", "look", "turn", "wait", "finish", "lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"]
+    action: Literal["plan", "execute_movement", "explore", "navigate_frontier", "circle", "select_object", "approach_object", "verify_object", "identify_target", "navigate_place", "park_floor", "observe_room", "report_observation", "look", "turn", "wait", "finish", "lookup_room", "find_object_sightings", "get_search_history", "get_exploration_summary"]
     plan: MissionPlan | None = None
     object_goal_id: str | None = None
     object_label: str = Field(default="", max_length=60)
@@ -44,6 +79,9 @@ class MissionDecision(StrictModel):
     approach_side: Literal["front", "left", "right"] = "front"
     circle_direction: Literal["clockwise", "counterclockwise"] = "clockwise"
     place_id: str | None = None
+    floor_target_id: str | None = Field(default=None, min_length=1, max_length=80)
+    parking_maneuver_id: str | None = Field(default=None, min_length=1, max_length=160,
+        description="Exact currently offered parking maneuver ID; never invent coordinates or reuse a previous observation's ID.")
     frontier_id: str | None = Field(default=None, max_length=80)
     room_matches: bool | None = None
     evidence_text: str = Field(default="", max_length=500)
@@ -66,9 +104,16 @@ class MissionDecision(StrictModel):
     reason: str = Field(default="", max_length=500)
 
     @model_validator(mode="after")
-    def required_evidence(self):
+    def required_evidence(self, info: ValidationInfo):
         if self.action == "plan" and self.plan is None:
             raise ValueError("Planning requires the requested mission stages")
+        if self.plan is not None and self.plan.kind in {"object", "room", "place", "circuit"} and info.context and "goal" in info.context:
+            target = " ".join(self.plan.target.casefold().split()).strip(" .!?\"'")
+            goal = " ".join(info.context["goal"].casefold().split())
+            if not target or not re.search(r"(?<!\w)" + re.escape(target) + r"(?!\w)", goal):
+                raise ValueError("Plan target must be an exact noun phrase from the original user goal; preserve the requested target instead of copying examples or scene labels")
+        if self.plan is not None and info.context and "goal" in info.context:
+            validate_plan_against_goal(self.plan, info.context["goal"])
         if self.plan is not None and self.plan.kind == "explore" and self.plan.target.strip():
             raise ValueError("Exploration-only plans must have an empty target. Finding and verifying a kitchen or other room requires kind=room; object and named-place goals require their corresponding kind.")
         if self.action in {"select_object", "verify_object", "circle"} or (self.action == "identify_target" and self.object_bounds is not None):
@@ -83,6 +128,8 @@ class MissionDecision(StrictModel):
             raise ValueError("Use a supplied place identity; report_observation records current fixtures without claiming arrival")
         if self.action == "navigate_frontier" and not self.frontier_id:
             raise ValueError("Select an exact currently supplied frontier identity")
+        if self.action == "park_floor" and not self.floor_target_id:
+            raise ValueError("Select an exact currently observed floor-region identity")
         if self.action == "report_observation" and not self.evidence_text.strip():
             raise ValueError("Observation reporting requires current visual evidence")
         if self.action == "identify_target" and not self.evidence_text.strip():
@@ -94,6 +141,20 @@ class MissionDecision(StrictModel):
                 raise ValueError("A room hypothesis requires report_observation, room_label and room_confidence")
         if self.action == "observe_room" and (self.room_matches is None or not self.evidence_text.strip()):
             raise ValueError("Room inspection requires a match assessment and current visual evidence")
+        return self
+
+
+class TaskSupervision(StrictModel):
+    status: Literal["aligned", "corrective"]
+    plan: MissionPlan
+    guidance: str = Field(default="", max_length=500,
+        description="Short task-level guidance for Qwen's next fresh decision. Never a robot action, coordinate or motion command.")
+
+    @model_validator(mode="after")
+    def preserve_explicit_task(self, info: ValidationInfo):
+        if not info.context or "goal" not in info.context:
+            return self
+        validate_plan_against_goal(self.plan, info.context["goal"])
         return self
 
 

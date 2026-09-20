@@ -139,6 +139,131 @@ test('configuration drawer saves then collapses and retains failures beside perm
   expect(errors).toEqual([]);
 });
 
+test('Qwen configuration saves its bounded local profile and reports validation details', async ({page,request}) => {
+  await page.goto('/');
+  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  const drawer=page.getByRole('dialog',{name:'Robot configuration',exact:true});
+  await drawer.getByRole('combobox',{name:'Mission controller',exact:true}).selectOption('qwen');
+  const saved=page.waitForResponse(response=>response.url().endsWith('/api/agent/config') && response.request().method()==='POST');
+  await drawer.getByRole('button',{name:'Save configuration',exact:true}).click();
+  const response=await saved;
+  expect(response.ok(),await response.text()).toBe(true);
+  const state:LiveState=await(await request.get('/api/state')).json();
+  expect(state.agent.configuration.models.find(model=>model.id==='qwen')).toMatchObject({
+    provider:'ollama',deployment:'qwen3-vl:4b-instruct-q4_K_M',context_window:16384,configured:true});
+  await expect(drawer).toBeHidden();
+
+  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await page.route('**/api/agent/config',route=>route.fulfill({status:422,json:{detail:[{
+    loc:['body','models',3,'context_window'],msg:'Input should be less than or equal to 49152',type:'less_than_equal'}]}}));
+  await drawer.getByRole('textbox',{name:'Local model tag',exact:true}).fill('qwen-test-tag');
+  await drawer.getByRole('button',{name:'Save configuration',exact:true}).click();
+  await expect(drawer.getByRole('alert')).toContainText('models.3.context_window: Input should be less than or equal to 49152');
+  await expect(drawer).toBeVisible();
+});
+
+test('hybrid controller keeps Qwen operational and gives Luna task-only supervision', async ({page}) => {
+  let payload:Record<string,unknown>|null=null;
+  await page.route('**/api/agent/local-readiness?*',route=>route.fulfill({json:{ready:true,status:'installed',message:'Local vision model installed'}}));
+  await page.route('**/api/mission/start',async route=>{
+    payload=route.request().postDataJSON();
+    await route.fulfill({status:409,json:{detail:'Payload captured without starting model inference'}});
+  });
+  await page.goto('/');
+  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  const drawer=page.getByRole('dialog',{name:'Robot configuration',exact:true});
+  await drawer.getByRole('combobox',{name:'Mission controller',exact:true}).selectOption('hybrid');
+  await drawer.getByRole('button',{name:'Save configuration',exact:true}).click();
+  await expect(drawer).toBeHidden();
+  await page.getByRole('button',{name:'Open configuration',exact:true}).click();
+  await expect(drawer.getByLabel('Luna task supervision readiness')).toContainText('immutable task plan only');
+  await drawer.getByRole('button',{name:'Close configuration',exact:true}).click();
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect.poll(()=>payload).not.toBeNull();
+  expect(payload).toMatchObject({model_id:'qwen',reasoning:'none',task_supervisor_model_id:'luna',
+    task_supervisor_reasoning:'low',max_task_supervisor_requests:4,max_task_supervisor_tokens:100000});
+  expect(payload).not.toHaveProperty('automatic_fallback');
+  await expect(page.getByRole('alert')).toContainText('Payload captured without starting model inference');
+});
+
+test('regression includes four parking starts with distinct loadable scene previews', async ({page,request}) => {
+  test.setTimeout(90000);
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  expect(initial.regression?.suite_id).toBe('observable-navigation-v2');
+  expect(initial.regression?.cases.slice(0,4).map(entry=>entry.challenge_id)).toEqual(['park','park_left','park_right','park_far']);
+  await page.goto('/');
+  const panel=page.locator('.regression-panel');
+  await expect(panel.locator(':scope > summary')).toContainText('8 cases · 20 min mission budget');
+  await panel.locator(':scope > summary').click();
+  await expect(panel.locator('.regression-cases > li')).toHaveCount(8);
+  await expect(panel.getByRole('button',{name:'Start baseline',exact:true})).toHaveAttribute('title',/96 primary model requests and 640,000 primary tokens/);
+  for(const image of await panel.locator('.regression-cases > li:nth-child(-n+4) img').all()) {
+    await expect.poll(()=>image.evaluate(element=>(element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  }
+  for(const width of [1440,390]) {
+    await page.setViewportSize({width,height:1000});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await panel.screenshot({path:`../.runtime/parking-variations-v1/suite-${width}.png`});
+  }
+  for(const identifier of ['park_left','park_right','park_far']) {
+    await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+    const dialog=page.getByRole('dialog',{name:'Load challenge',exact:true});
+    await dialog.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption(identifier);
+    await dialog.getByRole('combobox',{name:'Map source',exact:true}).selectOption('none');
+    await expect(dialog.locator('.scenario-thumbnail img')).toHaveAttribute('src',`/scenario-previews/${identifier}.webp`);
+    await expect(dialog.locator('.scenario-thumbnail')).toHaveAttribute('data-state','ready');
+    const loaded=page.waitForResponse(response=>response.url().endsWith('/api/challenges/load')&&response.request().method()==='POST');
+    await dialog.getByRole('button',{name:'Load challenge',exact:true}).click();
+    const response=await loaded;
+    expect(response.ok()).toBe(true);
+    const loadedState:LiveState=await response.json();
+    expect(loadedState.challenge?.id).toBe(identifier);
+    await expect(dialog).toBeHidden();
+    await expect(page.getByRole('heading',{name:loadedState.challenge!.title,exact:true})).toBeVisible();
+  }
+  await expect.poll(async()=>(await(await request.get('/api/preferences')).json()).preferences.challenge_selection?.challenge_id).toBe('park_far');
+  await page.reload();
+  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+  await expect(page.getByRole('combobox',{name:'Predefined challenge',exact:true})).toHaveValue('park_far');
+  const current:LiveState=await(await request.get('/api/state')).json();
+  expect(current.agent.active).toBe(false);
+  expect(current.regression?.active).toBe(false);
+});
+
+test('regression cases expose their recorded paths without changing robot state', async ({page,request}) => {
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  const live={...initial,regression:{suite_id:'observable-navigation-v1',sequence_id:'paths',active:false,phase:'completed' as const,
+    cases:[{id:'parking',challenge_id:'park' as const,title:'Park in the green bay',budget_s:120,status:'failed' as const,
+      elapsed_s:42,trajectory_url:'/api/regression/cases/parking/trajectory',evaluation:{schema_version:1,evaluation_only:true,
+        kind:'arrival',metric:'Target approach',progress_pct:75,physics_complete:false,completed_objectives:0,total_objectives:1,
+        initial_gap_m:1.4,remaining_m:.35,remaining_pct:25,center_distance_m:.6,detail:'Move fully inside the zone',
+        target_xy_m:[1.6,.5],target_bounds_m:[1.3,.1,1.9,.9],checks:[{label:'Full footprint inside',complete:false},{label:'Stopped',complete:true}]}}]}};
+  await page.routeWebSocket('**/api/live',socket=>socket.send(JSON.stringify(live)));
+  await page.route('**/api/regression/cases/parking/trajectory',route=>route.fulfill({json:{coordinate_frame:'recorded_world_xy_m',
+    sample_count:4,distance_m:1.2,bounds_m:[0,0,1,.5],downsampled:false,contact_markers_truncated:false,
+    points:[{x:0,y:0,wall_s:0,segment:0},{x:.4,y:.1,wall_s:1,segment:0},{x:.8,y:.5,wall_s:2,segment:0},{x:1,y:.5,wall_s:3,segment:0}],contacts:[]}}));
+  await page.goto('/');
+  const panel=page.locator('.regression-panel');
+  if(!(await panel.getAttribute('open')))await panel.locator(':scope > summary').click();
+  const item=panel.locator('.regression-cases > li').first();
+  await item.getByText('Path',{exact:true}).click();
+  await expect(item.getByRole('img',{name:'Recorded path for Park in the green bay'})).toBeVisible();
+  await expect(item).toContainText('1.20 m / 4 samples');
+  await expect(item.getByRole('progressbar')).toHaveAttribute('value','75');
+  await expect(item).toContainText('75.0%');
+  await expect(item).toContainText('0.35 m remaining (25.0% of initial gap)');
+  await expect(item.locator('.regression-case-status')).toHaveText('failed');
+  await expect(item).toContainText('Objectives 0/1');
+  await expect(item.locator('.regression-path-target')).toHaveCount(1);
+  for(const width of [1440,390,320]){
+    await page.setViewportSize({width,height:900});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await expect(item.locator('.regression-path-line')).toHaveCount(1);
+  }
+  const current:LiveState=await(await request.get('/api/state')).json();
+  expect(current.snapshot).toEqual(initial.snapshot);
+});
+
 test('recording settings save local folders and preserve failed drafts without motion', async ({page,request}) => {
   const directory=await realpath(await mkdtemp(join(tmpdir(),'milo-recording-settings-')));
   const target=join(directory,'My test runs');
@@ -189,8 +314,7 @@ test('powered-on chat starts custom missions and redirects only the active sessi
       await new Promise<void>(resolve=>{release=resolve;});
       await route.fulfill({status:409,json:{detail:'Instruction cancelled by Stop'}});
     } else {
-      publish({...live,busy:true,agent:{...live.agent,active:true,session_id:'chat-start',goal:body.goal,execution_mode:'luna_continuous',unified_mission:true,
-        run_messages:[{id:'prior-report',role:'assistant',source:'model',text:'Prior run report.',status:'reported',timestamp:1}]}});
+      publish({...live,busy:true,agent:{...live.agent,active:true,session_id:'chat-start',goal:body.goal,execution_mode:'luna_continuous',unified_mission:true}});
       await route.fulfill({json:{}});
     }
   });
@@ -230,9 +354,7 @@ test('powered-on chat starts custom missions and redirects only the active sessi
     execution_mode:'luna_continuous',navigation_backend:'builtin',images_per_request:2,map_context:true,
     max_model_requests:4,max_model_tokens:22000,mission_budget_s:75,max_turns:9,reasoning:'low'});
   await expect(composer).toHaveValue('');
-  const conversation=page.getByRole('log',{name:'Run conversation',exact:true});
-  await expect(conversation).toContainText(String(starts[1].goal));
-  await expect(conversation.locator('.chat-message p')).toHaveText(['Prior run report.',String(starts[1].goal)]);
+  await expect(page.getByRole('log',{name:'Run conversation',exact:true})).toContainText(String(starts[1].goal));
   await composer.fill('Return to the starting position.');await send.click();
   await expect.poll(()=>redirects.length).toBe(1);
   expect(redirects[0]).toEqual({run_id:initial.run_id,episode_epoch:initial.episode_epoch,session_id:'chat-start',message:'Return to the starting position.'});

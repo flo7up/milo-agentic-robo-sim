@@ -78,6 +78,18 @@ def test_live_run_is_archived_provisionally_with_version_and_finalizes(tmp_path)
     assert revised["successes"] == 0
 
 
+def test_local_mission_variant_records_latency_adaptive_review_cadence(tmp_path):
+    settings = SimpleNamespace(execution_mode="luna_continuous", unified_mission=True)
+    profile = SimpleNamespace(id="qwen", provider="ollama", deployment="local-test")
+    snapshot = variant_snapshot(settings, profile, tmp_path)
+    configuration = snapshot["model_variant"]["configuration"]
+    assert snapshot["architecture"]["version"] == "0.4.1"
+    assert configuration["semantic_review_interval_s"] == 3.
+    assert configuration["semantic_review_travel_m"] == .75
+    assert "recent_max_response_s" in configuration["semantic_review_latency_backoff"]
+    assert not configuration["automatic_fallback"]
+
+
 def test_live_reports_share_reader_writer_lock(tmp_path, monkeypatch):
     from pathlib import Path
     from backend import recording

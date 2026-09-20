@@ -746,7 +746,7 @@ class SimulationWorker:
                 self.latest = {**self.latest, "busy": False, "snapshot": sim.snapshot(), "stopped": sim.cancel.is_set()}
         return await self.call(operation)
 
-    async def start_continuous(self, request, selected_sensor=None, selected_target=None, exploration=False):
+    async def start_continuous(self, request, selected_sensor=None, selected_target=None, exploration=False, precision=False):
         from backend.continuous_navigation import target_from_depth
         from backend.navigation_backends import ConventionalBackend, NavigationFrame, NavigationGoal
         stop_revision = self.stop_revision
@@ -779,7 +779,11 @@ class SimulationWorker:
                     np.linspace(begin, end, max(2, int(np.ceil(np.linalg.norm(end - begin) / .025)) + 1))
                     for begin, end in zip(points, points[1:])], axis=0)))
             heading = float(np.arctan2(target[1] - sim.odometry[1], target[0] - sim.odometry[0])) if exploration else None
-            return self._start_navigation_path(path, selected_sensor is not None, exploration_heading=heading)
+            self._start_navigation_path(path, selected_sensor is not None, exploration_heading=heading)
+            self.continuous.precision_following = precision
+            if precision:
+                self.continuous.arrival_m = .015
+            return self.continuous.state()
         return await self.call(operation)
 
     def _start_navigation_path(self, path, recover_clearance=False, exploration_heading=None, ai_route=False, home_owned=False):
@@ -988,6 +992,64 @@ class SimulationWorker:
                     or np.linalg.norm(np.asarray(sensor.odometry_m_rad[:2]) - sim.odometry[:2]) > .25
                     or abs(sensor.odometry_m_rad[2] - sim.odometry[2]) > .35):
                 raise ValueError("Mission camera frame expired or capture pose moved too far")
+
+    async def prepare_mapped_drive(self, mission):
+        import pybullet as bullet
+        expected = self._mission_read_authority(mission)
+        def operation(sim):
+            def guard():
+                self._mission_read_guard(sim, expected)
+                mission.check((sim.run_id, sim.epoch, self.stop_revision, self.task_revision))
+                if self.home_mission.active or (self.continuous and self.continuous.active) or (self.navigation and self.navigation.buffer):
+                    raise ValueError("Driving view requires stopped navigation")
+            def head_state():
+                return [bullet.getJointState(sim.robot, sim.joints[name], physicsClientId=sim.client)
+                    for name in ("head_yaw", "head_pitch")]
+            guard()
+            before = sim.odometry.copy()
+            head_before = [joint[0] for joint in head_state()]
+            target = [0., .2]
+            changed = max(abs(actual-wanted) for actual, wanted in zip(head_before, target)) > .02
+            sim.hold_current()
+            try:
+                if changed:
+                    for name, value in zip(("head_yaw", "head_pitch"), target):
+                        sim.targets[sim.joints[name]] = (value, 5)
+                    sim._hold()
+                    for _ in range(20):
+                        guard()
+                        NavigationRuntime().check_clearance(sim, 0., 0.)
+                        sim._ticks(12)
+                        if (math.dist(before[:2], sim.odometry[:2]) > .02 or abs(before[2]-sim.odometry[2]) > .05
+                                or sim.proximity_sensors().collisions):
+                            raise ValueError("Driving view preparation moved or contacted an obstacle")
+                        joints = head_state()
+                        if all(abs(joint[0]-wanted) <= .02 and abs(joint[1]) <= .05 for joint, wanted in zip(joints, target)):
+                            break
+                    else:
+                        raise ValueError("Driving view did not settle within its bounded preparation")
+                guard()
+                settled_at = time.monotonic()
+                self._sample_spatial(force=True)
+                guard()
+                if not self.spatial_enabled or self.spatial_error or not self.spatial_frames:
+                    raise ValueError("Driving view requires fresh paired sensors")
+                sensor, image, _ = next(reversed(self.spatial_frames.values()))
+                self._mission_read_guard(sim, expected, sensor)
+                if (sensor.captured_at < settled_at or not image
+                        or max(abs(actual-wanted) for actual, wanted in zip(sensor.head_rad, target)) > .03):
+                    raise ValueError("Driving view requires a fresh frame after head settling")
+                self.home_mission.sample()
+                self.home_mission.require_localized()
+                guard()
+                return {"changed": changed, "head_before_rad": head_before,
+                    "head_after_rad": [joint[0] for joint in head_state()], "settled_at_s": settled_at,
+                    "spatial_sequence": sensor.sequence, "captured_at_s": sensor.captured_at,
+                    "motion_authorized": False}
+            except BaseException:
+                sim.hold_current()
+                raise
+        return await self.call(operation)
 
     async def mission_objective(self, mission, identity, *, decision=None, renew=False, end_reason=None, selection=None):
         from backend.home_mission import HomeRequest
@@ -1469,6 +1531,8 @@ class SimulationWorker:
             if time.monotonic() - orbit.started > 180:
                 raise MotionError("SKILL_TIMEOUT", "Observed circuit exceeded its 180-second mission limit")
             self._start_navigation_path(path, recover_clearance=True)
+            if orbit.swept >= 2 * np.pi:
+                self.continuous.arrival_m = .015
             self.navigation.recover_deadline = False
             self.navigation.skill_deadline = min(self.navigation.skill_deadline, orbit.started + 180)
             if len(path) > 2:
@@ -1755,14 +1819,32 @@ class SimulationWorker:
             return control.state()
         return await self.call(operation)
 
-    async def continuous_candidates(self, visited=(), floor_target=None):
+    def _can_reuse_stationary_spatial(self, sim, sensor):
+        import pybullet as bullet
+        if (sensor is None or not self.spatial_enabled or self.spatial_error or self.spatial_map is None
+                or sensor.run_id != sim.run_id or sensor.episode_epoch != sim.epoch
+                or self.spatial_map.sequence != sensor.sequence or sensor.sequence not in self.spatial_frames
+                or not 0 <= time.monotonic()-sensor.captured_at <= self.spatial_map.max_frame_age_s
+                or np.linalg.norm(np.asarray(sensor.odometry_m_rad)-sim.odometry) > .01):
+            return False
+        head = [bullet.getJointState(sim.robot, sim.joints[name], physicsClientId=sim.client)[0]
+            for name in ("head_yaw", "head_pitch")]
+        return bool(np.max(np.abs(np.asarray(head)-sensor.head_rad)) <= .02)
+
+    async def continuous_candidates(self, visited=(), floor_target=None, prepared_sensor=None):
         from scipy.ndimage import label, distance_transform_edt
         from backend.continuous_navigation import target_from_depth
         def operation(sim):
-            self._sample_spatial(force=True)
+            if not self._can_reuse_stationary_spatial(sim, prepared_sensor):
+                self._sample_spatial(force=True)
+            if not self.spatial_enabled or self.spatial_error or self.spatial_map is None or not self.spatial_frames:
+                raise ValueError("Candidates require fresh observed sensors")
             sensor, image, _ = next(reversed(self.spatial_frames.values()))
+            if not self._can_reuse_stationary_spatial(sim, sensor):
+                raise ValueError("Candidate observation expired or robot pose changed")
             radius = sim.robot_footprint()["radius_m"]
-            allowed = self.spatial_map.traversable(sim.odometry[:2], radius)
+            search = self.spatial_map.route_search(sim.odometry[:2], radius)
+            allowed = search.allowed
             components, _ = label(allowed)
             clearance = distance_transform_edt(np.pad(self.spatial_map.cells == 0, 1, constant_values=False))[1:-1, 1:-1] * self.spatial_map.resolution_m
             origin_component = components[self.spatial_map.cell_index(sim.odometry[:2])]
@@ -1786,7 +1868,7 @@ class SimulationWorker:
                         if any(np.linalg.norm(np.array(target) - item["target_m"]) < .2 for item in candidates):
                             continue
                         try:
-                            path = self.spatial_map.plan(sim.odometry[:2], target, radius)
+                            path = search.plan(target)
                         except ValueError:
                             continue
                         candidates.append({"id": len(candidates), "pixel": [column, row], "distance_m": round(float(distance), 2),
@@ -1808,7 +1890,7 @@ class SimulationWorker:
                         if any(np.linalg.norm(np.array(target) - item["target_m"]) < .25 for item in candidates):
                             continue
                         try:
-                            path = self.spatial_map.plan(sim.odometry[:2], target, radius)
+                            path = search.plan(target)
                         except ValueError:
                             continue
                         candidates.append({"id": len(candidates), "pixel": None, "target_m": target,
@@ -1822,7 +1904,7 @@ class SimulationWorker:
                     if not .2 <= distances[index] < 1.6 or any(np.linalg.norm(np.array(target) - item["target_m"]) < .2 for item in candidates):
                         continue
                     try:
-                        path = self.spatial_map.plan(sim.odometry[:2], target, radius)
+                        path = search.plan(target)
                     except ValueError:
                         continue
                     candidates.append({"id": len(candidates), "pixel": None, "target_m": target,
@@ -1846,7 +1928,7 @@ class SimulationWorker:
                     if any(np.linalg.norm(np.array(target) - item["target_m"]) < .04 for item in candidates):
                         continue
                     try:
-                        path = self.spatial_map.plan(sim.odometry[:2], target, radius)
+                        path = search.plan(target)
                     except ValueError:
                         continue
                     candidates.append({"id": len(candidates), "pixel": None, "target_m": target,
@@ -1861,7 +1943,9 @@ class SimulationWorker:
                 if goal is not None:
                     candidate["goal_distance_m"] = round(float(np.linalg.norm(np.array(candidate["target_m"]) - goal)), 3)
                     candidate["goal_progress_m"] = round(float(np.linalg.norm(sim.odometry[:2] - goal)) - candidate["goal_distance_m"], 3)
-            observation, image = self._feedback(sim)
+            observation, image = self._feedback(sim, image=image)
+            observation = observation.model_copy(update={"odometry_m_rad": list(sensor.odometry_m_rad),
+                "head_rad": list(sensor.head_rad), "simulated_time_s": sensor.simulated_time_s})
             return sensor, image, candidates, observation
         return await self.call(operation)
 
@@ -1943,7 +2027,7 @@ class SimulationWorker:
             return control.state()
         return await self.call(operation)
 
-    async def parking_clearance(self, floor_target=None, *, stationary_request=None):
+    async def parking_clearance(self, floor_target=None, *, stationary_request=None, prepared_sensor=None):
         from scipy.ndimage import distance_transform_edt
         stop_revision = self.stop_revision
         def operation(sim):
@@ -1951,7 +2035,8 @@ class SimulationWorker:
                 self._continuous_guard(sim, stationary_request, stop_revision)
                 if not self.spatial_enabled or self.spatial_map is None:
                     raise MotionError("SPATIAL_REQUIRED", "Stationary clearance requires an observed map")
-                self._sample_spatial(force=True)
+                if not self._can_reuse_stationary_spatial(sim, prepared_sensor):
+                    self._sample_spatial(force=True)
                 self._continuous_guard(sim, stationary_request, stop_revision)
                 if self.spatial_error or self.spatial_map.public()["stale"]:
                     raise MotionError("SPATIAL_STALE", self.spatial_error or "Stationary clearance sensing expired")

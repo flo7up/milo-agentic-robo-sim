@@ -474,7 +474,8 @@ def test_default_profile_requires_real_connection():
     config = FoundryConfig()
     assert config.public()["models"][0]["label"] == "GPT-5.6 Luna"
     assert [(profile.id, profile.deployment) for profile in config.models] == [
-        ("luna", "gpt-5.6-luna"), ("nano", "gpt-5.4-nano"), ("gemma", "gemma4:e2b-it-qat")]
+        ("luna", "gpt-5.6-luna"), ("nano", "gpt-5.4-nano"), ("gemma", "gemma4:e2b-it-qat"),
+        ("qwen", "qwen3-vl:4b-instruct-q4_K_M")]
     assert config.models[0].reasoning_efforts[0] == "low"
     assert config.public()["models"][0]["reasoning_efforts"] == ["low", "none", "medium", "high"]
     assert config.models[1].reasoning_efforts == ["low", "medium", "high"]
@@ -522,7 +523,7 @@ async def test_project_endpoint_aliases_and_actual_deployment_label(monkeypatch)
     config = FoundryConfig.from_environment()
     assert config.models[0].label == "GPT-5.6 Luna" and config.models[0].deployment == "gpt-5.6-luna"
     assert config.models[1].deployment == "gpt-5.4-nano"
-    assert config.models[3].deployment == "GPT-5.2" and config.models[3].label == "GPT-5.2"
+    assert config.models[4].deployment == "GPT-5.2" and config.models[4].label == "GPT-5.2"
     assert config.public()["default_model_id"] == "luna"
     assert AgentController(config).state["model_id"] == "luna"
     model = FoundryModel(config)
@@ -541,10 +542,11 @@ def test_model_defaults_preserve_legacy_aliases_without_duplicates(monkeypatch, 
     monkeypatch.delenv("AZURE_AI_MODEL_DEPLOYMENT_NAME", raising=False)
     monkeypatch.delenv("deployment_name", raising=False)
     config = FoundryConfig.from_environment()
-    assert len(config.models) == 3
+    assert len(config.models) == 4
     assert config.models[0].deployment == ("custom-luna" if deployment == "custom-luna" else "gpt-5.6-luna")
     assert "none" in config.models[0].reasoning_efforts
     assert config.models[1].deployment == "gpt-5.4-nano"
+    assert config.models[3].deployment == "qwen3-vl:4b-instruct-q4_K_M"
     assert config.public()["default_model_id"] == "luna"
     assert all(profile["configured"] for profile in config.public()["models"])
 

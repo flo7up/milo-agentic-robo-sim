@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from backend.agent import AgentController, AgentStart, ChatStart, FeedbackRate, FoundryConfig, InteractionMode, RunInstruction, robot_tools
+from backend.agent import AgentController, AgentStart, ChatStart, FeedbackRate, FoundryConfig, InteractionMode, RunInstruction, check_local_supervisor, prepare_local_supervisor, robot_tools
 from backend.challenges import ChallengeLoad, PRESETS, furniture_circuit, get_challenge, shared_apartment
 from backend.contracts import Command, ManualPlacement, SpatialSettings, StrictModel, tool_schemas
 from backend.continuous_navigation import ContinuousScan, ContinuousTarget
@@ -27,6 +27,7 @@ from backend.worker import SimulationWorker
 from backend.ros_navigation import RosBridgeStatus, RosGoalResult, RosStart, RosVelocity
 from backend.home_mission import HomeRequest
 from backend.preferences import PreferenceStore, PreferencesPatch
+from backend.regression import RegressionSequence, RegressionStart
 
 
 class Lab:
@@ -53,6 +54,7 @@ class Lab:
         self.preference_error = None
         self.power_off_pending = False
         self.robot_on = True
+        self.regression = RegressionSequence()
 
     async def finish_home_recording(self, reason=None):
         recording = self.home_recording
@@ -70,6 +72,7 @@ class Lab:
             "memory": {"scope": self.worker.memory.scope.model_dump(), "profile": self.worker.memory_profile,
                 "error": self.worker.memory.error} if self.worker.memory else None,
             "recording": self.recording_status(),
+            "regression": self.regression.public(),
             "preference_error": self.preference_error,
             "map_setup": {"reuse_saved_map": self.reuse_saved_map, "map_id": home.identity if home else None,
                 "name": home.name if home else None, "revision": home.revision if home else None,
@@ -160,6 +163,7 @@ lab = Lab()
 @asynccontextmanager
 async def lifespan(app):
     lab.robot_on = True
+    lab.regression = RegressionSequence()
     load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
     load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
     configuration_error = None
@@ -174,6 +178,8 @@ async def lifespan(app):
         saved = await asyncio.to_thread(PreferenceStore().read)
         saved_scene = saved["scene"]
         lab.configure_recording(saved["preferences"])
+        from backend.session_recording import recording_root
+        await asyncio.to_thread(lab.regression.restore_latest, recording_root(lab.recording_root))
     except (OSError, sqlite3.Error, ValueError):
         saved_scene = None
         lab.configure_recording({})
@@ -194,7 +200,9 @@ async def lifespan(app):
         yield
     finally:
         try:
+            lab.regression.cancel(lab, "Server shutdown")
             await lab.agent.halt("Server shutdown")
+            await lab.regression.wait()
             await lab.finish_home_recording("server_shutdown")
         finally:
             try:
@@ -214,6 +222,13 @@ async def local_origin_guard(request: Request, call_next):
     origin = request.headers.get("origin")
     if origin and origin not in {f"http://{request.headers.get('host')}", f"https://{request.headers.get('host')}"}:
         return Response("Same-origin access required", status_code=403)
+    if request.method == "POST" and lab.regression.active:
+        if request.url.path in {"/api/stop", "/api/power", "/api/reset", "/api/challenges/load", "/api/resume", "/api/agent/takeover"}:
+            lab.regression.cancel(lab, "Operator interrupted the regression sequence")
+            await lab.agent.halt("Regression sequence interrupted")
+            await lab.regression.wait()
+        else:
+            return JSONResponse({"detail": "Stop the regression sequence before changing control or configuration"}, status_code=409)
     if request.method == "POST" and lab.worker and not lab.worker.powered and request.url.path not in {
             "/api/power", "/api/stop", "/api/command", "/api/reset", "/api/challenges/load", "/api/preferences",
             "/api/agent/config", "/api/voice/config", "/api/memory"}:
@@ -271,7 +286,8 @@ async def recording_status():
 @app.get("/api/test-variant")
 async def test_variant(execution_mode: Literal["luna_continuous", "luna_navigation"] = "luna_continuous",
     model_id: str = "luna", reasoning: Literal["none", "low", "medium", "high"] = "high",
-        skill_composer: bool = False, navigation_backend: Literal["builtin", "nav2"] = "builtin"):
+        skill_composer: bool = False, navigation_backend: Literal["builtin", "nav2"] = "builtin",
+        task_supervisor_model_id: str | None = None):
     from backend.experiment_variants import variant_snapshot
     profile = next((entry for entry in lab.agent.config.models if entry.id == model_id), None)
     if profile is None:
@@ -279,7 +295,9 @@ async def test_variant(execution_mode: Literal["luna_continuous", "luna_navigati
     try:
         settings = AgentStart(run_id=lab.worker.latest["run_id"], episode_epoch=lab.worker.epoch,
             execution_mode=execution_mode, model_id=model_id, reasoning=reasoning,
-            skill_composer=skill_composer, navigation_backend=navigation_backend, goal="Architecture preview only")
+            skill_composer=skill_composer, navigation_backend=navigation_backend, goal="Architecture preview only",
+            unified_mission=task_supervisor_model_id is not None, images_per_request=2 if task_supervisor_model_id else 1,
+            task_supervisor_model_id=task_supervisor_model_id)
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     return JSONResponse({**variant_snapshot(settings, profile), "supports_ai_generated_routes": False,
@@ -680,6 +698,7 @@ async def power(settings: RobotPower):
 
 @app.post("/api/stop")
 async def stop():
+    lab.regression.cancel(lab, "Operator stopped the regression sequence")
     lab.worker.stop()
     await lab.agent.halt()
     await lab.finish_home_recording("stopped")
@@ -775,6 +794,11 @@ async def policy_readiness(config: PolicyConfig):
     return await check_policy_readiness(config, lab.agent.policy_factory)
 
 
+@app.get("/api/agent/local-readiness")
+async def local_supervisor_readiness(model_id: str = Query(default="qwen", min_length=1, max_length=80)):
+    return JSONResponse(await check_local_supervisor(lab.agent.config, model_id), headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/agent/chat")
 async def chat_message(settings: ChatStart):
     return await start_agent(settings)
@@ -798,6 +822,7 @@ async def mission_capabilities():
     settings = AgentStart(run_id="capability", episode_epoch=0, execution_mode="luna_continuous", goal="capability",
         unified_mission=True, images_per_request=2)
     return {"version": 1, "unified_mission": True, "observed_map_version": 1, "backends": ["builtin"],
+        "local_supervisor": {"provider": "ollama", "transport": "mission_json_v1", "fallback": "explicit_restart"},
         "task_kinds": MissionPlan.model_json_schema()["properties"]["kind"]["enum"], "image_slots": 2,
         "review_policy": "bounded_stopped_checkpoints", "qualification": "experimental",
         "architecture": variant_snapshot(settings, None)["architecture"]}
@@ -810,6 +835,34 @@ async def start_mission(settings: AgentStart):
     return await start_agent(settings)
 
 
+@app.get("/api/regression")
+async def regression_status():
+    return JSONResponse(lab.regression.public(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/regression/start")
+async def start_regression(settings: RegressionStart):
+    try:
+        lab.regression.start(lab, settings, start_agent)
+    except (ValueError, OSError) as error:
+        raise HTTPException(409, str(error) if isinstance(error, ValueError) else "Cannot create baseline recording directory") from None
+    return lab.regression.public()
+
+
+@app.get("/api/regression/report")
+async def regression_report():
+    return JSONResponse({**lab.regression.state, "active": lab.regression.active}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/regression/cases/{case_id}/trajectory")
+async def regression_trajectory(case_id: str):
+    try:
+        route = await asyncio.to_thread(lab.regression.trajectory, case_id, lab.agent.recording_directory)
+    except (OSError, ValueError, TypeError, KeyError):
+        raise HTTPException(404, "Regression path unavailable") from None
+    return JSONResponse(route, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/agent/start")
 async def start_agent(settings: AgentStart):
     if lab.interaction_mode != "chat":
@@ -819,6 +872,34 @@ async def start_agent(settings: AgentStart):
     if not lab.connections:
         raise HTTPException(409, "Keep an operator interface connected while the LLM controls the robot")
     async with lab.lock:
+        start_worker, start_config, start_revision = lab.worker, lab.agent.config, lab.worker.stop_revision
+        local_start_guard = None
+        local_preparation = None
+        profile = next((entry for entry in lab.agent.config.models if entry.id == settings.model_id), None)
+        if settings.unified_mission and not settings.mission_local_only and profile and profile.provider == "ollama":
+            if lab.agent.active or lab.worker.latest.get("busy"):
+                raise HTTPException(409, "Stop current control before starting a local model mission")
+            worker, config = lab.worker, lab.agent.config
+            stop_revision = worker.stop_revision
+            local_start_guard = (worker, config, stop_revision)
+            if settings.task_supervisor_model_id:
+                supervisor = next((entry for entry in config.models if entry.id == settings.task_supervisor_model_id), None)
+                if (not supervisor or supervisor.provider != "foundry" or not config.configured(supervisor)
+                        or settings.task_supervisor_reasoning not in supervisor.reasoning_efforts):
+                    raise HTTPException(409, "Configure Luna with a supported reasoning effort before hybrid task supervision")
+            readiness = await check_local_supervisor(config, settings.model_id)
+            if not readiness["ready"]:
+                raise HTTPException(409, readiness["message"])
+            if worker is not lab.worker or config is not lab.agent.config or worker.stop_revision != stop_revision or not lab.connections:
+                raise HTTPException(409, "Local model start invalidated by Stop or episode/operator change")
+            try:
+                observation, image = await worker.feedback()
+                local_preparation = await prepare_local_supervisor(config, settings.model_id, image)
+                local_preparation["observation_seq"] = observation.seq
+            except ValueError as error:
+                raise HTTPException(409, str(error)) from error
+            if worker is not lab.worker or config is not lab.agent.config or worker.stop_revision != stop_revision or not lab.connections:
+                raise HTTPException(409, "Local model start invalidated during stationary preparation")
         if settings.execution_mode == "supervised_policy":
             if lab.agent.active or lab.worker.latest.get("busy"):
                 raise HTTPException(409, "Stop current control before starting a policy session")
@@ -831,7 +912,15 @@ async def start_agent(settings: AgentStart):
                 raise HTTPException(409, "Policy start invalidated by Stop or episode/operator change")
         try:
             await lab.finish_home_recording("luna_handoff")
+            if (start_worker is not lab.worker or start_config is not lab.agent.config or
+                    start_revision != lab.worker.stop_revision or not lab.connections):
+                raise HTTPException(409, "Model start invalidated by Stop or episode/operator change")
+            if local_start_guard and (local_start_guard[0] is not lab.worker or local_start_guard[1] is not lab.agent.config or
+                    local_start_guard[2] != lab.worker.stop_revision or not lab.connections):
+                raise HTTPException(409, "Local model start invalidated during recording handoff")
             lab.agent.start(lab.worker, settings)
+            if local_preparation:
+                lab.agent._trace("session", "Local model stationary preparation", local_preparation)
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
         except RuntimeError as error:
@@ -931,9 +1020,11 @@ async def live(socket: WebSocket):
     finally:
         lab.connections -= 1
         if lab.connections == 0:
+            lab.regression.cancel(lab, "Operator disconnected")
             lab.worker.stop()
             with CancelScope(shield=True):
                 await lab.agent.halt("Operator disconnected")
+                await lab.regression.wait()
                 await lab.finish_home_recording("disconnected")
 
 
