@@ -120,11 +120,23 @@ async def test_malformed_moving_review_closes_objective_before_retry(tmp_path, m
     from backend.mission_supervisor import MappedReviewOperation
     worker = SimulationWorker(challenge=get_challenge("kitchen_bathroom"), rendering="enhanced", pace=True)
     captured = []
+    malformed_at = []
     async def handle(request):
         captured.append(json.JSONDecoder().raw_decode(json.loads(request.content)["messages"][-1]["content"])[0])
-        replies = ['{"action":"plan","plan":{"kind":"room","target":"Kitchen","completion":"identify"}}',
-            '{"action":"explore"}', '{"action":', '{"action":"wait","duration_s":0.5}']
-        return httpx.Response(200, json=local_response(message={"role": "assistant", "content": replies[len(captured)-1]}))
+        if len(captured) == 1:
+            reply = '{"action":"plan","plan":{"kind":"room","target":"Kitchen","completion":"identify"}}'
+        elif malformed_at:
+            reply = '{"action":"wait","duration_s":0.5}'
+        elif captured[-1]["mission"]["operation_id"]:
+            malformed_at.append(len(captured)-1)
+            reply = '{"action":'
+        else:
+            # Select fresh evidence again if the initial floor survey invalidated
+            # an offer. Inject the bad reply only after measured motion starts.
+            frontiers = captured[-1]["observation"]["spatial"]["frontiers"]
+            assert frontiers
+            reply = json.dumps({"action": "navigate_frontier", "frontier_id": frontiers[0]["frontier_id"]})
+        return httpx.Response(200, json=local_response(message={"role": "assistant", "content": reply}))
     adapter = await adapter_for(handle)
     controller = AgentController(FoundryConfig(), lambda config: adapter)
     original_review = MappedReviewOperation.review
@@ -142,16 +154,17 @@ async def test_malformed_moving_review_closes_objective_before_retry(tmp_path, m
         worker.home_mission = HomeMission(worker, MapStore(tmp_path / "moving-recovery.sqlite3"))
         controller.start(worker, start_settings(worker, model_id="qwen", reasoning="none", execution_mode="luna_continuous",
             unified_mission=True, map_context=True, images_per_request=2, mission_budget_s=90.,
-            max_turns=4, max_model_requests=4).model_copy(update={"goal": "Find Kitchen"}))
+            max_turns=6, max_model_requests=6).model_copy(update={"goal": "Find Kitchen"}))
         await asyncio.wait_for(controller.task, 100.)
         assert controller.state["error"] is None, controller.state["error"]
-        assert len(captured) == 4
-        moving, stopped = captured[2:]
-        assert moving["mission"]["operation_id"] and stopped["mission"]["operation_id"] is None
+        assert len(malformed_at) == 1
+        moving, stopped = captured[malformed_at[0]:malformed_at[0]+2]
+        assert moving["mission"]["operation_id"], moving.get("last_execution")
+        assert stopped["mission"]["operation_id"] is None
         assert stopped["review_mode"] == "choose_next_observed_destination"
         assert stopped["last_execution"]["motion_authorized"] is False
         assert stopped["sensing"]["source_sequence"] > moving["sensing"]["source_sequence"]
-        assert controller.state["inference_budget"]["tokens"] == 480
+        assert controller.state["inference_budget"]["tokens"] == 120*len(captured)
         assert worker.latest["stopped"] and not controller.active
         assert not worker.sim.proximity_sensors().collisions
     finally:

@@ -267,6 +267,51 @@ test('kitchen budget defaults and overrides stay separate from other challenges'
   expect(current.agent.input_tokens+current.agent.output_tokens).toBe(0);
 });
 
+for (const challenge of ['maze', 'maze_complex']) {
+test(`${challenge} budget defaults persist overrides without changing other scenarios`, async ({page,request}) => {
+  test.setTimeout(120000);
+  await request.post('/api/preferences',{data:{reasoning:'low',turns:20,max_model_requests:12,max_model_tokens:100000,exploration_budget:180}});
+  expect((await request.post('/api/challenges/load',{data:{challenge_id:challenge,reuse_saved_map:false}})).ok()).toBe(true);
+  let payload:Record<string,unknown>|null=null;
+  await page.route('**/api/mission/start',async route=>{
+    payload=route.request().postDataJSON();
+    await route.fulfill({status:409,json:{detail:'Budget captured without inference'}});
+  });
+  await page.goto('/');
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect.poll(()=>payload).not.toBeNull();
+  expect(payload).toMatchObject({max_turns:200,max_model_requests:200,max_model_tokens:1500000,mission_budget_s:600});
+  await openConfiguration(page);
+  const drawer=page.getByRole('dialog',{name:'Robot configuration',exact:true});
+  const time=drawer.getByRole('spinbutton',{name:'Mission budget',exact:true});
+  const turns=drawer.getByRole('spinbutton',{name:'Supervisor turn limit',exact:true});
+  await expect(time).toHaveAttribute('max','600');
+  await expect(turns).toHaveAttribute('max','200');
+  await time.fill('540');
+  await turns.fill('180');
+  await drawer.getByRole('spinbutton',{name:'Luna request limit',exact:true}).fill('190');
+  await drawer.getByRole('spinbutton',{name:'Luna token threshold',exact:true}).fill('1600000');
+  await drawer.getByRole('button',{name:'Save configuration',exact:true}).click();
+  const saved=(await(await request.get('/api/preferences')).json()).preferences;
+  expect(saved).toMatchObject({turns:20,max_model_requests:12,max_model_tokens:100000,exploration_budget:180,
+    maze_turns:180,maze_max_model_requests:190,maze_max_model_tokens:1600000,maze_mission_budget:540});
+  await page.reload();
+  payload=null;
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect.poll(()=>payload).not.toBeNull();
+  expect(payload).toMatchObject({max_turns:180,max_model_requests:190,max_model_tokens:1600000,mission_budget_s:540});
+  expect((await request.post('/api/challenges/load',{data:{challenge_id:'park',reuse_saved_map:false}})).ok()).toBe(true);
+  await expect(page.getByRole('heading',{name:'Park in the Bay',exact:true})).toBeVisible();
+  payload=null;
+  await page.getByRole('button',{name:'Start mission',exact:true}).click();
+  await expect.poll(()=>payload).not.toBeNull();
+  expect(payload).toMatchObject({max_turns:20,max_model_requests:12,max_model_tokens:100000,mission_budget_s:180});
+  const current:LiveState=await(await request.get('/api/state')).json();
+  expect(current.agent.active).toBe(false);
+  expect(current.agent.input_tokens+current.agent.output_tokens).toBe(0);
+});
+}
+
 test('regression includes four parking starts with distinct loadable scene previews', async ({page,request}) => {
   test.setTimeout(90000);
   const initial:LiveState=await(await request.get('/api/state')).json();
@@ -979,6 +1024,42 @@ test('robot controls appear once and stay reachable through dialogs', async ({pa
   await expect(start).toBeEnabled();
   expect(errors).toEqual([]);
 });
+
+for (const [challengeId, bay] of [['maze', [4.5, 2.7]], ['maze_complex', [6.3, 4.5]]] as const) {
+  test(`${challengeId} arrival stops motion and keeps the scenario complete until reset`, async ({page, request}) => {
+    await page.goto('/');
+    await request.post('/api/challenges/load', {data:{challenge_id:challengeId,reuse_saved_map:false}});
+    const initial:LiveState = await (await request.post('/api/agent/takeover')).json();
+    const placement = await request.post('/api/robot/placement', {data:{
+      run_id:initial.run_id,episode_epoch:initial.episode_epoch,observation_seq:initial.observation.seq,
+      xy_m:[bay[0] - .9, bay[1]],
+    }});
+    expect(placement.ok(), await placement.text()).toBe(true);
+    const placed:LiveState = await placement.json();
+    expect(placed.challenge?.status).toBe('in_progress');
+    const drive = await request.post('/api/command', {data:{
+      run_id:placed.run_id,episode_epoch:placed.episode_epoch,observation_seq:placed.observation.seq,
+      action_id:`${challengeId}-arrival`,tool:'drive_base',arguments:{linear_mps:.3,angular_radps:0,duration_s:2},
+    }});
+    expect(drive.ok()).toBe(true);
+    expect((await drive.json()).status).toBe('cancelled');
+    const status = page.getByRole('status',{name:'Robot status',exact:true});
+    await expect(status).toContainText('Task completed');
+    await expect(page.getByText(/1 \/ 1 objectives verified by physics/)).toBeVisible();
+    const completed:LiveState = await (await request.get('/api/state')).json();
+    expect(completed.challenge?.status).toBe('completed');
+    expect(completed.stopped).toBe(true);
+    expect(completed.snapshot.simulated_time_s).toBeLessThan(2);
+    await page.reload();
+    await expect(status).toContainText('Task completed');
+    await page.getByRole('button',{name:'Reset episode',exact:true}).click();
+    await expect.poll(async()=>(await(await request.get('/api/state')).json()).run_id).not.toBe(completed.run_id);
+    await expect(status).not.toContainText('Task completed');
+    const reset:LiveState = await (await request.get('/api/state')).json();
+    expect(reset.challenge?.completed_objectives).toBe(0);
+    expect(reset.challenge?.status).toBe('in_progress');
+  });
+}
 
 test('one robot status prioritizes current activity power and connection',async({page,request})=>{
   const initial=await(await request.get('/api/state')).json();

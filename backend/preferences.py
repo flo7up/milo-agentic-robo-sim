@@ -21,6 +21,10 @@ class PreferencesPatch(BaseModel):
     kitchen_turns: int | None = Field(default=None, ge=1, le=80)
     kitchen_max_model_requests: int | None = Field(default=None, ge=1, le=200)
     kitchen_max_model_tokens: int | None = Field(default=None, ge=1, le=2000000)
+    maze_turns: int | None = Field(default=None, ge=1, le=200)
+    maze_max_model_requests: int | None = Field(default=None, ge=1, le=200)
+    maze_max_model_tokens: int | None = Field(default=None, ge=1, le=2000000)
+    maze_mission_budget: int | None = Field(default=None, ge=5, le=600)
     recording_enabled: bool | None = None
     recording_directory: str | None = Field(default=None, max_length=1024)
     reasoning: Literal["none", "low", "medium", "high"] | None = None

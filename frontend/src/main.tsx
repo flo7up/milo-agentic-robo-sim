@@ -13,7 +13,7 @@ import { robotOutcome } from './OutcomeFeedback';
 import { RobotControlSurface } from './RobotControlSurface';
 import { ViewNavigation, type TestView } from './ViewNavigation';
 import { PreferencesProvider, usePreference } from './Preferences';
-import type { LiveState, ManualPlacement, ProximitySensors, Result, SpatialTelemetry } from './types';
+import type { LiveState, ManualPlacement, ProximitySensors, Result, SpatialTelemetry, ModelCallSelection } from './types';
 import './style.css';
 
 export async function api(path: string, body?: unknown) {
@@ -136,6 +136,14 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
     try { return sessionStorage.getItem('milo-travelled-path') !== 'false'; }
     catch { return true; }
   });
+  const [callSelection,setCallSelection]=useState<ModelCallSelection>(null);
+  function selectCall(id:string,from:'path'|'chat') {
+    setCallSelection(previous=>({id,from,revision:(previous?.revision ?? 0)+1}));
+    if(from==='chat') {
+      setShowTravelledPath(true);
+      document.querySelector('.world-panel')?.scrollIntoView({block:'nearest',behavior:'smooth'});
+    }
+  }
   useEffect(() => {
     try { sessionStorage.setItem('milo-travelled-path', String(showTravelledPath)); }
     catch {}
@@ -287,7 +295,7 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
             </label></div>
             <label className="toggle"><input type="checkbox" checked={axes} onChange={event => setAxes(event.target.checked)} /> Axes</label></div>
           <div className="world-viewport">
-            {state ? <Spectator state={state} axes={axes} enabled={!disabled} onPlace={placeRobot} showZones={showMotionZones} showTrail={showTravelledPath} telemetry={spatialTelemetry} connected={connected} /> : <div className="loading">Connecting to physics worker...</div>}
+            {state ? <Spectator state={state} axes={axes} enabled={!disabled} onPlace={placeRobot} showZones={showMotionZones} showTrail={showTravelledPath} telemetry={spatialTelemetry} connected={connected} callSelection={callSelection} onSelectCall={id=>selectCall(id,'path')} /> : <div className="loading">Connecting to physics worker...</div>}
             <aside className="viewport-hud" aria-label="Robot sensor HUD">
               <section className="viewport-widget" aria-label="Head camera HUD" data-minimized={cameraMinimized}>
                 <div className="viewport-widget-heading"><h3><Camera size={14} /> Head camera</h3></div>
@@ -317,7 +325,7 @@ function App({ onNavigate, onLiveState }: { onNavigate: (view: TestView) => void
       </div>
       <aside className="interaction-column" id="interact" aria-label="Robot interaction">
         {state && <AgentControl key={state.run_id} state={state} connected={connected && !sceneLoading && !powerPending} request={api} commandHost={commandHost}
-          settingsHost={settingsHost} telemetryContent={telemetryContent} robotAccess={robotAccess}
+          settingsHost={settingsHost} telemetryContent={telemetryContent} robotAccess={robotAccess} callSelection={callSelection} onSelectCall={id=>selectCall(id,'chat')}
           spatialTelemetry={spatialTelemetry?.run_id === state.run_id && spatialTelemetry.episode_epoch === state.episode_epoch ? spatialTelemetry : null} />}
       </aside>
       </div>

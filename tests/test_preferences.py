@@ -22,19 +22,24 @@ def test_preferences_survive_new_store_and_merge_without_scene_commands(tmp_path
     path.unlink()
 
 
-def test_kitchen_budgets_persist_separately_from_other_challenges(tmp_path):
+@pytest.mark.parametrize("profile,values,bounds", [
+    ("kitchen", {"turns": 60, "max_model_requests": 60, "max_model_tokens": 400000},
+        {"turns": (1, 80), "max_model_requests": (1, 200), "max_model_tokens": (1, 2000000)}),
+    ("maze", {"turns": 200, "max_model_requests": 200, "max_model_tokens": 1500000, "mission_budget": 600},
+        {"turns": (1, 200), "max_model_requests": (1, 200), "max_model_tokens": (1, 2000000), "mission_budget": (5, 600)}),
+])
+def test_scenario_budgets_persist_separately_from_other_challenges(tmp_path, profile, values, bounds):
     path = tmp_path / "preferences.sqlite3"
     store = PreferenceStore(path)
     general = {"turns": 20, "max_model_requests": 12, "max_model_tokens": 100000}
-    kitchen = {"kitchen_turns": 60, "kitchen_max_model_requests": 60, "kitchen_max_model_tokens": 400000}
+    scoped = {f"{profile}_{key}": value for key, value in values.items()}
     store.update(PreferencesPatch(**general))
-    store.update(PreferencesPatch(**kitchen))
-    assert PreferenceStore(path).read()["preferences"] == {**general, **kitchen}
-    for key, maximum in (("kitchen_turns", 80), ("kitchen_max_model_requests", 200),
-            ("kitchen_max_model_tokens", 2000000)):
-        for value in (0, maximum + 1, 1.5, True):
+    store.update(PreferencesPatch(**scoped))
+    assert PreferenceStore(path).read()["preferences"] == {**general, **scoped}
+    for key, (minimum, maximum) in bounds.items():
+        for value in (minimum - 1, maximum + 1, 1.5, True):
             with pytest.raises(ValidationError):
-                PreferencesPatch.model_validate({key: value})
+                PreferencesPatch.model_validate({f"{profile}_{key}": value})
     path.unlink()
 
 

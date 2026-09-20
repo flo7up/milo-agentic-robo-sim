@@ -5,15 +5,17 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
-import type { LiveState, ManualPlacement, SpatialTelemetry } from './types';
+import type { LiveState, ManualPlacement, SpatialTelemetry, ModelCallSelection } from './types';
+import { currentModelCalls, ModelCallMarkers } from './modelCallMarkers';
 import { MovementZoneOverlay } from './movementZones';
 import { TravelledPath } from './travelledPath';
 import { detailRobotVisual, enhancedLighting, visualGeometry, visualMaterial, type GraphicsQuality } from './sceneGraphics';
 import { usePreference } from './Preferences';
 
-export function Spectator({ state, axes, enabled, onPlace, showZones = false, showTrail = true, telemetry, connected = true }: {
+export function Spectator({ state, axes, enabled, onPlace, showZones = false, showTrail = true, telemetry, connected = true, callSelection, onSelectCall }: {
   state: LiveState; axes: boolean; enabled: boolean; onPlace: (placement: ManualPlacement) => Promise<void>;
   showZones?:boolean;showTrail?:boolean;telemetry?:SpatialTelemetry | null;connected?:boolean;
+  callSelection?:ModelCallSelection;onSelectCall?:(id:string)=>void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const current = useRef(state);
@@ -27,6 +29,10 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, sh
   const travelledPath = useRef(new TravelledPath());
   const trailVisible = useRef(showTrail);
   trailVisible.current = showTrail;
+  const callOptions=useRef({callSelection,onSelectCall});
+  callOptions.current={callSelection,onSelectCall};
+  const modelCalls=useRef(currentModelCalls(state));
+  modelCalls.current=currentModelCalls(state);
   useEffect(() => {travelledPath.current.sample(state,connected);}, [state,connected]);
   const interaction = useRef({ select: () => {}, cancel: () => {} });
   const [selected, setSelected] = useState(false);
@@ -77,6 +83,8 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, sh
     renderer.domElement.setAttribute('aria-keyshortcuts', 'ArrowUp ArrowDown ArrowLeft ArrowRight Enter Escape');
     renderer.domElement.title = 'Select the robot and drag to position. Arrow keys adjust a selected robot; Enter places it and Escape cancels.';
     element.appendChild(renderer.domElement);
+    const callMarkers=new ModelCallMarkers(id=>callOptions.current.onSelectCall?.(id));
+    element.appendChild(callMarkers.element);
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(facility ? 0 : workshop ? .5 : apartment ? .45 : recharging ? .65 : parking ? .6 : .12, .25, 0);
     if (savedView.current?.run === state.run_id) {
@@ -311,6 +319,7 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, sh
     let placements = current.current.manual_placements;
     let previousZoneState='';
     let previousBeamState='';
+    let selectedCallRevision=-1;
     const animate = () => {
       if (drag && (!options.current.enabled || drag.source.observation_seq !== current.current.observation.seq)) cancel();
       const positioned = placements !== current.current.manual_placements;
@@ -347,8 +356,21 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, sh
         ? [...movementZones.meshes.values()].filter(mesh=>['clear','restricted'].includes(mesh.userData.level)).length : 0);
       outline.visible = isSelected;
       if (isSelected) outline.update();
+      const selection=callOptions.current.callSelection;
+      if(selection?.from==='chat' && selection.revision!==selectedCallRevision) {
+        selectedCallRevision=selection.revision;
+        const call=modelCalls.current.find(item=>item.id===selection.id);
+        if(call?.position_world_m) {
+          const target=world.localToWorld(new THREE.Vector3(...call.position_world_m,.04));
+          camera.position.add(target.clone().sub(controls.target));
+          controls.target.copy(target);
+          cameraAdjusted=true;
+        }
+      }
       if (!drag) controls.update();
       renderer.render(scene, camera);
+      callMarkers.update(modelCalls.current,callOptions.current.callSelection?.id,trailVisible.current,
+        camera,world,element.clientWidth,element.clientHeight);
       frameId = requestAnimationFrame(animate);
     };
     animate();
@@ -367,6 +389,7 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, sh
       resize.disconnect();
       controls.dispose();
       movementZones.dispose();
+      callMarkers.dispose();
       trailGeometry.dispose();
       trailMaterial.dispose();
       outline.geometry.dispose();

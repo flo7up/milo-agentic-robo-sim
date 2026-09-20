@@ -8,7 +8,8 @@ import { LocalModelProgress } from './LocalModelProgress';
 import { usePreference, useSavePreferences } from './Preferences';
 import { RobotControlSlot } from './RobotControlSurface';
 import { MemoryControls } from './MemoryControls';
-import type { LiveState, Reasoning, SpatialTelemetry } from './types';
+import { RunConversation } from './RunConversation';
+import type { LiveState, Reasoning, SpatialTelemetry, ModelCallSelection } from './types';
 
 function normalizedEndpoint(value: string) {
   try {
@@ -33,12 +34,13 @@ function TokenCounter({ agent, connected }: { agent: LiveState['agent']; connect
   </div>;
 }
 
-export function LunaNavigationControl({ state, connected, request, commandHost, settingsHost, spatialTelemetry, telemetryContent, robotAccess }: {
+export function LunaNavigationControl({ state, connected, request, commandHost, settingsHost, spatialTelemetry, telemetryContent, robotAccess, callSelection, onSelectCall }: {
   state: LiveState; connected: boolean; request: (path: string, body?: unknown) => Promise<unknown>; commandHost: HTMLElement | null;
   settingsHost?:HTMLElement | null;
   spatialTelemetry?:SpatialTelemetry | null;
   telemetryContent?:ReactNode;
   robotAccess?:ReactNode;
+  callSelection?:ModelCallSelection;onSelectCall?:(id:string)=>void;
 }) {
   const agent = state.agent;
   const kitchenSearch = state.challenge?.id === 'flat_kitchen';
@@ -60,9 +62,12 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
   const setGoal = (value: string) => setGoals(previous => ({...previous, [goalKey]: value}));
   const [interval, setInterval] = usePreference('interval', .25);
   const kitchenBudget = kitchenSearch && unified;
-  const [turns, setTurns] = usePreference(kitchenBudget ? 'kitchen_turns' : 'turns', kitchenBudget ? 60 : 80);
-  const [maxRequests, setMaxRequests] = usePreference(kitchenBudget ? 'kitchen_max_model_requests' : 'max_model_requests', kitchenBudget ? 60 : 12);
-  const [maxTokens, setMaxTokens] = usePreference(kitchenBudget ? 'kitchen_max_model_tokens' : 'max_model_tokens', kitchenBudget ? 400000 : 100000);
+  const mazeBudget = unified && ['maze', 'maze_complex'].includes(state.challenge?.id ?? '');
+  const maximumTurns = mazeBudget ? 200 : 80;
+  const maximumMissionSeconds = mazeBudget ? 600 : 300;
+  const [turns, setTurns] = usePreference(mazeBudget ? 'maze_turns' : kitchenBudget ? 'kitchen_turns' : 'turns', mazeBudget ? 200 : kitchenBudget ? 60 : 80);
+  const [maxRequests, setMaxRequests] = usePreference(mazeBudget ? 'maze_max_model_requests' : kitchenBudget ? 'kitchen_max_model_requests' : 'max_model_requests', mazeBudget ? 200 : kitchenBudget ? 60 : 12);
+  const [maxTokens, setMaxTokens] = usePreference(mazeBudget ? 'maze_max_model_tokens' : kitchenBudget ? 'kitchen_max_model_tokens' : 'max_model_tokens', mazeBudget ? 1500000 : kitchenBudget ? 400000 : 100000);
   const [preferredReasoning, setReasoning] = usePreference('reasoning', 'high');
   const reasoning = useLocalModel ? 'none' : luna?.reasoning_efforts.includes(preferredReasoning) ? preferredReasoning : luna?.reasoning_efforts[0] ?? 'high';
   const taskSupervisorReasoning = luna?.reasoning_efforts.includes('low') ? 'low' : luna?.reasoning_efforts[0] ?? 'none';
@@ -118,7 +123,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     try {await navigator.clipboard.writeText(recording!.run_directory!); setRecordingMessage('Recording path copied');}
     catch {setRecordingError('Could not copy the recording path');}
   }
-  const [explorationBudget, setExplorationBudget] = usePreference('exploration_budget', 180);
+  const [explorationBudget, setExplorationBudget] = usePreference(mazeBudget ? 'maze_mission_budget' : 'exploration_budget', mazeBudget ? 600 : 180);
   const [mapContext, setMapContext] = usePreference('mission_map_context', true);
   const [capabilities, setCapabilities] = useState<{ready: boolean; localSupervisor?:boolean; architecture?: {name:string;version:string;revision:string}}>({ready:false});
   useEffect(() => {
@@ -162,6 +167,12 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
   const [telemetrySelected, setTelemetrySelected] = useState(false);
   const inspector = telemetrySelected ? 'telemetry' : savedInspector === 'settings' ? 'conversation' : savedInspector;
   const [consoleMinimized, setConsoleMinimized] = useState(false);
+  useEffect(()=>{
+    if(callSelection?.from==='path') {
+      setConsoleMinimized(false);
+      selectInspector('conversation');
+    }
+  },[callSelection]);
   const [connectionOpen, setConnectionOpen] = usePreference('connection_open', !luna?.configured);
   const [runSettingsOpen, setRunSettingsOpen] = usePreference('run_settings_open', false);
   const [instructionsOpen, setInstructionsOpen] = useState(false);
@@ -196,9 +207,9 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     || (!localOnly && (!selectedModel?.configured || selectedConnectionChanged || (useLocalModel && !localModelReady)))
     || (hybrid && !luna?.configured)
     || !Number.isInteger(maxRequests) || maxRequests < 1 || maxRequests > 200 || !Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 2000000
-    || (unified && (!capabilities.ready || !Number.isFinite(explorationBudget) || explorationBudget < 5 || explorationBudget > 300))
+    || (unified && (!capabilities.ready || !Number.isFinite(explorationBudget) || explorationBudget < 5 || explorationBudget > maximumMissionSeconds))
     || (!unified && ((continuous && backend === 'builtin' && aiRoutes && !supportsAiRoutes) || (backend === 'nav2' && !nav2.ready)))
-    || !Number.isInteger(turns) || turns < 1 || turns > 80 || !Number.isFinite(interval) || interval < .25 || interval > 30;
+    || !Number.isInteger(turns) || turns < 1 || turns > maximumTurns || !Number.isFinite(interval) || interval < .25 || interval > 30;
   const stopInstruction = ['stop','pause','halt','cancel'].includes(instruction.trim().toLowerCase().replace(/[.!]+$/, ''));
   const instructionUnavailable = !connected ? 'Disconnected' : state.power?.on === false ? 'Robot is off'
     : state.regression?.active && !stopInstruction ? 'Stop the regression baseline before sending an instruction'
@@ -440,17 +451,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
     {telemetryContent}
     </div>
     <div id="panel-conversation" role="tabpanel" aria-labelledby="inspector-conversation" hidden={inspector !== 'conversation'}>
-    <section className="chat-section" aria-label="Run chat">
-      <div className="panel-header"><h3><MessageSquare size={17} />Run chat</h3></div>
-      <div className="chat-transcript" role="log" aria-label="Run conversation" tabIndex={0}>
-        {!hasRun && !agent.run_messages?.length && <p className="empty">No messages yet.</p>}
-        {(agent.run_messages ?? []).map(message => <article key={message.id} className={`chat-message chat-${message.role}`}>
-          <strong>{message.role === 'user' ? 'You' : message.source === 'model' ? agent.configuration.models.find(model=>model.id===agent.model_id)?.label ?? modelName : 'Controller'} / {message.status}</strong>
-          <p>{message.text}</p></article>)}
-        {hasRun && agent.goal && !agent.run_messages?.some(message=>message.role==='user' && message.text===agent.goal) &&
-          <article className="chat-message chat-user"><strong>You / mission instruction</strong><p>{agent.goal}</p></article>}
-      </div>
-    </section>
+    <RunConversation state={state} selection={callSelection} onSelect={onSelectCall} visible={inspector==='conversation' && !consoleMinimized}/>
     </div>
     <div id="panel-trace" role="tabpanel" aria-labelledby="inspector-trace" hidden={inspector !== 'trace'}>
     <ExchangeFeed agent={agent} visible={inspector === 'trace' && !consoleMinimized} />
@@ -504,7 +505,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
         <label>Supervisor reasoning<select aria-label="Supervisor reasoning" value={reasoning} disabled={agent.active || pending}
           onChange={event => setReasoning(event.target.value as Reasoning)}>
           {(useLocalModel ? ['none'] : luna?.reasoning_efforts ?? ['low', 'medium', 'high']).map(effort => <option value={effort} key={effort}>{effort}</option>)}</select></label>
-        <label>Supervisor turn limit<input aria-label="Supervisor turn limit" type="number" min={1} max={80} value={turns}
+        <label>Supervisor turn limit<input aria-label="Supervisor turn limit" type="number" min={1} max={maximumTurns} value={turns}
           disabled={agent.active || pending} onChange={event => setTurns(Number(event.target.value))} /></label>
         <label>Luna request limit<input aria-label="Luna request limit" type="number" min={1} max={200} value={maxRequests}
           disabled={agent.active || pending} onChange={event => setMaxRequests(Number(event.target.value))} /></label>
@@ -522,7 +523,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
           title="Checked using reported usage after each request; one response may cross this threshold."
           disabled={agent.active || pending} onChange={event => setMaxTokens(Number(event.target.value))} /></label>
         </div>
-        {unified && <label>Mission budget (s)<input aria-label="Mission budget" type="number" min={5} max={300} value={explorationBudget}
+        {unified && <label>Mission budget (s)<input aria-label="Mission budget" type="number" min={5} max={maximumMissionSeconds} value={explorationBudget}
           disabled={agent.active || pending} onChange={event=>setExplorationBudget(Number(event.target.value))}/></label>}
         {!continuous && <label>Local feedback interval (s)<input aria-label="Feedback interval (s)" type="number" min={.25} max={30} step={.25}
           value={interval} onChange={event => setInterval(Number(event.target.value))} /></label>}

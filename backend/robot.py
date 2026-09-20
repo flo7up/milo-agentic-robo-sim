@@ -66,7 +66,8 @@ def build_robot():
         joint(name + "_support", "base", name + "_support", (forward, 0, -.12), kind="fixed")
     link("torso", (.14, .18, .24), 1.1, accent, center=(-.04, 0, .12))
     joint("torso_fixed", "base", "torso", (0, 0, .08), kind="fixed")
-    link("neck", (.065, .065, .10), .12, dark, center=(0, 0, .05))
+    # Reach below the yaw pivot into the torso while retaining the head's height.
+    link("neck", (.065, .065, .14), .12, dark, center=(0, 0, .03))
     joint("head_yaw", "torso", "neck", (-.04, 0, .27), limits=(-1.5, 1.5), force=5)
     link("head", (.16, .22, .13), .35, shell)
     joint("head_pitch", "neck", "head", (0, 0, .10), (0, 1, 0), (-.7, 1.15), force=5)

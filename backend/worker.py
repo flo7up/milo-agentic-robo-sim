@@ -96,6 +96,7 @@ class SimulationWorker:
         self.epoch = epoch
         self.scene = scene
         self.challenge = challenge
+        self.arrival_completed = False
         self.rendering = rendering
         self.render_resources = render_resources
         self.owns_render_resources = render_resources is None
@@ -205,6 +206,7 @@ class SimulationWorker:
 
     @timed("publication.physics")
     def _publish(self):
+        self._stop_on_arrival()
         self._record_map_pose()
         trail = getattr(self, "mission_trail", None)
         if trail is not None and self.home_mission and self.home_mission.mission_owner == self.mission_trail_owner:
@@ -351,6 +353,15 @@ class SimulationWorker:
                     self.continuous.status, self.continuous.reason = "blocked", f"Execution stopped: {type(error).__name__}"
         self._publish_navigation()
 
+    def _stop_on_arrival(self):
+        status = self.sim.challenge_status()
+        if (not self.arrival_completed and self.challenge and self.challenge.complete_on_arrival
+                and status and status["status"] == "completed"):
+            self.arrival_completed = True
+            self.stop()  # Revoke queued motion and outstanding model decisions.
+            self.sim.hold_current()
+            self.latest = {**self.latest, "challenge": status}
+
     def _run(self):
         try:
             self.sim = BulletSimulation(epoch=self.epoch, scene=self.scene, challenge=self.challenge, rendering=self.rendering)
@@ -374,6 +385,7 @@ class SimulationWorker:
             self.sim.on_tick = self._publish
             self.ready.set_result(True)
             while True:
+                self._stop_on_arrival()
                 if self.home_mission:
                     self.home_mission.tick()
                 self.motion_throughput.observe(self.sim.ticks * TIMESTEP, time.monotonic(),

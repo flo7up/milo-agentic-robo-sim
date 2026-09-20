@@ -167,23 +167,23 @@
   </joint>
   <link name="neck">
     <inertial>
-      <origin xyz="0 0 0.05" rpy="0 0 0" />
+      <origin xyz="0 0 0.03" rpy="0 0 0" />
       <mass value="0.12" />
-      <inertia ixx="0.00014225000000000002" iyy="0.00014225000000000002" izz="8.450000000000001e-05" ixy="0" ixz="0" iyz="0" />
+      <inertia ixx="0.00023825" iyy="0.00023825" izz="8.450000000000001e-05" ixy="0" ixz="0" iyz="0" />
     </inertial>
     <visual>
-      <origin xyz="0 0 0.05" rpy="0 0 0" />
+      <origin xyz="0 0 0.03" rpy="0 0 0" />
       <geometry>
-        <box size="0.065 0.065 0.1" />
+        <box size="0.065 0.065 0.14" />
       </geometry>
       <material name="neck_paint">
         <color rgba="0.13 0.17 0.18 1" />
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 0.05" rpy="0 0 0" />
+      <origin xyz="0 0 0.03" rpy="0 0 0" />
       <geometry>
-        <box size="0.065 0.065 0.1" />
+        <box size="0.065 0.065 0.14" />
       </geometry>
     </collision>
   </link>

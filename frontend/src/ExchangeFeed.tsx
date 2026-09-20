@@ -233,6 +233,7 @@ export function ExchangeFeed({ agent, visible = true }: { agent: AgentState; vis
         revision: feed.revision, first_id: feed.first_id, capacity: feed.capacity,
         earlier_events_discarded: feed.first_id > 1,
         image_note: 'Camera URLs reference this local session; image pixels are not embedded.',
+        model_calls: agent.model_calls ?? [],
         events: copiedEntries,
       }, null, 2));
       if (cursor.current.sessionId === sessionId) setCopyMessage(`Copied ${copiedEntries.length} exchanges`);
@@ -269,7 +270,7 @@ export function ExchangeFeed({ agent, visible = true }: { agent: AgentState; vis
           <div className="exchange-icon"><Icon size={16} /></div>
           <div className="exchange-body">
             <div className="exchange-heading"><span className="exchange-direction">{channel.from}{channel.to && <><ArrowRight size={12} aria-hidden="true" /><span>{channel.to}</span></>}</span><span className="exchange-turn">Turn {entry.turn}</span><time dateTime={new Date(entry.timestamp * 1000).toISOString()}>{new Date(entry.timestamp * 1000).toLocaleTimeString('en-GB', { hour12: false })}</time></div>
-            <strong className="exchange-title">{entry.title}</strong>
+            <strong className="exchange-title">{agent.model_calls?.find(call=>call.id===entry.model_call_id) && <span className="model-call-inline">#{agent.model_calls.find(call=>call.id===entry.model_call_id)!.number} </span>}{entry.title}</strong>
             <span className={`exchange-preview ${entry.kind === 'result' && entry.payload.result.status !== 'ok' ? 'bad' : ''}`}>{entryPreview(entry)}</span>
           </div>
           <ChevronRight className="disclosure-chevron" size={15} />

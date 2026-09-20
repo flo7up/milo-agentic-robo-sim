@@ -82,7 +82,7 @@ export type ModelProfile = { id: string; label: string; deployment: string; prov
 export type AgentAction = { turn: number; tool: string; arguments: unknown; status: string; error: string | null; message: string; actual_duration_s: number; observation_seq: number; odometry_delta_m_rad?: number[] | null };
 export type CollisionFeedback = { source: 'current' | 'during_action'; contacts: { direction: string; force_n?: number }[]; guidance: string };
 export type ExchangeEntry = {
-  id: number; title: string; timestamp: number; turn: number; image_url: string | null; image_urls?: string[];
+  id: number; title: string; timestamp: number; turn: number; image_url: string | null; image_urls?: string[]; model_call_id?:string;
 } & (
   { kind: 'session'; payload: { model?: string; deployment?: string; reasoning?: string; goal?: string; instructions?: string; tools?: unknown[]; feedback_interval_s?: number; max_turns?: number; status?: string; message?: string; reason?: string } } |
   { kind: 'feedback'; payload: { observation: Observation; observed_map_snapshot?:{age_s:number;capture_clock?:string;age_basis?:string;geometry_age_s?:number | null;geometry_age_basis?:string;frame?:string;revision?:number | string}; image_roles?: string[]; image_detail: string; history_turns: number[]; input_items: number; images_in_request: number; tool_result_call_ids: string[]; context_mode?: string; memory_frame_seq?: number | null; recent_actions?: Partial<AgentAction>[]; collision_feedback?: CollisionFeedback | null; images_per_request?: number; context_tokens?: number; retained_context_tokens_estimate?: number; context_estimator?: string; camera_frames?: { seq: number; frame_ref: string; simulated_time_s: number; wall_timestamp: number; current: boolean }[]; camera_history?: { frames: { frame_id: string; simulated_time_s: number }[] }; historical_original?: { frame_id: string; simulated_time_s: number } | null } } |
@@ -92,7 +92,14 @@ export type ExchangeEntry = {
   { kind: 'result'; payload: { tool: string; call_id: string; result: Partial<Result> & { status: string; sensor_deltas?: unknown }; model_result?: Record<string, unknown> & { collision_feedback?: CollisionFeedback } } }
 );
 export type ExchangeFeed = { session_id: string | null; revision: number; first_id: number; capacity: number; events: ExchangeEntry[] };
+export type ModelCall = {
+  id:string; number:number; session_id:string; run_id:string; episode_epoch:number; turn:number;
+  model:string; kind:'decision'|'task_supervision'; timestamp:number; simulated_time_s:number | null;
+  position_world_m:[number,number] | null; status:'thinking'|'responded'|'failed'|'cancelled'; summary:string;
+};
+export type ModelCallSelection = {id:string; from:'path'|'chat'; revision:number} | null;
 export type AgentState = {
+  model_calls?:ModelCall[];
   inference_budget?: {requests: number; tokens: number; max_requests: number; max_tokens: number; usage_unknown: boolean};
   task_supervision?: {model_id:string;requests:number;tokens:number;input_tokens:number;output_tokens:number;
     max_requests:number;max_tokens:number;usage_unknown:boolean;status:string;guidance:string;operational_authority?:false;motion_authorized?:false} | null;
@@ -102,7 +109,7 @@ export type AgentState = {
     plan: {kind: string; target: string; return_home: boolean} | null; receipts: Record<string, unknown>} | null;
   execution_mode: ExecutionMode;
   navigation_backend?: 'builtin' | 'nav2';
-  run_messages?: {id:string;role:'user'|'assistant';text:string;status:string;source?:string}[];
+  run_messages?: {id:string;role:'user'|'assistant';text:string;status:string;source?:string;timestamp?:number;model_call_id?:string}[];
   run_memory?: {revision:number;visited_positions_m:number[][];inspected_heading_sectors_here:number[];
     rotation_without_translation_rad:number;recent_actions:{action:string;status:string;distance_m:number;turn_rad:number;reason:string}[];
     progress?:{stagnant_actions:number;recovery_needed:boolean;recovery_attempts:number;recovery_limit:number}};

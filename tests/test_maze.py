@@ -83,22 +83,105 @@ def test_maze_is_connected_with_branches_dead_ends_and_one_hidden_exit(identifie
 
 @pytest.mark.parametrize("identifier,start,bay", [("maze", [-2.7, -2.7], [4.5, 2.7]),
                                                  ("maze_complex", [-4.5, -4.5], [6.3, 4.5])])
-def test_maze_requires_whole_robot_outside_and_uninterrupted_stationary_dwell(identifier, start, bay):
+def test_maze_completes_on_grounded_center_arrival_and_retains_success(identifier, start, bay):
     progress = ChallengeProgress(get_challenge(identifier))
-    inside, threshold, partial = ([bay[0] - offset, bay[1]] for offset in (1.8, .9, .5))
-    elapsed = 0.
-    for center, invalid in ((start, {}), (inside, {}), (threshold, {}),
-                            (partial, {}), (bay, {"speed": .1}),
-                            (bay, {"angular_speed": .2}), (bay, {"grounded": False})):
-        elapsed += 2
-        assert progress.update({"robot": {**robot_measurement(center), **invalid}}, set(), elapsed)["status"] == "in_progress"
-    parked = {"robot": robot_measurement(bay)}
-    assert progress.update(parked, set(), elapsed + .5)["status"] == "in_progress"
-    assert progress.update(parked, set(), elapsed + .5)["status"] == "in_progress"
-    assert progress.update({"robot": robot_measurement(threshold)}, set(), elapsed + .6)["status"] == "in_progress"
-    assert progress.update(parked, set(), elapsed + 1.1)["status"] == "in_progress"
-    assert progress.update(parked, set(), elapsed + 1.7)["status"] == "completed"
-    assert progress.update({"robot": robot_measurement(threshold)}, set(), elapsed + 1.8)["status"] == "in_progress"
+    def measured(center, **overrides):
+        return {"robot": {**robot_measurement(center), "position_xy": center, **overrides}}
+
+    # Seeing/crossing the doorway and merely overlapping a bay edge do not count.
+    for center in (start, [bay[0] - .9, bay[1]], [bay[0] - .601, bay[1]],
+                   [bay[0] + .601, bay[1]], [bay[0], bay[1] - .651], [bay[0], bay[1] + .651]):
+        assert progress.update(measured(center), set())["status"] == "in_progress"
+    assert progress.update(measured(bay, grounded=False), set())["status"] == "in_progress"
+    # Entry is enough while moving, without whole-body containment or a wait.
+    arrival = [bay[0] - .599, bay[1]]
+    status = progress.update(measured(arrival, speed=.3, angular_speed=.2), set())
+    assert status["status"] == "completed" and status["completed_objectives"] == 1
+    assert progress.update(measured(start), set(), 10.) == status
+    reset = ChallengeProgress(get_challenge(identifier))
+    assert reset.update(measured(start), set())["status"] == "in_progress"
+
+
+@pytest.mark.parametrize("identifier", ["maze", "maze_complex"])
+async def test_maze_worker_stops_a_drive_on_arrival_and_revokes_late_motion(identifier):
+    import asyncio
+    from backend.contracts import Command
+    from backend.worker import SimulationWorker
+
+    challenge = get_challenge(identifier)
+    bay = challenge.objectives[0].center
+    challenge.initial_xy = [bay[0] - .9, bay[1]]  # Scripted fixture at the doorway.
+    worker = SimulationWorker(challenge=challenge, rendering="tiny", pace=False)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        before = worker.stop_revision
+        def drive(identity):
+            return Command(run_id=worker.latest["run_id"], episode_epoch=worker.epoch,
+                observation_seq=worker.latest["observation"]["seq"], action_id=identity,
+                tool="drive_base", arguments={"linear_mps": .3, "angular_radps": 0, "duration_s": 2})
+        result = await worker.execute(drive("enter-bay"), assisted=False)
+        assert result.status == "cancelled" and result.actual_duration_s < 2., result
+        assert worker.arrival_completed and worker.latest["stopped"]
+        assert worker.latest["challenge"]["status"] == "completed"
+        assert worker.stop_revision > before
+        position = await worker.call(lambda sim: bullet.getBasePositionAndOrientation(sim.robot, physicsClientId=sim.client)[0])
+        assert bay[0] - .6 <= position[0] < bay[0] - .5
+        ticks = worker.sim.ticks
+        assert (await worker.execute(drive("late-drive"), assisted=False)).status == "cancelled"
+        assert worker.sim.ticks == ticks
+    finally:
+        await worker.close()
+
+
+@pytest.mark.parametrize("unified", [False, True])
+async def test_maze_arrival_cancels_pending_inference_and_reports_physics_success(tmp_path, unified):
+    import asyncio
+    from backend.contracts import Command
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
+
+    class LateModel(ScriptedModel):
+        async def respond(self, *args):
+            try:
+                return await super().respond(*args)
+            except asyncio.CancelledError:
+                return model_response()  # A late decision must never move the robot.
+
+    challenge = get_challenge("maze_complex")
+    bay = challenge.objectives[0].center
+    challenge.initial_xy = [bay[0] - .9, bay[1]]
+    worker = SimulationWorker(challenge=challenge, rendering="tiny", pace=False)
+    model = LateModel(["wait"])
+    controller = controller_for(model)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        if unified:
+            worker.home_mission = HomeMission(worker, MapStore(tmp_path / "arrival.sqlite3"))
+        controller.start(worker, start_settings(worker, unified_mission=unified,
+            execution_mode="luna_continuous" if unified else "single_step", compact_arms=True,
+            max_turns=5, mission_budget_s=30, images_per_request=2))
+        await asyncio.wait_for(model.entered.wait(), 20)
+        # Scripted physical crossing while inference is pending; no goal coordinates enter model inputs.
+        await worker.execute(Command(run_id=worker.latest["run_id"], episode_epoch=worker.epoch,
+            observation_seq=worker.latest["observation"]["seq"], action_id="inference-crossing", tool="drive_base",
+            arguments={"linear_mps": .3, "angular_radps": 0, "duration_s": 2}), assisted=False)
+        await asyncio.wait_for(controller.task, 5)
+        assert worker.latest["challenge"]["status"] == "completed"
+        assert controller.state["phase"] == "completed" and controller.state["error"] is None
+        assert controller.state["outcome"]["kind"] == "completed"
+        assert controller.state["outcome"]["source"] == "physics"
+        assert model.closed and len(model.inputs) == 1 and not controller.active
+        assert not controller.state["auto_wake"] and controller.idle_task is None
+        if unified:
+            assert controller.mission.phase == "completed"
+        ticks = worker.sim.ticks
+        await asyncio.sleep(.1)
+        assert worker.sim.ticks == ticks
+    finally:
+        await controller.halt()
+        await worker.close()
 
 
 def test_complex_maze_dead_end_backtracking_and_long_exit_route_are_physically_feasible():

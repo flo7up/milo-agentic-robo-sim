@@ -133,7 +133,7 @@ export function detailRobotVisual(mesh: THREE.Mesh, asset: Geometry) {
         spoke.rotation.z = angle;
       }
     }
-  } else if (asset.type === 3 && near(width, .065) && near(height, .1)) {
+  } else if (asset.type === 3 && near(width, .065) && near(depth, .065)) {
     for (const offset of [-.03, -.01, .01, .03]) {
       panel([.066, .066, .006], [0, 0, offset], alloy, 'neck-collar');
     }

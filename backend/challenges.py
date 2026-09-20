@@ -71,6 +71,10 @@ class Challenge(StrictModel):
     movement_program: list[MovementStep] = Field(default_factory=list)
     floor_size_m: Annotated[list[Annotated[float, Field(ge=4, le=20)]], Field(min_length=2, max_length=2)] = Field(default_factory=lambda: [6, 6])
 
+    @property
+    def complete_on_arrival(self):
+        return self.id in {"maze", "maze_complex"}
+
     def public(self):
         return {"id": self.id, "environment": self.environment, "title": self.title, "skill": self.skill, "goal": self.goal,
             "objectives": [objective.label for objective in self.objectives], "suggested_turn_limit": self.suggested_turn_limit,
@@ -133,10 +137,10 @@ def maze_challenge():
     ])
     return Challenge(id="maze", title="Maze", skill="Exploration, dead-end recovery and exit finding", difficulty="Advanced",
         floor_size_m=[12, 10], initial_xy=[-2.7, -2.7], initial_head_pitch=.15, suggested_turn_limit=160,
-        goal="Explore the maze and find the green exit doorway. Discover the route using your camera and sensors, remember junctions and backtrack from dead ends. Drive through the doorway and park with your entire base and both wheels in the green bay outside the maze. Stop and wait for one simulated second. Keep your arms folded and avoid the walls. Seeing the exit alone does not complete the task.",
-        objects=objects, ordered_objectives=True,
-        objectives=[Objective(label="Leave the maze and stop fully in the green exit bay for 1 second", body="robot",
-            center=[4.5, 2.7, 0], size=[1.2, 1.3], color=green, require_lift=False, dwell_s=1)])
+        goal="Explore the maze and find the green exit doorway. Discover the route using your camera and sensors, remember junctions and backtrack from dead ends. Drive through the doorway into the green destination area outside the maze. The scenario completes and stops automatically when the center of your grounded base enters that area. Keep your arms folded and avoid the walls. Seeing the exit alone does not complete the task.",
+        objects=objects,
+        objectives=[Objective(label="Reach the green destination area outside the maze", body="robot",
+            center=[4.5, 2.7, 0], size=[1.2, 1.3], color=green, require_lift=False)])
 
 
 def complex_maze_challenge():
@@ -205,10 +209,10 @@ def complex_maze_challenge():
     ])
     return Challenge(id="maze_complex", title="Maze — Complex", skill="Exploration, loop recognition, backtracking and exit finding", difficulty="Advanced",
         floor_size_m=[16, 14], initial_xy=[-4.5, -4.5], initial_head_pitch=.15, suggested_turn_limit=160,
-        goal="Explore the larger maze and find the green exit doorway. Use your camera, sensors and movement memory to distinguish new passages from loops, remember junctions and backtrack from dead ends. Drive through the doorway and park with your entire base and both wheels in the green bay outside the maze. Stop and wait for one simulated second. Keep your arms folded and avoid the walls. Seeing the exit alone does not complete the task.",
-        objects=objects, ordered_objectives=True,
-        objectives=[Objective(label="Leave the complex maze and stop fully in the green exit bay for 1 second", body="robot",
-            center=[6.3, 4.5, 0], size=[1.2, 1.3], color=green, require_lift=False, dwell_s=1)])
+        goal="Explore the larger maze and find the green exit doorway. Use your camera, sensors and movement memory to distinguish new passages from loops, remember junctions and backtrack from dead ends. Drive through the doorway into the green destination area outside the maze. The scenario completes and stops automatically when the center of your grounded base enters that area. Keep your arms folded and avoid the walls. Seeing the exit alone does not complete the task.",
+        objects=objects,
+        objectives=[Objective(label="Reach the green destination area outside the complex maze", body="robot",
+            center=[6.3, 4.5, 0], size=[1.2, 1.3], color=green, require_lift=False)])
 
 
 PRESETS = {
@@ -955,6 +959,19 @@ class ChallengeProgress:
         return self.status
 
     def update(self, measurements, held, simulated_time_s=0, travel_m=0):
+        if self.challenge.complete_on_arrival:
+            # Arrival is an episode result, retained even if the robot later leaves.
+            if self.status and self.status["status"] == "completed":
+                return self.status
+            objective = self.challenge.objectives[0]
+            measurement = measurements[objective.body]
+            inside = all(abs(measurement["position_xy"][axis] - objective.center[axis]) <= objective.size[axis] / 2
+                         for axis in (0, 1))
+            complete = inside and measurement["grounded"]
+            self.status = {**self.challenge.public(), "status": "completed" if complete else "in_progress",
+                "completed_objectives": int(complete), "progress": [{"label": objective.label, "complete": complete,
+                    "detail": "Destination reached" if complete else "Enter the green destination area"}]}
+            return self.status
         if self.challenge.movement_program:
             return self._update_movement(measurements["robot"], simulated_time_s)
         if self.challenge.orbit:

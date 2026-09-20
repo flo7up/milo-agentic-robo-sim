@@ -571,11 +571,14 @@ class BudgetedModel:
         if budget["requests"] >= budget["max_requests"] or budget["tokens"] >= budget["max_tokens"]:
             raise InferenceLimit("Luna task budget reached; robot returned to idle")
         budget["requests"] += 1
+        call = self.controller.model_calls.begin(self.worker, profile, self.session_id, self.controller.state["turns"], "decision")
         try:
             response = await self.model.respond(profile, reasoning, goal, inputs)
-        except BaseException:
+        except BaseException as error:
+            self.controller.model_calls.finish(call, status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed")
             budget["usage_unknown"] = True
             raise
+        self.controller.model_calls.finish(call, response)
         self.controller._check_live(self.worker, self.settings)
         if self.controller.state["session_id"] != self.session_id:
             raise asyncio.CancelledError
@@ -604,11 +607,14 @@ class BudgetedTaskSupervisor:
         if state["requests"] >= state["max_requests"] or state["tokens"] >= state["max_tokens"]:
             return None
         state["requests"] += 1
+        call = self.controller.model_calls.begin(self.worker, profile, self.session_id, self.controller.state["turns"], "task_supervision")
         try:
             response = await self.model.supervise_task(profile, self.settings.task_supervisor_reasoning, goal, inputs)
-        except BaseException:
+        except BaseException as error:
+            self.controller.model_calls.finish(call, status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed")
             state["usage_unknown"] = True
             raise
+        self.controller.model_calls.finish(call, response)
         self.controller._check_live(self.worker, self.settings)
         if self.controller.state["session_id"] != self.session_id:
             raise asyncio.CancelledError
@@ -646,7 +652,7 @@ class AgentStart(FeedbackRate):
     max_task_supervisor_requests: int = Field(default=4, ge=1, le=12)
     max_task_supervisor_tokens: int = Field(default=100000, ge=1, le=500000)
     map_context: bool = True
-    mission_budget_s: float = Field(default=180., ge=5, le=300)
+    mission_budget_s: float = Field(default=180., ge=5, le=600)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     images_per_request: int = Field(default=1, ge=1, le=8)
     context_tokens: int = Field(default=4096, ge=0, le=32768)
@@ -751,6 +757,8 @@ class AgentController:
         self.cancelled = False
         self.interruption_revision = 0
         self.run_messages = []
+        from backend.model_call_history import ModelCallHistory
+        self.model_calls = ModelCallHistory()
         from backend.navigation_memory import NavigationMemory
         self.navigation_memory = NavigationMemory()
         self.rate_changed = asyncio.Event()
@@ -786,6 +794,7 @@ class AgentController:
         state = {**self.state, "active": self.active or self.recording_active, "configuration": self.config.public(),
                  "mission": self.mission.state() if self.mission else None,
                  "run_messages": list(self.run_messages),
+                 "model_calls": list(self.model_calls.calls),
                  "run_memory": self.navigation_memory.summary(),
                  "trace_revision": self.trace_revision}
         if self.active and state.get("local_model") and self.local_started is not None:
@@ -802,6 +811,8 @@ class AgentController:
         self.trace_revision += 1
         entry = {"id": self.trace_revision, "kind": kind, "title": title, "timestamp": time.time(),
                  "turn": self.state["turns"], "payload": payload, "image_url": None}
+        if kind == "response" and self.model_calls.calls:
+            entry["model_call_id"] = self.model_calls.calls[-1]["id"]
         if image is not None:
             self.trace_images[entry["id"]] = image
             entry["image_url"] = f"/api/agent/trace/{self.state['session_id']}/{entry['id']}/frame"
@@ -817,6 +828,7 @@ class AgentController:
 
     def trace(self, after=0):
         return {"session_id": self.state["session_id"], "revision": self.trace_revision,
+                "model_calls": list(self.model_calls.calls),
                 "first_id": next(iter(self.trace_records), self.trace_revision + 1),
                 "capacity": self.trace_capacity,
                 "events": [entry for identifier, entry in self.trace_records.items() if identifier > after]}
@@ -957,6 +969,8 @@ class AgentController:
                           if settings.task_supervisor_model_id else None),
                       "auto_wake": False, "idle_reason": None, "idle_since": None, "camera_unchanged_s": 0, "wake_reason": None, "outcome": None}
         self.trace_records.clear()
+        from backend.model_call_history import ModelCallHistory
+        self.model_calls = ModelCallHistory()
         self.trace_images.clear()
         self.trace_image_batches.clear()
         self.trace_revision = 0
@@ -1034,8 +1048,10 @@ class AgentController:
         self.rate_changed.set()
 
     def navigation_reply(self, text, source="model"):
+        call = self.model_calls.calls[-1] if self.model_calls.calls else None
+        reference = {"model_call_id": call["id"]} if source == "model" and call and call["kind"] == "decision" else {}
         self.run_messages = [*self.run_messages[-39:], {"id": str(uuid4()), "role": "assistant", "source": source,
-            "text": text[:2000], "status": "reported", "timestamp": time.time()}]
+            "text": text[:2000], "status": "reported", "timestamp": time.time(), **reference}]
 
     async def redirect(self, worker, instruction: RunInstruction):
         if (not self.active or worker is not self.worker or self.state["execution_mode"] not in {"luna_navigation", "luna_continuous"}
@@ -1308,6 +1324,15 @@ class AgentController:
             self.recording_active = False
             self.recording_finished.set()
 
+    def _arrival_completed(self, worker, settings):
+        return (worker.arrival_completed and worker.latest.get("run_id") == settings.run_id
+            and worker.latest.get("episode_epoch") == settings.episode_epoch)
+
+    async def _watch_arrival(self, worker, settings, task):
+        while not self._arrival_completed(worker, settings):
+            await asyncio.sleep(.05)
+        task.cancel()
+
     async def _run_controller(self, worker, settings, profile, stop_revision):
         model = None
         task_supervisor = None
@@ -1317,8 +1342,13 @@ class AgentController:
         pending_command = None
         pending_call_id = None
         idle_reason = None
+        arrival_monitor = None
         try:
             self.state["outcome"] = None
+            if worker.challenge and worker.challenge.complete_on_arrival:
+                if self._arrival_completed(worker, settings):
+                    raise asyncio.CancelledError
+                arrival_monitor = asyncio.create_task(self._watch_arrival(worker, settings, asyncio.current_task()))
             if settings.unified_mission:
                 from backend.mission_supervisor import run as run_mission
                 model = None if settings.mission_local_only else self.budgeted_model(worker, settings)
@@ -1629,6 +1659,14 @@ class AgentController:
             self._trace("session", "Internal controller failure", {**details, "status": "error", "message": f"{details['type']} at {details['file']}:{details['line']}; reference {reference}"})
             self.state.update(phase="error", error=f"Internal controller error ({type(error).__name__}, reference {reference}); robot stopped.")
         finally:
+            if arrival_monitor:
+                arrival_monitor.cancel()
+                await asyncio.gather(arrival_monitor, return_exceptions=True)
+            if self._arrival_completed(worker, settings):
+                self.state.update(phase="completed", error=None, message="Destination reached; scenario completed")
+                self._set_outcome("completed", self.state["message"], "physics")
+                if self.state.get("local_model"):
+                    self.state["local_model"].update(phase="completed", success=True)
             if settings.unified_mission and worker.home_mission:
                 await worker.finish_mission(self.mission.identity)
             if self.state.get("local_model"):
