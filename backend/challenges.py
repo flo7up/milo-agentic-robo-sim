@@ -8,7 +8,7 @@ from backend.movement import MovementStep
 
 
 ChallengeId = Literal["bench", "park", "park_left", "park_right", "park_far", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery",
-                      "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "movement_practice"]
+                      "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "chair_circuit_far", "movement_practice"]
 Vector3 = Annotated[list[float], Field(min_length=3, max_length=3)]
 
 
@@ -297,6 +297,8 @@ def furniture_circuit(target="table", direction="clockwise"):
 
 
 PRESETS["furniture_circuit"] = furniture_circuit()
+PRESETS["chair_circuit_far"] = furniture_circuit("chair", "clockwise").model_copy(deep=True, update={
+    "id": "chair_circuit_far", "title": "Circle the Chair: Farther Start", "initial_xy": [-.6, -2.5]})
 
 
 PRESETS["flat_kitchen"] = Challenge(

@@ -67,7 +67,8 @@ async def test_ollama_payload_history_privacy_and_tool_result_continuation(execu
         await adapter.close()
 
 
-async def test_ollama_unified_mission_uses_shared_scoped_contract_and_paired_images():
+@pytest.mark.parametrize("circuit", [False, True])
+async def test_ollama_unified_mission_uses_shared_scoped_contract_and_paired_images(circuit):
     from types import SimpleNamespace
     from backend.agent import FoundryModel, mission_model_contract
     from backend.mission_supervisor import instructions_for, local_response_schema, tools as mission_tools
@@ -82,6 +83,14 @@ async def test_ollama_unified_mission_uses_shared_scoped_contract_and_paired_ima
     brief = {"mission": {"plan": {"kind": "room", "completion": "identify"}},
         "available_actions": ["navigate_frontier", "wait"],
         "observation": {"spatial": {"frontiers": [{"frontier_id": "observed-1"}]}}}
+    candidate_ids = ["run:0:1:object-0"] if circuit else []
+    goal = "Circle the table clockwise" if circuit else "Find Kitchen"
+    if circuit:
+        brief["mission"]["plan"] = {"kind": "circuit", "target": "table", "circle_direction": "clockwise"}
+        brief["available_actions"] = ["circle", "look"]
+        brief["observation"]["spatial"]["object_candidates"] = [{"id": candidate_ids[0], "bounds": [.3, .1, .7, .7]}]
+        decision = {"action": "circle", "object_candidate_id": candidate_ids[0], "object_label": "table",
+            "evidence_text": "Flat top and legs", "circle_direction": "clockwise"}
     inputs = [{"role": "user", "content": [{"type": "input_text", "text": json.dumps(brief)}] + [
         {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(image).decode()}
         for image in (b"paired-head", b"observed-map")]}]
@@ -92,17 +101,20 @@ async def test_ollama_unified_mission_uses_shared_scoped_contract_and_paired_ima
         cloud = FoundryModel.__new__(FoundryModel)
         cloud.unified_mission = True
         cloud.client = SimpleNamespace(responses=SimpleNamespace(create=cloud_respond))
-        await cloud.respond(FoundryConfig().models[0], "low", "Find Kitchen", inputs)
-        assert cloud_payloads[0] == {"model": "gpt-5.6-luna", "instructions": instructions_for(brief) + "\nUser goal: Find Kitchen",
-            "input": inputs, "tools": mission_tools(brief["available_actions"], ["observed-1"]),
+        await cloud.respond(FoundryConfig().models[0], "low", goal, inputs)
+        assert cloud_payloads[0] == {"model": "gpt-5.6-luna", "instructions": instructions_for(brief) + "\nUser goal: " + goal,
+            "input": inputs, "tools": mission_tools(brief["available_actions"], ["observed-1"], candidate_ids),
             "parallel_tool_calls": False, "tool_choice": {"type": "function", "name": "guide_mission"},
             "reasoning": {"effort": "low"}, "max_output_tokens": 2048, "store": False}
-        response = await adapter.respond(FoundryConfig().models[2], "none", "Find Kitchen", inputs)
-        instructions, tools = mission_model_contract("Find Kitchen", inputs, structured=True)
+        response = await adapter.respond(FoundryConfig().models[2], "none", goal, inputs)
+        instructions, tools = mission_model_contract(goal, inputs, structured=True)
         payload = captured[0]
-        assert payload["format"] == local_response_schema(brief["available_actions"], ["observed-1"]) and "tools" not in payload
+        assert payload["format"] == local_response_schema(brief["available_actions"], ["observed-1"], candidate_ids) and "tools" not in payload
         assert [branch["properties"]["action"]["const"] for branch in payload["format"]["anyOf"]] == brief["available_actions"]
-        assert payload["format"]["anyOf"][0]["properties"]["frontier_id"]["enum"] == ["observed-1"]
+        selection_field = "object_candidate_id" if circuit else "frontier_id"
+        assert payload["format"]["anyOf"][0]["properties"][selection_field]["enum"] == (candidate_ids if circuit else ["observed-1"])
+        if circuit:
+            assert "object_bounds" not in payload["format"]["anyOf"][0]["properties"]
         assert payload["messages"][0]["content"].startswith(instructions)
         assert [base64.b64decode(image) for image in payload["messages"][-1]["images"]] == [b"paired-head", b"observed-map"]
         assert response.output[0].name == "guide_mission"

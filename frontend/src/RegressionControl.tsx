@@ -82,7 +82,7 @@ export function RegressionControl({state, connected, request}: {state:LiveState;
   request:(path:string,body?:unknown)=>Promise<unknown>}) {
   const suite=state.regression;
   const [expanded,setExpanded]=useState(false);
-  const [model,setModel]=useState('luna');
+  const [model,setModel]=useState('hybrid');
   const [reasoning,setReasoning]=useState<Reasoning>('none');
   const [pending,setPending]=useState(false);
   const [error,setError]=useState('');
@@ -98,7 +98,7 @@ export function RegressionControl({state, connected, request}: {state:LiveState;
     setPending(true);setError('');
     try {await request('regression/start',{run_id:state.run_id,episode_epoch:state.episode_epoch,
       model_id:model==='hybrid'?'qwen':model,reasoning:model==='hybrid'?'none':effectiveReasoning,
-      ...(model==='hybrid'?{task_supervisor_model_id:'luna'}:{})});
+      task_supervisor_model_id:model==='hybrid'?'luna':null});
       document.getElementById('observe')?.scrollIntoView({behavior:'smooth',block:'start'});}
     catch(failure){setError(String(failure));}
     finally{setPending(false);}

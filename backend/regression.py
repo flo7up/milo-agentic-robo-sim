@@ -35,9 +35,10 @@ CASES = (
 class RegressionStart(StrictModel):
     run_id: str = Field(min_length=1)
     episode_epoch: int = Field(ge=0)
-    model_id: Literal["luna", "qwen"] = "luna"
+    model_id: Literal["luna", "qwen"] = "qwen"
     reasoning: Literal["none", "low", "medium", "high"] = "none"
-    task_supervisor_model_id: Literal["luna"] | None = None
+    task_supervisor_model_id: Literal["luna"] | None = Field(
+        default_factory=lambda data: "luna" if data.get("model_id") == "qwen" else None)
 
     @model_validator(mode="after")
     def hybrid_contract(self):

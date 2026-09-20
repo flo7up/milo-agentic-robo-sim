@@ -37,7 +37,7 @@ const ranges: Record<string, [number, number]> = {interval: [.25, 30], turns: [1
 const booleans = new Set(['handoff', 'skill_composer', 'ai_routes', 'adaptive', 'connection_open', 'run_settings_open',
   'challenge_details_open', 'compact_arms', 'axes', 'manual_open', 'mission_map_context']);
 const scenarios = new Set(['bench', 'park', 'park_left', 'park_right', 'park_far', 'tidy', 'sort', 'recharge', 'apartment', 'kitchen_bathroom', 'clinic_delivery',
-  'warehouse', 'inspection', 'workshop', 'local_park', 'pedestrian_crossing', 'flat_kitchen', 'furniture_circuit', 'movement_practice']);
+  'warehouse', 'inspection', 'workshop', 'local_park', 'pedestrian_crossing', 'flat_kitchen', 'furniture_circuit', 'chair_circuit_far', 'movement_practice']);
 
 function valid(key: string, value: unknown): boolean {
   if (key === 'position' || key === 'joints') {

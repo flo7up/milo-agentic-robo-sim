@@ -800,6 +800,63 @@ async function writeScenarioPreview(page: Page, identifier: string) {
   await writeFile(new URL(`${identifier}.webp`, directory), Buffer.from(encoded, 'base64'));
 }
 
+test('farther chair circuit loads, persists and renders without changing the fixed suite', async ({page,request}) => {
+  test.setTimeout(90000);
+  const errors:string[]=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  const initial:LiveState=await(await request.get('/api/state')).json();
+  await page.setViewportSize({width:1440,height:1000});
+  await page.goto('/');
+  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+  const menu=page.getByRole('dialog',{name:'Load challenge',exact:true});
+  await menu.getByRole('combobox',{name:'Predefined challenge',exact:true}).selectOption('chair_circuit_far');
+  await menu.getByRole('combobox',{name:'Map source',exact:true}).selectOption('none');
+  await expect(menu.locator('.scenario-summary')).toContainText('3.2 m');
+  await expect(menu.getByRole('combobox',{name:'Object to circle',exact:true})).toHaveCount(0);
+  const responsePromise=page.waitForResponse(response=>response.url().endsWith('/api/challenges/load')&&response.request().method()==='POST');
+  await menu.getByRole('button',{name:'Load challenge',exact:true}).click();
+  const response=await responsePromise;
+  expect(response.ok()).toBe(true);
+  expect(response.request().postDataJSON()).toEqual({challenge_id:'chair_circuit_far',environment:'standalone',reuse_saved_map:false});
+  const loaded:LiveState=await response.json();
+  expect(loaded.challenge?.orbit).toEqual({target:'chair',direction:'clockwise'});
+  expect(loaded.regression?.cases.map(entry=>entry.id)).toEqual(initial.regression?.cases.map(entry=>entry.id));
+  const base=loaded.snapshot.poses.find(pose=>pose.key===`${loaded.robot_body_id}:-1`)!;
+  expect(base.position[0]).toBeCloseTo(-.6,2);
+  expect(base.position[1]).toBeCloseTo(-2.5,2);
+  await expect(menu).toBeHidden();
+  await expect(page.getByRole('heading',{name:'Circle the Chair: Farther Start',exact:true})).toBeVisible();
+  await expect.poll(async()=>(await spectatorPixels(page)).colors).toBeGreaterThan(30);
+  await writeScenarioPreview(page,'chair_circuit_far');
+  for(const width of [1440,390]) {
+    await page.setViewportSize({width,height:1000});
+    await expect.poll(async()=>(await spectatorPixels(page)).colors).toBeGreaterThan(30);
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await page.locator('.spectator-shell').screenshot({path:`../.runtime/chair-circuit-far-v1/scene-${width}.png`});
+    await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+    await expect(menu.getByRole('combobox',{name:'Predefined challenge',exact:true})).toHaveValue('chair_circuit_far');
+    if(process.env.MILO_CAPTURE_PREVIEWS!=='1') {
+      await expect(menu.getByAltText('Scene preview: Circle the Chair: Farther Start')).toHaveJSProperty('naturalWidth',480);
+    }
+    expect(await menu.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+    await menu.screenshot({path:`../.runtime/chair-circuit-far-v1/picker-${width}.png`});
+    await menu.getByRole('button',{name:'Close challenge menu',exact:true}).click();
+  }
+  await expect.poll(async()=>(await(await request.get('/api/preferences')).json()).preferences.challenge_selection).toEqual({
+    challenge_id:'chair_circuit_far',environment:'standalone',reuse_saved_map:false});
+  const reset=await request.post('/api/reset',{data:{}});
+  expect(reset.ok()).toBe(true);
+  const resetState:LiveState=await reset.json();
+  expect(resetState.run_id).not.toBe(loaded.run_id);
+  expect(resetState.challenge?.id).toBe('chair_circuit_far');
+  expect(resetState.challenge?.orbit).toEqual(loaded.challenge?.orbit);
+  expect(resetState.agent.active).toBe(false);
+  await page.reload();
+  await page.getByRole('button',{name:'Choose challenge',exact:true}).click();
+  await expect(menu.getByRole('combobox',{name:'Predefined challenge',exact:true})).toHaveValue('chair_circuit_far');
+  expect(errors).toEqual([]);
+});
+
 test('shared apartment selection preserves the common world and renders across viewports', async ({ page, request }) => {
   test.setTimeout(120000);
   const errors: string[] = [];

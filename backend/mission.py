@@ -76,6 +76,7 @@ class MissionDecision(StrictModel):
     object_goal_id: str | None = None
     object_label: str = Field(default="", max_length=60)
     object_bounds: list[float] | None = Field(default=None, min_length=4, max_length=4)
+    object_candidate_id: str | None = Field(default=None, min_length=1, max_length=80)
     approach_side: Literal["front", "left", "right"] = "front"
     circle_direction: Literal["clockwise", "counterclockwise"] = "clockwise"
     place_id: str | None = None
@@ -116,7 +117,10 @@ class MissionDecision(StrictModel):
             validate_plan_against_goal(self.plan, info.context["goal"])
         if self.plan is not None and self.plan.kind == "explore" and self.plan.target.strip():
             raise ValueError("Exploration-only plans must have an empty target. Finding and verifying a kitchen or other room requires kind=room; object and named-place goals require their corresponding kind.")
-        if self.action in {"select_object", "verify_object", "circle"} or (self.action == "identify_target" and self.object_bounds is not None):
+        candidate_circle = self.action == "circle" and self.object_candidate_id is not None
+        if self.object_candidate_id is not None and (self.action != "circle" or self.object_bounds is not None or not self.evidence_text.strip()):
+            raise ValueError("Circle candidate selection requires current visual evidence and no replacement box")
+        if self.action in {"select_object", "verify_object"} or (self.action == "circle" and not candidate_circle) or (self.action == "identify_target" and self.object_bounds is not None):
             bounds = self.object_bounds
             if not bounds or not all(0 <= value <= 1 for value in bounds) or bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
                 raise ValueError("Object selection requires a current normalized image box")

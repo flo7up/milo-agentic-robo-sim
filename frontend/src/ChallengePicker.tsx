@@ -24,6 +24,7 @@ const scenarioNotes: Record<ChallengeId, { summary: string; completion: string }
   pedestrian_crossing: { summary: 'A walking person crosses the robot\'s route before a green parking bay.', completion: 'Yield without contact, let the person cross, then park fully in the bay.' },
   flat_kitchen: { summary: 'A furnished five-room flat with a central hallway and multiple doorways. Find the kitchen.', completion: 'Park fully inside the kitchen and remain at rest for half a simulated second.' },
   furniture_circuit: { summary: 'A spacious room with a table, sofa, chair and floor lamp. Choose one object to circle.', completion: 'Complete a lap in the selected direction without contact, then stop near the circuit start.' },
+  chair_circuit_far: { summary: 'A chair in the furnished room, starting 3.2 m from its centre, 0.8 m farther away than the standard table task.', completion: 'Circle the chair clockwise without contact, then stop near the circuit start for half a simulated second.' },
   movement_practice: { summary: 'An open movement course with one-meter floor markings.', completion: 'Move one meter forward, reverse one meter without turning, then spin counterclockwise once. Stop after each step.' },
 };
 
@@ -48,7 +49,7 @@ export function ChallengePicker({ state, connected, request, onLoadingChange }: 
   const [menuOpen, setMenuOpen] = useState(false);
   const [presets, setPresets] = useState<ChallengePreset[]>([]);
   const loadedSelection: SceneSelection = {challenge_id: state.challenge?.id ?? 'bench', environment: state.challenge?.environment ?? 'standalone',
-    reuse_saved_map: state.map_setup?.reuse_saved_map ?? true, ...(state.challenge?.orbit ? {
+    reuse_saved_map: state.map_setup?.reuse_saved_map ?? true, ...(state.challenge?.id === 'furniture_circuit' && state.challenge.orbit ? {
       orbit_target: state.challenge.orbit.target as SceneSelection['orbit_target'], orbit_direction: state.challenge.orbit.direction} : {})};
   const [selection, setSelection] = usePreference('challenge_selection', loadedSelection);
   const [detailsOpen, setDetailsOpen] = usePreference('challenge_details_open', false);

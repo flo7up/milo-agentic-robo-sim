@@ -502,6 +502,91 @@ async def test_unified_table_circuit_drives_and_preserves_authority(tmp_path, mo
         await worker.close()
 
 
+@pytest.mark.parametrize("target,direction,lateral,fault,preset", [
+    ("table", "clockwise", 0., None, None), ("table", "counterclockwise", .25, None, None), ("chair", "clockwise", 0., None, None),
+    *[("table", "clockwise", 0., fault, None) for fault in ("unknown", "wrong_direction", "pending_stop")],
+    pytest.param("chair", "clockwise", 0., None, "chair_circuit_far", id="chair-far")])
+async def test_circle_candidate_makes_directed_arc_and_obeys_stop(tmp_path, monkeypatch, record_property, target, direction, lateral, fault, preset):
+    import asyncio
+    import json
+    import math
+    from backend.challenges import furniture_circuit, get_challenge
+    from backend.home_mapping import MapStore
+    from backend.home_mission import HomeMission
+    from backend.worker import SimulationWorker
+    from tests.test_agent import ScriptedModel, controller_for, model_response, start_settings
+    challenge = get_challenge(preset) if preset else furniture_circuit(target, direction)
+    center = challenge.orbit.center_m
+    if not preset:
+        challenge = challenge.model_copy(update={"initial_xy": [center[0]-2.4, center[1]+lateral]})
+    selections, progress = [], []
+
+    class CandidateModel(ScriptedModel):
+        async def respond(self, profile, reasoning, goal, inputs):
+            self.inputs.append(inputs)
+            brief = json.loads(inputs[-1]["content"][0]["text"])
+            if brief["mission"]["plan"] is None:
+                decision = {"action": "plan", "plan": {"kind": "circuit", "target": target, "circle_direction": direction}}
+            else:
+                candidates = brief["observation"]["spatial"]["object_candidates"]
+                assert candidates
+                selected = candidates[0]
+                selections.append(selected)
+                decision = {"action": "circle", "object_label": target, "object_candidate_id": selected["id"],
+                    "evidence_text": "Scripted selection of the largest visible measured surface", "circle_direction": direction}
+                if fault == "unknown":
+                    decision["object_candidate_id"] = "previous-run:object-0"
+                elif fault == "wrong_direction":
+                    decision["circle_direction"] = "counterclockwise"
+                elif fault == "pending_stop":
+                    worker.stop()
+            return model_response("guide_mission", json.dumps(decision), call_id=f"candidate-{len(self.inputs)}")
+
+    model = CandidateModel([])
+    model.requires_grounded_plan = True
+    controller = controller_for(model)
+    worker = SimulationWorker(challenge=challenge, rendering="enhanced", pace=True)
+    original_trace = controller._trace
+
+    def trace(kind, title, payload, **kwargs):
+        original_trace(kind, title, payload, **kwargs)
+        if title == "Observed furniture circuit":
+            progress.append(payload)
+            if payload["swept_degrees"] >= 35.:
+                worker.stop()
+
+    monkeypatch.setattr(controller, "_trace", trace)
+    try:
+        await asyncio.wrap_future(worker.ready)
+        worker.home_mission = HomeMission(worker, MapStore(tmp_path / "maps.sqlite3"))
+        controller.start(worker, start_settings(worker, execution_mode="luna_continuous", unified_mission=True,
+            map_context=True, images_per_request=2, mission_budget_s=120., max_turns=2, max_model_requests=2
+            ).model_copy(update={"goal": challenge.goal}))
+        await asyncio.wait_for(controller.task, 135.)
+        measured = await worker.call(lambda sim: {"travel_m": sim.path_length, "contacts": len(sim.proximity_sensors().collisions),
+            "challenge": sim.challenge_status(), "ticks": sim.ticks})
+        record_property("circle_attempt", json.dumps({"evidence": "scripted_candidate_selection_real_enhanced_physics",
+            "target": target, "direction": direction, "lateral_m": lateral, "fault": fault, "selection": selections,
+            "preset": preset, "initial_target_distance_m": math.dist(challenge.initial_xy, center),
+            "progress": progress, "error": controller.state["error"], **measured}))
+        if fault:
+            assert not progress and measured["travel_m"] < .01, controller.trace()
+        else:
+            assert progress and progress[-1]["swept_degrees"] >= 35., controller.trace()
+            assert measured["travel_m"] > (1.5 if preset else .5)
+            assert all(item["direction"] == direction for item in progress)
+            expected_center = [center[0]-challenge.initial_xy[0], center[1]-challenge.initial_xy[1]]
+            assert math.dist(progress[0]["observed_center_m"], expected_center) < .7
+        assert measured["contacts"] == 0
+        assert worker.latest["stopped"] and not controller.active
+        assert "target" not in controller.mission.receipts and measured["challenge"]["status"] != "completed"
+        await asyncio.sleep(.2)
+        assert await worker.call(lambda sim: sim.ticks) == measured["ticks"]
+    finally:
+        await controller.halt()
+        await worker.close()
+
+
 @pytest.mark.parametrize("supervised", [False, True])
 async def test_table_scene_drives_from_simple_local_to_supervised_exploration(tmp_path, record_property, supervised):
     import asyncio

@@ -62,7 +62,7 @@ export function Spectator({ state, axes, enabled, onPlace, showZones = false, sh
     const recharging = ['recharge', 'pedestrian_crossing'].includes(current.current.challenge?.id ?? '');
     const apartment = ['apartment', 'kitchen_bathroom'].includes(current.current.challenge?.id ?? '');
     const facility = current.current.challenge?.environment === 'shared_apartment_v1'
-      || ['clinic_delivery', 'warehouse', 'inspection', 'flat_kitchen', 'furniture_circuit', 'movement_practice'].includes(current.current.challenge?.id ?? '');
+      || ['clinic_delivery', 'warehouse', 'inspection', 'flat_kitchen', 'furniture_circuit', 'chair_circuit_far', 'movement_practice'].includes(current.current.challenge?.id ?? '');
     const workshop = current.current.challenge?.id === 'workshop';
     const floor = current.current.geometry.find(asset => asset.type === 3 && asset.dimensions[0] >= 4 && asset.dimensions[1] >= 4 && asset.dimensions[2] <= .11);
     const floorWidth = floor?.dimensions[0] ?? 6, floorDepth = floor?.dimensions[1] ?? 6;

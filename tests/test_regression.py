@@ -9,7 +9,10 @@ def test_observable_baseline_has_fixed_distinct_challenges_and_budgets():
         "table-clockwise", "table-counterclockwise", "object-search", "room-arrival"]
     assert sum(case["budget_s"] for case in CASES) == 1200
     assert len({case["challenge_id"] for case in CASES}) == 7
-    assert RegressionStart(run_id="run", episode_epoch=0).model_id == "luna"
+    default = RegressionStart(run_id="run", episode_epoch=0)
+    assert (default.model_id, default.reasoning, default.task_supervisor_model_id) == ("qwen", "none", "luna")
+    assert RegressionStart(run_id="run", episode_epoch=0, model_id="luna").task_supervisor_model_id is None
+    assert RegressionStart(run_id="run", episode_epoch=0, task_supervisor_model_id=None).task_supervisor_model_id is None
     hybrid = RegressionStart(run_id="run", episode_epoch=0, model_id="qwen", reasoning="none", task_supervisor_model_id="luna")
     assert hybrid.task_supervisor_model_id == "luna"
     with pytest.raises(ValueError):

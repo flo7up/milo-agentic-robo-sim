@@ -96,8 +96,13 @@ Missing identity or a rejected route is not arrival.""",
     "object": """Use select_object with a current normalized [left,top,right,bottom] object_bounds and object_label;
 approach_object with the supplied object_goal_id and a reachable front/left/right approach; verify_object with a NEW post-arrival
 image box. Check shape and support, not color alone. Inspect before selecting when uncertain; do not repeat an unchanged rejected view.""",
-    "circuit": """Identify the object in the CURRENT image; use circle with object_label, normalized object_bounds and the accepted
-circle_direction. The local worker measures the full lap and settling. Do not approximate a lap with in-place turns or confuse
+    "circuit": """Identify the requested object in the CURRENT image from its shape and visible parts, not its position alone.
+When observation.spatial.object_candidates is supplied, select its exact object_candidate_id with circle, object_label,
+evidence_text describing the visible identity cues, and the accepted circle_direction. Candidate bounds are normalized image
+regions of measured surfaces, NOT automatic object recognition; reject an ambiguous, absent or wrong target and look again.
+IDs belong only to this image. Do not invent IDs, reuse an old ID, or send object_bounds alongside an ID.
+If no candidates are supplied, use a valid normalized [left,top,right,bottom] object_bounds or inspect again.
+The local worker measures the full lap and settling. Do not approximate a lap with in-place turns or confuse
 approach with circling. Inspect first when the object box is uncertain. A measured lap is not independent semantic identity proof.""",
     "explore": "Explore observed reachable space within the approved mission budget. Unknown or closed areas remain unverified.",
     "movement": """Execute the accepted ordered movements with execute_movement once. The worker measures each
@@ -142,7 +147,7 @@ def instructions_for(brief, *, structured=False):
     return instructions
 
 
-def tools(actions=None, frontier_ids=()):
+def tools(actions=None, frontier_ids=(), object_candidate_ids=()):
     schema = MissionDecision.model_json_schema()
     selected = actions if actions is not None else schema["properties"]["action"]["enum"]
     fields = {"action", "reason"}
@@ -156,6 +161,8 @@ def tools(actions=None, frontier_ids=()):
         "lookup_room": {"memory_query"}, "find_object_sightings": {"memory_query"}, "get_search_history": {"memory_query"},
         "get_exploration_summary": set(), "look": {"yaw_rad", "pitch_rad"},
         "turn": {"turn_rad"}, "wait": {"duration_s"}, "finish": set()}
+    if object_candidate_ids:
+        parameters["circle"] = {"object_label", "object_candidate_id", "evidence_text", "circle_direction"}
     for action in selected:
         fields.update(parameters[action])
     schema["properties"] = {key: value for key, value in schema["properties"].items() if key in fields}
@@ -164,6 +171,8 @@ def tools(actions=None, frontier_ids=()):
         schema.pop("$defs", None)
     if frontier_ids and "frontier_id" in fields:
         schema["properties"]["frontier_id"] = {"type": "string", "enum": list(frontier_ids)}
+    if object_candidate_ids and "object_candidate_id" in fields:
+        schema["properties"]["object_candidate_id"] = {"type": "string", "enum": list(object_candidate_ids)}
     if "object_bounds" in fields:
         schema["properties"]["object_bounds"] = {"anyOf": [{"type": "array", "minItems": 4, "maxItems": 4,
             "items": {"type": "number", "minimum": 0, "maximum": 1}}, {"type": "null"}]}
@@ -172,6 +181,8 @@ def tools(actions=None, frontier_ids=()):
         "approach_object": ["object_goal_id"], "verify_object": ["object_goal_id", "object_bounds"],
         "identify_target": ["evidence_text"], "report_observation": ["evidence_text"],
         "navigate_place": ["place_id"], "observe_room": ["place_id", "room_matches", "evidence_text"]}
+    if object_candidate_ids:
+        required["circle"] = ["object_label", "object_candidate_id", "evidence_text", "circle_direction"]
     if len(selected) == 1:
         schema["required"] = ["action", *required.get(selected[0], [])]
         for name in schema["required"]:
@@ -184,7 +195,7 @@ def tools(actions=None, frontier_ids=()):
     else:
         schema["anyOf"] = []
         for action in selected:
-            branch = tools([action], frontier_ids)[0]["parameters"]
+            branch = tools([action], frontier_ids, object_candidate_ids)[0]["parameters"]
             branch.pop("$defs", None)
             if "plan" in selected:
                 branch["properties"]["plan"] = {"$ref": "#/$defs/MissionPlan"}
@@ -195,11 +206,11 @@ def tools(actions=None, frontier_ids=()):
         "parameters": schema, "strict": False}]
 
 
-def local_response_schema(actions, frontier_ids=()):
+def local_response_schema(actions, frontier_ids=(), object_candidate_ids=()):
     branches, definitions = [], {}
     initial = tools(["plan"])[0]["parameters"] if "plan" in actions else None
     for action in actions:
-        branch = tools([action], frontier_ids)[0]["parameters"]
+        branch = tools([action], frontier_ids, object_candidate_ids)[0]["parameters"]
         branch["properties"]["action"] = {"type": "string", "const": action}
         if initial:
             branch["properties"]["plan"] = {"$ref": "#/$defs/MissionPlan"}
@@ -290,6 +301,8 @@ def semantic_payload(observation, mission, object_state, last, actions, budget=N
         sensors["spatial"]["floor_regions"] = [{key: region[key] for key in ("id", "color", "complete_view", "visible",
             "age_s", "captured_at", "sequence", "source", "frame", "image_polygon") if key in region}
             for region in spatial["floor_regions"][:8]]
+    if spatial.get("object_candidates"):
+        sensors["spatial"]["object_candidates"] = spatial["object_candidates"][:6]
     if spatial.get("parking"):
         sensors["spatial"]["parking"] = spatial["parking"]
     if episode_memory:
@@ -867,6 +880,14 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
         local_exploration = settings.mission_local_only
         object_state = await worker.object_state()
         sensor, image, observation = await worker.mission_feedback(mission)
+        object_candidates = []
+        if mission.plan and mission.plan.kind == "circuit":
+            from backend.object_navigation import circle_candidates
+            object_candidates = await asyncio.to_thread(circle_candidates, sensor)
+            controller._check_live(worker, settings)
+            mission.check(authority(worker))
+            observation = observation.model_copy(update={"spatial": {
+                **(observation.spatial or {}), "object_candidates": object_candidates}})
         parking_offer = None
         if mission.plan and mission.plan.kind == "place":
             if sensor.sequence > floor_tracker.sequence:
@@ -942,9 +963,11 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
                 "history_estimated_bytes": history_bytes, "retained_history_pairs": len(retained),
                 "effective_instructions": instructions_for(payload, structured=profile.provider == "ollama") + "\nUser goal: " + settings.goal,
                 **({"response_format": local_response_schema(payload["available_actions"],
-                    [item["frontier_id"] for item in payload["observation"]["spatial"]["frontiers"]])} if profile.provider == "ollama" else {}),
+                    [item["frontier_id"] for item in payload["observation"]["spatial"]["frontiers"]],
+                    [item["id"] for item in object_candidates])} if profile.provider == "ollama" else {}),
                 "effective_tools": tools(payload["available_actions"],
-                    [item["frontier_id"] for item in payload["observation"]["spatial"]["frontiers"]])}, image=image, images=images)
+                    [item["frontier_id"] for item in payload["observation"]["spatial"]["frontiers"]],
+                    [item["id"] for item in object_candidates])}, image=image, images=images)
             mapped.input_durations.append(max(0., time.monotonic() - input_started))
             began = time.monotonic()
             request_interval = began-mapped.last_request_started_at if mapped.last_request_started_at is not None else None
@@ -1128,6 +1151,14 @@ async def run_reviews(controller, worker, settings, model, profile, stop_revisio
                     raise ValueError("Use circle only for the accepted circuit objective and direction")
                 if not 0 <= time.monotonic()-sensor.captured_at <= 15.:
                     raise ValueError("Circuit selection expired; inspect current evidence")
+                if decision.object_candidate_id:
+                    from backend.object_navigation import resolve_circle_candidate
+                    bounds = resolve_circle_candidate(sensor, object_candidates, decision.object_candidate_id)
+                    controller._trace("policy", "Circle object selected", {"candidate_id": decision.object_candidate_id,
+                        "label": decision.object_label, "evidence_text": decision.evidence_text,
+                        "bounds": bounds, "source_sequence": sensor.sequence, "source": "paired_head_depth",
+                        "semantic_identity": "model_reported_not_independently_verified", "motion_authorized": False})
+                    decision = decision.model_copy(update={"object_bounds": bounds})
                 token = mission.begin("navigating", authority(worker))
                 last = await circle_observed_object(controller, worker, settings, sensor, decision, stop_revision)
                 if last.get("status") != "arrived" or not last.get("complete"):

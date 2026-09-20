@@ -120,7 +120,7 @@ def test_inspection_shelf_case_is_distinct_from_yellow_target_without_geometry_c
 
 
 def test_presets_have_distinct_goals_and_private_geometry():
-    assert set(PRESETS) == {"park", "park_left", "park_right", "park_far", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "movement_practice"}
+    assert set(PRESETS) == {"park", "park_left", "park_right", "park_far", "tidy", "sort", "recharge", "apartment", "kitchen_bathroom", "clinic_delivery", "warehouse", "inspection", "workshop", "local_park", "pedestrian_crossing", "flat_kitchen", "furniture_circuit", "chair_circuit_far", "movement_practice"}
     for preset in PRESETS.values():
         assert preset.goal and preset.objectives
         assert "objects" not in preset.public()
@@ -130,6 +130,26 @@ def test_presets_have_distinct_goals_and_private_geometry():
         assert all(isinstance(label, str) for label in preset.public()["objectives"])
         assert any(item.get("marker") for item in preset.scene())
     assert get_challenge("bench") is None
+
+
+def test_chair_circuit_far_preserves_geometry_and_starts_farther_from_target():
+    from backend.challenges import ChallengeLoad, furniture_circuit
+    original = furniture_circuit()
+    chair = furniture_circuit("chair", "clockwise")
+    farther = get_challenge("chair_circuit_far")
+    assert ChallengeLoad(challenge_id=farther.id).challenge_id == farther.id
+    assert farther.orbit == chair.orbit and farther.orbit.target == "chair"
+    assert farther.objects == chair.objects and farther.objectives == chair.objectives
+    assert farther.goal == chair.goal and "clockwise circuit around that chair" in farther.goal
+    assert math.dist(farther.initial_xy, farther.orbit.center_m) == pytest.approx(3.2)
+    assert math.dist(farther.initial_xy, farther.orbit.center_m) - math.dist(original.initial_xy, original.orbit.center_m) == pytest.approx(.8)
+    assert get_challenge("furniture_circuit").model_dump() == original.model_dump()
+    assert all(field not in farther.public() for field in ("objects", "initial_xy", "center_m"))
+    assert farther.public()["orbit"] == {"target": "chair", "direction": "clockwise"}
+    with pytest.raises(ValueError):
+        ChallengeLoad(challenge_id=farther.id, orbit_target="table")
+    with pytest.raises(ValueError):
+        ChallengeLoad(challenge_id=farther.id, environment="shared_apartment_v1")
 
 
 @pytest.mark.parametrize("direction", ["clockwise", "counterclockwise"])

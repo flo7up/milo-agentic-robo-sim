@@ -13,6 +13,31 @@ def object_sensor(**changes):
     return SimpleNamespace(**(values | changes))
 
 
+def test_circle_candidates_are_bounded_unlabelled_current_depth_regions():
+    from backend.object_navigation import circle_candidates
+    depth = np.full((48, 64), np.nan)
+    depth[13:30, 8:22] = 1.5
+    depth[13:30, 42:56] = 1.8
+    sensor = object_sensor(calibration=calibration(64, 48), depth_m=depth.ravel().tolist())
+    candidates = circle_candidates(sensor, now=10.1)
+    assert len(candidates) == 2
+    assert len({item["id"] for item in candidates}) == 2
+    for item in candidates:
+        assert item["source"] == "paired_head_depth" and item["sequence"] == sensor.sequence
+        assert item["run_id"] == sensor.run_id and item["episode_epoch"] == sensor.episode_epoch
+        assert item["semantic_identity"] == "unverified" and not item["motion_authorized"]
+        assert item["bounds"][0] < item["bounds"][2] and item["bounds"][1] < item["bounds"][3]
+        assert all(0 <= value <= 1 for value in item["bounds"])
+        assert "table" not in str(item) and "body_id" not in item
+    newer = circle_candidates(object_sensor(**{**vars(sensor), "sequence": 2}), now=10.1)
+    assert {item["id"] for item in newer}.isdisjoint(item["id"] for item in candidates)
+    other_run = circle_candidates(object_sensor(**{**vars(sensor), "run_id": "other"}), now=10.1)
+    assert {item["id"] for item in other_run}.isdisjoint(item["id"] for item in candidates)
+    assert circle_candidates(object_sensor(depth_m=[None]*384), now=10.1) == []
+    with pytest.raises(ValueError, match="fresh"):
+        circle_candidates(sensor, now=12.)
+
+
 def test_object_options_keep_intention_and_reject_blocked_corridor():
     goal = ObservedObjectGoal(object_sensor(), [.4, .4, .6, .6], "table", .8, 2, 3)
     options = goal.options([0., 0., 0.], lambda start, end: [start, end], lambda points: np.all(points[:, 1] >= -.01))
@@ -23,6 +48,40 @@ def test_object_options_keep_intention_and_reject_blocked_corridor():
     goal.options([.2, .1, .1], lambda start, end: [start, end], lambda points: True)
     assert goal.pose("left") == target
     assert not goal.verified
+
+
+def test_circle_candidate_contract_and_resolution_require_fresh_visual_selection():
+    from backend.mission import MissionDecision
+    from backend.mission_supervisor import local_response_schema
+    from backend.object_navigation import circle_candidates, resolve_circle_candidate
+    depth = np.full((48, 64), np.nan)
+    depth[13:30, 22:42] = 1.5
+    sensor = object_sensor(calibration=calibration(64, 48), depth_m=depth.ravel().tolist())
+    candidates = circle_candidates(sensor, now=10.1)
+    assert candidates
+    identity = candidates[0]["id"]
+    decision = MissionDecision(action="circle", object_candidate_id=identity, object_label="table",
+        evidence_text="Flat top with supporting legs", circle_direction="clockwise")
+    schema = local_response_schema(["circle", "look"], object_candidate_ids=[identity])["anyOf"][0]
+    assert schema["properties"]["object_candidate_id"]["enum"] == [identity]
+    assert "object_bounds" not in schema["properties"] and "evidence_text" in schema["required"]
+    assert decision.object_bounds is None
+    assert resolve_circle_candidate(sensor, candidates, identity, now=10.5) == candidates[0]["bounds"]
+    with pytest.raises(ValueError, match="UNKNOWN"):
+        resolve_circle_candidate(sensor, candidates, "invented", now=10.5)
+    with pytest.raises(ValueError, match="STALE"):
+        resolve_circle_candidate(sensor, candidates, identity, now=26.)
+    with pytest.raises(ValueError, match="STALE"):
+        resolve_circle_candidate(object_sensor(sequence=2), candidates, identity, now=10.5)
+    for changes in ({"episode_epoch": 2}, {"run_id": "other"}, {"captured_at": 10.2}):
+        with pytest.raises(ValueError, match="STALE"):
+            resolve_circle_candidate(object_sensor(**changes), candidates, identity, now=10.5)
+    with pytest.raises(ValueError, match="STALE"):
+        resolve_circle_candidate(sensor, candidates, identity, now=9.)
+    with pytest.raises(ValueError, match="evidence"):
+        MissionDecision(action="circle", object_candidate_id=identity, object_label="table")
+    with pytest.raises(ValueError, match="replacement box"):
+        MissionDecision(**{**decision.model_dump(), "object_bounds": [0., 0., 0., 0.]})
 
 
 def test_object_goal_rejects_revoked_and_expired_evidence():

@@ -162,17 +162,22 @@ test('Qwen configuration saves its bounded local profile and reports validation 
   await expect(drawer).toBeVisible();
 });
 
-test('hybrid controller keeps Qwen operational and gives Luna task-only supervision', async ({page}) => {
+test('hybrid defaults keep Qwen operational and give Luna task-only supervision', async ({page}) => {
   let payload:Record<string,unknown>|null=null;
+  let baselinePayload:Record<string,unknown>|null=null;
   await page.route('**/api/agent/local-readiness?*',route=>route.fulfill({json:{ready:true,status:'installed',message:'Local vision model installed'}}));
   await page.route('**/api/mission/start',async route=>{
     payload=route.request().postDataJSON();
     await route.fulfill({status:409,json:{detail:'Payload captured without starting model inference'}});
   });
+  await page.route('**/api/regression/start',async route=>{
+    baselinePayload=route.request().postDataJSON();
+    await route.fulfill({status:409,json:{detail:'Baseline payload captured without model inference'}});
+  });
   await page.goto('/');
   await page.getByRole('button',{name:'Open configuration',exact:true}).click();
   const drawer=page.getByRole('dialog',{name:'Robot configuration',exact:true});
-  await drawer.getByRole('combobox',{name:'Mission controller',exact:true}).selectOption('hybrid');
+  await expect(drawer.getByRole('combobox',{name:'Mission controller',exact:true})).toHaveValue('hybrid');
   await drawer.getByRole('button',{name:'Save configuration',exact:true}).click();
   await expect(drawer).toBeHidden();
   await page.getByRole('button',{name:'Open configuration',exact:true}).click();
@@ -184,6 +189,23 @@ test('hybrid controller keeps Qwen operational and gives Luna task-only supervis
     task_supervisor_reasoning:'low',max_task_supervisor_requests:4,max_task_supervisor_tokens:100000});
   expect(payload).not.toHaveProperty('automatic_fallback');
   await expect(page.getByRole('alert')).toContainText('Payload captured without starting model inference');
+  const panel=page.locator('.regression-panel');
+  await panel.locator(':scope > summary').click();
+  const supervisor=panel.getByRole('combobox',{name:'Baseline supervisor',exact:true});
+  await expect(supervisor).toHaveValue('hybrid');
+  for(const selection of ['hybrid','qwen','luna']) {
+    await supervisor.selectOption(selection);
+    baselinePayload=null;
+    await panel.getByRole('button',{name:'Start baseline',exact:true}).click();
+    await expect.poll(()=>baselinePayload).not.toBeNull();
+    expect(baselinePayload).toMatchObject({model_id:selection==='hybrid'?'qwen':selection,
+      task_supervisor_model_id:selection==='hybrid'?'luna':null});
+    if(selection==='hybrid') expect(baselinePayload).toHaveProperty('reasoning','none');
+    await expect(panel.getByRole('alert')).toContainText('Baseline payload captured');
+  }
+  await page.reload();
+  await panel.locator(':scope > summary').click();
+  await expect(supervisor).toHaveValue('hybrid');
 });
 
 test('regression includes four parking starts with distinct loadable scene previews', async ({page,request}) => {

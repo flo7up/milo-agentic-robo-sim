@@ -42,7 +42,7 @@ export function LunaNavigationControl({ state, connected, request, commandHost, 
   const kitchenSearch = state.challenge?.id === 'flat_kitchen';
   const luna = agent.configuration.models.find(model => model.id === 'luna' && model.provider === 'foundry');
   const qwen = agent.configuration.models.find(model => model.id === 'qwen' && model.provider === 'ollama');
-  const [preferredController, setPreferredController] = usePreference('mission_controller', 'luna');
+  const [preferredController, setPreferredController] = usePreference('mission_controller', 'hybrid');
   const [diagnostic, setDiagnostic] = useState<'unified' | 'local' | 'legacy'>(() =>
     new URLSearchParams(location.search).get('diagnostics') === 'legacy' ? 'legacy' : 'unified');
   const unified = diagnostic !== 'legacy';

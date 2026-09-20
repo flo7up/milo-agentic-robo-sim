@@ -1,9 +1,69 @@
 import math
+import time
 from uuid import uuid4
 
 import numpy as np
 
-from backend.spatial import measure_visible_region
+from backend.spatial import measure_visible_region, point_cloud
+
+
+def circle_candidates(sensor, now=None):
+    from scipy.ndimage import binary_dilation, label
+    now = time.monotonic() if now is None else now
+    if not 0 <= now-sensor.captured_at <= 1.:
+        raise ValueError("Circle candidates require fresh paired depth")
+    intrinsics = sensor.calibration
+    depth = np.asarray(sensor.depth_m, dtype=float).reshape(intrinsics.height, intrinsics.width)
+    rows, columns = np.where(np.isfinite(depth))
+    eye, points = point_cloud(sensor, stride=1)
+    selected = (points[:, 2] > .08) & (points[:, 2] < 1.6) & (np.linalg.norm(points-eye, axis=1) <= 4.)
+    points, rows, columns = points[selected], rows[selected], columns[selected]
+    if len(points) < 12:
+        return []
+    cells = np.floor(points[:, :2]/.08).astype(int)
+    origin = cells.min(axis=0)
+    cells -= origin
+    size = cells.max(axis=0)+1
+    occupied = np.zeros((size[1], size[0]), dtype=bool)
+    occupied[cells[:, 1], cells[:, 0]] = True
+    components, count = label(binary_dilation(occupied, iterations=1))
+    membership = components[cells[:, 1], cells[:, 0]]
+    candidates = []
+    for component in range(1, count+1):
+        mask = membership == component
+        if np.count_nonzero(mask) < 12:
+            continue
+        surface = points[mask]
+        extent = np.ptp(surface[:, :2], axis=0)
+        if max(extent) > 2.5:
+            continue
+        lower = [int(columns[mask].min()), int(rows[mask].min())]
+        upper = [int(columns[mask].max())+1, int(rows[mask].max())+1]
+        if min(upper[0]-lower[0], upper[1]-lower[1]) < 3:
+            continue
+        candidates.append({"bounds": [lower[0]/intrinsics.width, lower[1]/intrinsics.height,
+            upper[0]/intrinsics.width, upper[1]/intrinsics.height], "measured_points": int(mask.sum()),
+            "distance_m": float(np.median(np.linalg.norm(surface-eye, axis=1))),
+            "clipped": lower[0] == 0 or lower[1] == 0 or upper[0] == intrinsics.width or upper[1] == intrinsics.height,
+            "source": "paired_head_depth", "frame": "wheel_odometry", "sequence": sensor.sequence,
+            "run_id": sensor.run_id, "episode_epoch": sensor.episode_epoch, "captured_at": sensor.captured_at,
+            "semantic_identity": "unverified", "motion_authorized": False,
+            "limitation": "Connected visible surfaces may merge objects or omit hidden parts; identify from the paired image"})
+    candidates.sort(key=lambda item: (-item["measured_points"], item["distance_m"]))
+    return [{"id": f"{sensor.run_id}:{sensor.episode_epoch}:{sensor.sequence}:object-{index}", **item}
+        for index, item in enumerate(candidates[:6])]
+
+
+def resolve_circle_candidate(sensor, candidates, identity, now=None):
+    now = time.monotonic() if now is None else now
+    selected = next((item for item in candidates if item["id"] == identity), None)
+    if selected is None:
+        raise ValueError("UNKNOWN_OBJECT_CANDIDATE: select an ID from the current paired image")
+    if ((selected["run_id"], selected["episode_epoch"], selected["sequence"], selected["captured_at"])
+            != (sensor.run_id, sensor.episode_epoch, sensor.sequence, sensor.captured_at)
+            or not 0 <= now-sensor.captured_at <= 15.):
+        raise ValueError("STALE_OBJECT_CANDIDATE: inspect the object again")
+    return list(selected["bounds"])
 
 
 class ObservedObjectGoal:

@@ -247,8 +247,9 @@ def mission_model_contract(goal, inputs, *, structured=False):
     from backend.mission_supervisor import instructions_for, tools
     brief = json.loads(inputs[-1]["content"][0]["text"])
     frontiers = ((brief.get("observation") or {}).get("spatial") or {}).get("frontiers", [])
+    candidates = ((brief.get("observation") or {}).get("spatial") or {}).get("object_candidates", [])
     return instructions_for(brief, structured=structured) + "\nUser goal: " + goal, tools(
-        brief.get("available_actions"), [item["frontier_id"] for item in frontiers])
+        brief.get("available_actions"), [item["frontier_id"] for item in frontiers], [item["id"] for item in candidates])
 
 
 class FoundryModel:
@@ -374,7 +375,8 @@ class OllamaModel:
             from backend.mission_supervisor import local_response_schema
             instructions, tools = mission_model_contract(goal, inputs, structured=True)
             properties = tools[0]["parameters"]["properties"]
-            output_contract = {"format": local_response_schema(properties["action"]["enum"], properties.get("frontier_id", {}).get("enum", []))}
+            output_contract = {"format": local_response_schema(properties["action"]["enum"], properties.get("frontier_id", {}).get("enum", []),
+                properties.get("object_candidate_id", {}).get("enum", []))}
         else:
             composer = getattr(self, "skill_composer", False)
             instructions = controller_instructions(mode, composer) + "\nUser goal: " + goal
